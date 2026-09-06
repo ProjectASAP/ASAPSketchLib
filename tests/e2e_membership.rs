@@ -210,7 +210,7 @@ fn a_union_equals_the_filter_of_the_concatenated_stream() {
         whole.insert(&DataInput::I64(key));
     }
 
-    left.merge_from(&right);
+    left.merge(&right);
     assert_eq!(left.as_bits().count_ones(), whole.as_bits().count_ones());
     assert_eq!(left.inserted(), whole.inserted());
 
@@ -749,7 +749,7 @@ fn a_fast_path_union_equals_the_filter_of_the_concatenated_stream() {
         }
         whole.insert(&DataInput::I64(key));
     }
-    left.merge_from(&right);
+    left.merge(&right);
     assert_eq!(all_bits(left.as_bits()), all_bits(whole.as_bits()));
     assert_eq!(left.inserted(), whole.inserted());
     for key in 0..10_000i64 {
@@ -762,7 +762,7 @@ fn a_fast_path_union_equals_the_filter_of_the_concatenated_stream() {
 fn merging_filters_of_different_widths_panics() {
     let mut left = Bloom::<RegularPath>::with_dimensions(7, 1 << 14);
     let right = Bloom::<RegularPath>::with_dimensions(7, 1 << 13);
-    left.merge_from(&right);
+    left.merge(&right);
 }
 
 #[test]
@@ -770,7 +770,7 @@ fn merging_filters_of_different_widths_panics() {
 fn merging_filters_of_different_slice_counts_panics() {
     let mut left = Bloom::<RegularPath>::with_dimensions(7, 1 << 14);
     let right = Bloom::<RegularPath>::with_dimensions(8, 1 << 14);
-    left.merge_from(&right);
+    left.merge(&right);
 }
 
 /// `bulk_insert` is the loop, not a different filter.

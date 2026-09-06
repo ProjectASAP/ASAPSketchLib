@@ -95,7 +95,7 @@ selectivity, so counting them would report a rate the filter cannot deliver.
 ## Merge
 
 ```rust
-fn merge_from(&mut self, other: &Self)
+fn merge(&mut self, other: &Self)
 ```
 
 Bitwise union. Both filters must have the same dimensions and hasher; the

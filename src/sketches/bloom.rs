@@ -279,7 +279,7 @@ impl<Mode, H: SketchHasher> Bloom<Mode, H> {
     ///
     /// Both filters must have the same dimensions and the same hasher; the
     /// result is exactly the filter the concatenated streams would have built.
-    pub fn merge_from(&mut self, other: &Self) {
+    pub fn merge(&mut self, other: &Self) {
         self.bits.union_from(&other.bits);
         self.inserted = self.inserted.saturating_add(other.inserted);
     }
@@ -798,7 +798,7 @@ mod tests {
         }
         let expected = left.inserted() + right.inserted();
 
-        left.merge_from(&right);
+        left.merge(&right);
         assert_eq!(
             left.inserted(),
             expected,
@@ -826,7 +826,7 @@ mod tests {
     fn merging_mismatched_geometries_panics_instead_of_unioning_a_prefix() {
         let mut left = Bloom::<RegularPath>::with_dimensions(5, 512);
         let right = Bloom::<RegularPath>::with_dimensions(5, 256);
-        left.merge_from(&right);
+        left.merge(&right);
     }
 
     /// A zero dimension is a filter with no bits to probe; construction rejects

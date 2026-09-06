@@ -37,7 +37,7 @@
 //! `entries()` order follows the counter arena and `top_k` order follows the
 //! bucket walk, neither of which survives a rebuild. The payload is therefore
 //! **order-defined**: descending count, ties broken by the crate's `key_order`
-//! total order over [`HeapItem`] (the same one `merge_from` uses). Two summaries
+//! total order over [`HeapItem`] (the same one `merge` uses). Two summaries
 //! holding the same triples emit the same bytes whatever order they were seated
 //! in, and re-serializing a decoded summary reproduces its bytes exactly.
 
@@ -508,7 +508,7 @@ mod tests {
         for _ in 0..20 {
             right.insert(&DataInput::I64(8));
         }
-        left.merge_from(&right);
+        left.merge(&right);
 
         assert!(left.len() < left.capacity(), "the merge left room to spare");
         assert!(left.min_count() >= 10, "the merge did not raise a ceiling");

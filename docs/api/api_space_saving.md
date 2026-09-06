@@ -94,7 +94,7 @@ error)` in non-increasing count order.
 ## Merge
 
 ```rust
-fn merge_from(&mut self, other: &Self)
+fn merge(&mut self, other: &Self)
 ```
 
 Counts for a shared key add. A key held by only one side takes the other's

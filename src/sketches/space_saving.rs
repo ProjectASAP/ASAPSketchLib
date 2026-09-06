@@ -305,7 +305,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
     /// The `min_count` a one-sided key picks up is added weight that the stream
     /// never carried, so the merged counts sum to more than [`Self::total`] and
     /// an estimate divided by the total is no longer a frequency.
-    pub fn merge_from(&mut self, other: &Self) {
+    pub fn merge(&mut self, other: &Self) {
         let mine_min = self.min_count();
         let theirs_min = other.min_count();
 
@@ -1027,7 +1027,7 @@ mod tests {
         right.insert_many(&DataInput::I64(3), 100);
         right.insert_many(&DataInput::I64(4), 50);
 
-        left.merge_from(&right);
+        left.merge(&right);
 
         left.validate().expect("after a saturating merge");
         assert_eq!(left.len(), 2);
@@ -1048,7 +1048,7 @@ mod tests {
         source.insert_many(&DataInput::I64(dropped), ceiling - 1);
         source.insert(&DataInput::I64(held));
         let mut summary: SpaceSaving = SpaceSaving::with_capacity(capacity);
-        summary.merge_from(&source);
+        summary.merge(&source);
         assert_eq!(summary.min_count(), ceiling, "the fixture ceiling");
         summary
     }
@@ -1087,7 +1087,7 @@ mod tests {
     fn a_merge_saturates_a_shared_keys_count() {
         let (mut left, right) = a_saturated_overlap();
 
-        left.merge_from(&right);
+        left.merge(&right);
 
         left.validate().expect("after a saturating merge");
         assert_eq!(left.len(), 1);
@@ -1104,7 +1104,7 @@ mod tests {
     fn a_merge_saturates_a_shared_keys_error() {
         let (mut left, right) = a_saturated_overlap();
 
-        left.merge_from(&right);
+        left.merge(&right);
 
         left.validate().expect("after a saturating merge");
         assert_eq!(
@@ -1128,7 +1128,7 @@ mod tests {
         let mut right: SpaceSaving = SpaceSaving::with_capacity(4);
         right.insert_many(&DataInput::I64(3), 7);
 
-        left.merge_from(&right);
+        left.merge(&right);
 
         left.validate().expect("after a saturating merge");
         assert_eq!(
@@ -1148,7 +1148,7 @@ mod tests {
         left.insert_many(&DataInput::I64(3), 7);
         let right = ceilinged(4, u64::MAX - 3, 8, 9);
 
-        left.merge_from(&right);
+        left.merge(&right);
 
         left.validate().expect("after a saturating merge");
         assert_eq!(
@@ -1167,7 +1167,7 @@ mod tests {
         let mut left = ceilinged(4, u64::MAX - 3, 8, 9);
         let right = ceilinged(4, 10, 5, 6);
 
-        left.merge_from(&right);
+        left.merge(&right);
 
         left.validate().expect("after a saturating merge");
         assert_eq!(left.min_count(), u64::MAX, "the merged ceiling wrapped");
@@ -1192,7 +1192,7 @@ mod tests {
         for _ in 0..20 {
             right.insert(&DataInput::I64(8));
         }
-        left.merge_from(&right);
+        left.merge(&right);
         assert!(left.len() < left.capacity(), "the merge left room to spare");
         assert_eq!(left.min_count(), 30);
 
@@ -1288,7 +1288,7 @@ mod tests {
             right.insert(&DataInput::I64(8));
         }
 
-        left.merge_from(&right);
+        left.merge(&right);
 
         left.validate()
             .expect("after merging into an empty summary");
@@ -1324,9 +1324,9 @@ mod tests {
             right.insert(&DataInput::I64(10));
         }
 
-        left.merge_from(&middle);
+        left.merge(&middle);
         left.validate().expect("after the first merge");
-        left.merge_from(&right);
+        left.merge(&right);
         left.validate().expect("after the second merge");
 
         assert!(left.len() < left.capacity(), "the chain left room to spare");
@@ -1350,7 +1350,7 @@ mod tests {
         for _ in 0..30 {
             right.insert(&DataInput::I64(8));
         }
-        left.merge_from(&right);
+        left.merge(&right);
 
         let ceiling = left.min_count();
         left.insert(&DataInput::I64(7));
@@ -1393,9 +1393,9 @@ mod tests {
             let (right, right_truth) = fuzzed(2, 80, 700, seed ^ 0xabcd);
             let (third, third_truth) = fuzzed(capacity + 5, 70, 500, seed ^ 0x1234);
 
-            left.merge_from(&right);
+            left.merge(&right);
             left.validate().expect("after the first merge");
-            left.merge_from(&third);
+            left.merge(&third);
             left.validate().expect("after the second merge");
 
             for (key, count) in right_truth.iter().chain(third_truth.iter()) {
@@ -1613,7 +1613,7 @@ mod tests {
         right.insert_many(&DataInput::Bytes(RAW), 2);
         right.insert_many(&DataInput::Bytes(&[0x02]), 7);
 
-        left.merge_from(&right);
+        left.merge(&right);
 
         left.validate().expect("after a byte-key merge");
         assert_eq!(left.len(), 3);
@@ -1750,7 +1750,7 @@ mod collisions {
         right.insert_many(&DataInput::I64(10), 2);
         right.insert_many(&DataInput::I64(30), 7);
 
-        left.merge_from(&right);
+        left.merge(&right);
 
         left.validate().expect("after a colliding merge");
         assert_eq!(left.len(), 3);
@@ -1774,11 +1774,11 @@ mod collisions {
                 right.insert(&DataInput::I64(key));
             }
             if swap {
-                right.merge_from(&left);
+                right.merge(&left);
                 right.validate().expect("after a colliding merge");
                 keys_of(&right)
             } else {
-                left.merge_from(&right);
+                left.merge(&right);
                 left.validate().expect("after a colliding merge");
                 keys_of(&left)
             }
