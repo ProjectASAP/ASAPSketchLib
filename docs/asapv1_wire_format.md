@@ -470,12 +470,12 @@ The counter budget `capacity` and the `key_type` are configuration and live in t
 | 1 | `counts` | array | u64 recorded count, parallel to `keys` |
 | 2 | `errors` | array | u64 error allowance, parallel to `keys`; `errors[i] <= counts[i]` |
 | 3 | `total` | u64 | total weight recorded, monitored or displaced |
-| 4 | `floor` | u64 | the largest count known to have left the summary |
+| 4 | `discarded_max` | u64 | the largest count known to have left the summary |
 
 The three arrays are parallel and equal-length; the number of monitored keys is `len(keys)` (derived, so not stored).
-`min_count` is **not** stored either: it is `max(floor, smallest count still held)` and is recomputed on load.
+`min_count` is **not** stored either: it is `max(discarded_max, smallest count still held)` and is recomputed on load.
 
-`floor`, by contrast, is **not** derivable from the triples — it records what an eviction or a merge dropped, and a merged summary can hold fewer keys than its capacity and still be missing keys the other side had already discarded. A payload carrying only the triples would decode such a summary with no ceiling at all, silently reporting `upper_bound == 0` for exactly the keys the ceiling exists to bound. So it is carried.
+`discarded_max`, by contrast, is **not** derivable from the triples — it records what an eviction or a merge dropped, and a merged summary can hold fewer keys than its capacity and still be missing keys the other side had already discarded. A payload carrying only the triples would decode such a summary with no ceiling at all, silently reporting `upper_bound == 0` for exactly the keys the ceiling exists to bound. So it is carried.
 
 **Metadata vs payload.** `capacity` is the summary's one sizing parameter, chosen at construction, so per the config-to-metadata rule it belongs in the descriptor (like HLL's `precision` or Count-Min's `rows`/`cols`). `key_type` is a structural param in the Count-Min `counter_type` / KLL `item_type` sense: it fixes the element type of the payload's `keys` array, and the payload cannot be read without it.
 
@@ -841,7 +841,7 @@ A `NaN` sample is legal: `update(f64::NAN)` is legal in memory and `total_cmp` g
 | ----- | ------- | ------ | ------- |
 | 0 | `hashes` | array | the retained 64-bit digests, **strictly ascending**; `len(hashes) <= k` |
 
-The payload is a **1-element positional array `[hashes]`**, mirroring Count-Min's `[counts]`. How many digests are retained is `len(hashes)` (derived, so not stored), and the estimate is a closed form over `k` and the largest retained digest, so it is not carried either. KMV keeps no insertion counter, no displaced-weight scalar and no eviction ceiling: unlike Bloom's `inserted` or Space-Saving's `floor`, there is no running state the retained set does not already determine.
+The payload is a **1-element positional array `[hashes]`**, mirroring Count-Min's `[counts]`. How many digests are retained is `len(hashes)` (derived, so not stored), and the estimate is a closed form over `k` and the largest retained digest, so it is not carried either. KMV keeps no insertion counter, no displaced-weight scalar and no eviction ceiling: unlike Bloom's `inserted` or Space-Saving's `discarded_max`, there is no running state the retained set does not already determine.
 
 **Metadata vs payload.** `k` is the sketch's one sizing parameter, chosen at construction, so per the config-to-metadata rule it belongs in the descriptor. It is carried as a `u32`; a `k` past that field fails to serialize rather than being truncated. Structural-param order is `... canonical_seed_index, k`.
 

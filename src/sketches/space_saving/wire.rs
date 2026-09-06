@@ -5,14 +5,14 @@
 //! constant, the `key_type` mapping, and the `serialize_to_bytes` /
 //! `deserialize_from_bytes` impls) while the algorithm lives in the parent
 //! module file. Being a descendant module, it reads the summary's private
-//! `counters` / `buckets` / `total` / `floor` fields and reuses the private
+//! `counters` / `buckets` / `total` / `discarded_max` fields and reuses the private
 //! `rebuild` entry point directly, without widening any field visibility. See
 //! `docs/asapv1_wire_format.md` §3.5.
 //!
 //! Space-Saving is one algorithm — a single kind_id `0x18 0x00`. Its structural
 //! parameters are the counter `capacity` and the `key_type`, both in the
 //! metadata, so the payload is the answer triples split into parallel arrays
-//! plus the two running scalars: `[keys, counts, errors, total, floor]`. The
+//! plus the two running scalars: `[keys, counts, errors, total, discarded_max]`. The
 //! bucket list, the counter arena and the key index are all derived and are
 //! rebuilt on load, so no arena index reaches the wire.
 //!
@@ -119,9 +119,9 @@ fn space_saving_metadata<H: HashProfile>(capacity: u32, key_type: &str) -> Space
 }
 
 /// Space-Saving payload (ASAPv1 §3.5), a msgpack **array** (`to_vec`,
-/// positional): `[keys, counts, errors, total, floor]`. The three arrays are
+/// positional): `[keys, counts, errors, total, discarded_max]`. The three arrays are
 /// parallel and equal-length; `keys`'s element type is fixed by the metadata
-/// `key_type`. `total` is the recorded weight, `floor` the largest count known
+/// `key_type`. `total` is the recorded weight, `discarded_max` the largest count known
 /// to have left the summary.
 #[derive(Debug, Serialize, Deserialize)]
 struct SpaceSavingPayload<K> {
@@ -129,7 +129,7 @@ struct SpaceSavingPayload<K> {
     counts: Vec<u64>,
     errors: Vec<u64>,
     total: u64,
-    floor: u64,
+    discarded_max: u64,
 }
 
 /// The `key_type` the payload will be written in, taken from the first key in
@@ -159,7 +159,7 @@ fn encode_payload(
     key_type: &str,
     entries: &[(&HeapItem, u64, u64)],
     total: u64,
-    floor: u64,
+    discarded_max: u64,
 ) -> Result<Vec<u8>, RmpEncodeError> {
     let counts: Vec<u64> = entries.iter().map(|entry| entry.1).collect();
     let errors: Vec<u64> = entries.iter().map(|entry| entry.2).collect();
@@ -178,7 +178,7 @@ fn encode_payload(
                 counts,
                 errors,
                 total,
-                floor,
+                discarded_max,
             })
         }};
     }
@@ -209,7 +209,7 @@ fn encode_payload(
                 counts,
                 errors,
                 total,
-                floor,
+                discarded_max,
             })
         }
         "bytes" => {
@@ -225,7 +225,7 @@ fn encode_payload(
                 counts,
                 errors,
                 total,
-                floor,
+                discarded_max,
             })
         }
         other => Err(RmpEncodeError::Syntax(format!(
@@ -255,12 +255,12 @@ fn decode_payload(
                 decoded.counts,
                 decoded.errors,
                 decoded.total,
-                decoded.floor,
+                decoded.discarded_max,
             )
         }};
     }
 
-    let (keys, counts, errors, total, floor) = match key_type {
+    let (keys, counts, errors, total, discarded_max) = match key_type {
         "i8" => unpack!(I8, i8),
         "i16" => unpack!(I16, i16),
         "i32" => unpack!(I32, i32),
@@ -285,7 +285,7 @@ fn decode_payload(
                 decoded.counts,
                 decoded.errors,
                 decoded.total,
-                decoded.floor,
+                decoded.discarded_max,
             )
         }
         other => {
@@ -307,7 +307,7 @@ fn decode_payload(
     Ok(SpaceSavingState {
         capacity,
         total,
-        floor,
+        discarded_max,
         entries: keys
             .into_iter()
             .zip(counts)
@@ -338,7 +338,7 @@ impl<H: SketchHasher + HashProfile> SpaceSaving<H> {
         let entries = self.wire_entries();
         let key_type = wire_key_type(&entries)?;
         let metadata = rmp_serde::to_vec_named(&space_saving_metadata::<H>(capacity, key_type))?;
-        let payload = encode_payload(key_type, &entries, self.total, self.floor)?;
+        let payload = encode_payload(key_type, &entries, self.total, self.discarded_max)?;
         Ok(envelope::encode(SPACE_SAVING_KIND, &metadata, &payload))
     }
 
@@ -495,7 +495,7 @@ mod tests {
         );
     }
 
-    /// The ceiling a merge leaves behind lives only in `floor`, which is not
+    /// The ceiling a merge leaves behind lives only in `discarded_max`, which is not
     /// derivable from the triples: a payload carrying only the triples would
     /// decode to `min_count == 0` here.
     #[test]
@@ -671,14 +671,14 @@ mod tests {
         let seated = SpaceSaving::<DefaultXxHasher>::rebuild(SpaceSavingState {
             capacity: 4,
             total: 28,
-            floor: 0,
+            discarded_max: 0,
             entries,
         })
         .expect("rebuild");
         let reseated = SpaceSaving::<DefaultXxHasher>::rebuild(SpaceSavingState {
             capacity: 4,
             total: 28,
-            floor: 0,
+            discarded_max: 0,
             entries: reversed,
         })
         .expect("rebuild");
@@ -875,7 +875,7 @@ mod tests {
         counts: Vec<u64>,
         errors: Vec<u64>,
         total: u64,
-        floor: u64,
+        discarded_max: u64,
     ) -> Vec<u8> {
         let metadata =
             rmp_serde::to_vec_named(&space_saving_metadata::<DefaultXxHasher>(capacity, "u64"))
@@ -885,7 +885,7 @@ mod tests {
             counts,
             errors,
             total,
-            floor,
+            discarded_max,
         })
         .expect("payload");
         envelope::encode(SPACE_SAVING_KIND, &metadata, &payload)
@@ -902,7 +902,7 @@ mod tests {
                 counts: vec![1],
                 errors: vec![0],
                 total: 1,
-                floor: 0,
+                discarded_max: 0,
             })
             .expect("payload");
             (metadata, payload)
@@ -974,7 +974,7 @@ mod tests {
         let summary = SpaceSaving::<DefaultXxHasher>::rebuild(SpaceSavingState {
             capacity: 1 << 40,
             total: 3,
-            floor: 0,
+            discarded_max: 0,
             entries: vec![(HeapItem::U64(1), 3, 0)],
         })
         .expect("a sparse state");
@@ -1000,7 +1000,11 @@ mod tests {
         assert_eq!(decoded.capacity(), u32::MAX as usize);
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded.estimate(&DataInput::U64(7)), 9);
-        assert_eq!(decoded.min_count(), 0, "a sparse summary has no floor");
+        assert_eq!(
+            decoded.min_count(),
+            0,
+            "a sparse summary has no discarded_max"
+        );
         assert_eq!(decoded.top_k(8).len(), 2);
     }
 }

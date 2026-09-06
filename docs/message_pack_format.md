@@ -110,7 +110,7 @@ Converted:
   bit grid packed into `u64`s plus the insert count; the wire covers the
   geometries `Bloom::with_capacity` produces.
 - **Space-Saving** (`src/sketches/space_saving/wire.rs`, kind `0x18 0x00`) — the
-  payload is the `(key, count, error)` triples plus `total` and `floor`; the
+  payload is the `(key, count, error)` triples plus `total` and `discarded_max`; the
   Stream-Summary's links and arenas are rebuilt on decode.
 - **CMSHeap** (`src/sketches/countminsketch_topk/wire.rs`, `0x03 0x00`) and
   **CSHeap** (`src/sketches/countsketch_topk/wire.rs`, `0x0a 0x00`) — a base

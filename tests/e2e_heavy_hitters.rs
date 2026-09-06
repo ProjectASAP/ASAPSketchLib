@@ -632,19 +632,20 @@ fn crafted_state_fails_closed() {
     struct CraftedState {
         capacity: usize,
         total: u64,
-        floor: u64,
+        discarded_max: u64,
         entries: Vec<(HeapItem, u64, u64)>,
     }
 
-    let crafted = |capacity: usize, total: u64, floor: u64, entries: Vec<(HeapItem, u64, u64)>| {
-        rmp_serde::to_vec(&CraftedState {
-            capacity,
-            total,
-            floor,
-            entries,
-        })
-        .expect("serialize")
-    };
+    let crafted =
+        |capacity: usize, total: u64, discarded_max: u64, entries: Vec<(HeapItem, u64, u64)>| {
+            rmp_serde::to_vec(&CraftedState {
+                capacity,
+                total,
+                discarded_max,
+                entries,
+            })
+            .expect("serialize")
+        };
 
     let refused = [
         (crafted(0, 100, 0, Vec::new()), "capacity is zero"),

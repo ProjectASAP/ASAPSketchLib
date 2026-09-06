@@ -40,7 +40,7 @@ const NIL: usize = usize::MAX;
 /// Counters in a default sketch.
 pub const SPACE_SAVING_DEFAULT_CAPACITY: usize = 1024;
 
-/// Counter positions sharing one digest. Two monitored keys colliding on a
+/// Positions of the monitored keys sharing one digest. Two monitored keys colliding on a
 /// 64-bit digest is rare enough that the inline pair is effectively never
 /// spilled.
 type Slot = SmallVec<[usize; 2]>;
@@ -49,7 +49,7 @@ type Index = HashMap<u64, Slot, DigestBuildHasher>;
 
 /// One monitored key.
 #[derive(Clone, Debug)]
-struct Counter {
+struct MonitoredKey {
     key: HeapItem,
     digest: u64,
     error: u64,
@@ -71,7 +71,7 @@ struct Bucket {
 #[derive(Clone, Debug)]
 pub struct SpaceSaving<H: SketchHasher = DefaultXxHasher> {
     capacity: usize,
-    counters: Vec<Counter>,
+    counters: Vec<MonitoredKey>,
     buckets: Vec<Bucket>,
     bucket_free: Vec<usize>,
     bucket_head: usize,
@@ -80,7 +80,7 @@ pub struct SpaceSaving<H: SketchHasher = DefaultXxHasher> {
     total: u64,
     /// Largest count known to have left the summary, so the ceiling on any key
     /// that is no longer monitored.
-    floor: u64,
+    discarded_max: u64,
     _hasher: PhantomData<H>,
 }
 
@@ -103,7 +103,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
             bucket_tail: NIL,
             index: Index::with_capacity_and_hasher(capacity, DigestBuildHasher::default()),
             total: 0,
-            floor: 0,
+            discarded_max: 0,
             _hasher: PhantomData,
         }
     }
@@ -145,7 +145,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
         } else {
             0
         };
-        self.floor.max(lowest)
+        self.discarded_max.max(lowest)
     }
 
     /// Drops every counter.
@@ -157,7 +157,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
         self.bucket_tail = NIL;
         self.index.clear();
         self.total = 0;
-        self.floor = 0;
+        self.discarded_max = 0;
     }
 
     /// Records one occurrence of `value`.
@@ -185,20 +185,20 @@ impl<H: SketchHasher> SpaceSaving<H> {
         }
 
         if self.counters.len() < self.capacity {
-            let seated = self.floor.saturating_add(count);
-            let floor = self.floor;
-            self.seat(digest, input_to_owned(value), seated, floor);
+            let seated = self.discarded_max.saturating_add(count);
+            let discarded_max = self.discarded_max;
+            self.seat(digest, input_to_owned(value), seated, discarded_max);
             return;
         }
 
         let victim = self.buckets[self.bucket_head].head;
         let lowest = self.buckets[self.bucket_head].count;
         debug_assert!(
-            self.floor <= lowest,
+            self.discarded_max <= lowest,
             "the ceiling {} sits above the lowest live count {lowest}",
-            self.floor
+            self.discarded_max
         );
-        self.floor = lowest;
+        self.discarded_max = lowest;
         self.unindex(self.counters[victim].digest, victim);
         self.counters[victim].key = input_to_owned(value);
         self.counters[victim].digest = digest;
@@ -353,16 +353,16 @@ impl<H: SketchHasher> SpaceSaving<H> {
                 .then_with(|| key_order(&a.key).cmp(&key_order(&b.key)))
         });
 
-        let mut floor = mine_min.saturating_add(theirs_min);
+        let mut discarded_max = mine_min.saturating_add(theirs_min);
         if flat.len() > self.capacity {
-            floor = floor.max(flat[self.capacity].count);
+            discarded_max = discarded_max.max(flat[self.capacity].count);
             flat.truncate(self.capacity);
         }
 
         let total = self.total.saturating_add(other.total);
         self.clear();
         self.total = total;
-        self.floor = floor;
+        self.discarded_max = discarded_max;
         for entry in flat {
             self.seat(entry.digest, entry.key, entry.count, entry.error);
         }
@@ -398,7 +398,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
     /// Takes a free counter for `key` at `count` with `error`.
     fn seat(&mut self, digest: u64, key: HeapItem, count: u64, error: u64) {
         let cid = self.counters.len();
-        self.counters.push(Counter {
+        self.counters.push(MonitoredKey {
             key,
             digest,
             error,
@@ -562,7 +562,7 @@ fn key_order(key: &HeapItem) -> (u8, u128, &[u8]) {
 struct SpaceSavingRef<'a> {
     capacity: usize,
     total: u64,
-    floor: u64,
+    discarded_max: u64,
     entries: Vec<(&'a HeapItem, u64, u64)>,
 }
 
@@ -570,7 +570,7 @@ struct SpaceSavingRef<'a> {
 struct SpaceSavingState {
     capacity: usize,
     total: u64,
-    floor: u64,
+    discarded_max: u64,
     entries: Vec<(HeapItem, u64, u64)>,
 }
 
@@ -579,7 +579,7 @@ impl<H: SketchHasher> Serialize for SpaceSaving<H> {
         SpaceSavingRef {
             capacity: self.capacity,
             total: self.total,
-            floor: self.floor,
+            discarded_max: self.discarded_max,
             entries: self
                 .counters
                 .iter()
@@ -636,7 +636,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
             bucket_tail: NIL,
             index: Index::with_capacity_and_hasher(entries.len(), DigestBuildHasher::default()),
             total: state.total,
-            floor: state.floor,
+            discarded_max: state.discarded_max,
             _hasher: PhantomData,
         };
         for (key, count, error) in entries {
@@ -653,10 +653,10 @@ impl<H: SketchHasher> SpaceSaving<H> {
             .map(|c| summary.buckets[c.bucket].count)
             .min()
             .unwrap_or(0);
-        if summary.floor > smallest {
+        if summary.discarded_max > smallest {
             return Err(format!(
                 "space-saving carries a ceiling of {} above its lowest count of {smallest}",
-                summary.floor
+                summary.discarded_max
             ));
         }
         let recorded = summary
@@ -1179,7 +1179,7 @@ mod tests {
         );
     }
 
-    /// The ceiling a merge leaves behind lives only in `floor`; an under-full
+    /// The ceiling a merge leaves behind lives only in `discarded_max`; an under-full
     /// summary reads it from no counter, so a serde round trip that dropped it
     /// would answer below the truth.
     #[test]
@@ -1441,7 +1441,7 @@ mod tests {
         let over_capacity = SpaceSavingState {
             capacity: 1,
             total: 4,
-            floor: 0,
+            discarded_max: 0,
             entries: vec![(HeapItem::I64(1), 2, 0), (HeapItem::I64(2), 2, 0)],
         };
         let cases = [
@@ -1449,7 +1449,7 @@ mod tests {
                 SpaceSavingState {
                     capacity: 0,
                     total: 0,
-                    floor: 0,
+                    discarded_max: 0,
                     entries: Vec::new(),
                 },
                 "capacity is zero",
@@ -1459,7 +1459,7 @@ mod tests {
                 SpaceSavingState {
                     capacity: 4,
                     total: 1,
-                    floor: 0,
+                    discarded_max: 0,
                     entries: vec![(HeapItem::I64(1), 0, 0)],
                 },
                 "at zero",
@@ -1468,7 +1468,7 @@ mod tests {
                 SpaceSavingState {
                     capacity: 4,
                     total: 1,
-                    floor: 0,
+                    discarded_max: 0,
                     entries: vec![(HeapItem::I64(1), 3, 4)],
                 },
                 "error of 4",
@@ -1477,7 +1477,7 @@ mod tests {
                 SpaceSavingState {
                     capacity: 4,
                     total: 2,
-                    floor: 0,
+                    discarded_max: 0,
                     entries: vec![(HeapItem::I64(1), 2, 0), (HeapItem::I64(1), 1, 0)],
                 },
                 "same key twice",
@@ -1486,7 +1486,7 @@ mod tests {
                 SpaceSavingState {
                     capacity: 4,
                     total: 3,
-                    floor: u64::MAX,
+                    discarded_max: u64::MAX,
                     entries: vec![(HeapItem::I64(1), 3, 0)],
                 },
                 "ceiling of 18446744073709551615 above its lowest count of 3",
@@ -1495,7 +1495,7 @@ mod tests {
                 SpaceSavingState {
                     capacity: 4,
                     total: 0,
-                    floor: 0,
+                    discarded_max: 0,
                     entries: vec![(HeapItem::I64(1), 9, 0)],
                 },
                 "total of 0 under the 9",
@@ -1516,7 +1516,7 @@ mod tests {
         let state = SpaceSavingState {
             capacity: 1 << 40,
             total: 3,
-            floor: 0,
+            discarded_max: 0,
             entries: vec![(HeapItem::I64(1), 3, 0)],
         };
         let summary = SpaceSaving::<DefaultXxHasher>::rebuild(state).expect("a sparse state");
@@ -1810,7 +1810,7 @@ mod collisions {
         let repeated = SpaceSavingState {
             capacity: 4,
             total: 9,
-            floor: 0,
+            discarded_max: 0,
             entries: vec![(HeapItem::I64(10), 5, 0), (HeapItem::I64(10), 4, 0)],
         };
         let problem = Colliding::rebuild(repeated).expect_err("a repeated key");

@@ -132,7 +132,7 @@ A summary travels as `capacity`, `total`, the unmonitored ceiling, and one
 the key index all follow from the triples and are rebuilt on load, so no arena
 index reaches the wire and no crafted state can point one out of bounds or into
 a loop. `capacity` and the key type are ASAPv1 metadata; the payload is
-`[keys, counts, errors, total, floor]`.
+`[keys, counts, errors, total, discarded_max]`.
 
 Keys are `HeapItem`s, so the key type is a runtime property: the metadata's
 `key_type` names the **exact** variant (`"i32"` stays `"i32"`, never widened to
