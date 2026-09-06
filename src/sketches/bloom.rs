@@ -33,9 +33,13 @@ pub const BLOOM_DEFAULT_COLS: usize = 1 << 16;
 
 /// Slices that can hash independently, the matrix row bound under Bloom's name.
 ///
-/// Row `r` hashes with seed index `r % SEEDLIST.len()` on both paths, so slice
-/// `r` and slice `r + BLOOM_MAX_SLICES` receive the same seed and hold the same
-/// bits. Selectivity therefore stops growing past this many rows.
+/// On the regular path row `r` hashes with seed index `r % SEEDLIST.len()`, so
+/// slice `r` and slice `r + BLOOM_MAX_SLICES` receive the same seed and hold
+/// the same bits, and selectivity stops growing past this many rows. The fast
+/// path duplicates the same way only once the slices are wide enough to need
+/// one hash per row; under a packed layout every row decodes its own window of
+/// a single hash and no two slices coincide. [`Bloom::effective_rows`] applies
+/// the cap either way.
 pub const BLOOM_MAX_SLICES: usize = MATRIX_MAX_ROWS;
 
 /// Ceiling on the bits [`Bloom::with_capacity`] will size to, 256 MiB packed.
@@ -153,12 +157,15 @@ impl<Mode, H: SketchHasher> Bloom<Mode, H> {
 
     /// The `(rows, cols)` [`Self::with_capacity`] would choose.
     ///
-    /// `k = round(log2(1/p))` slices, capped at [`BLOOM_MAX_SLICES`], then the
-    /// slice width that hits `p` with exactly that many slices,
-    /// `cols = -n / ln(1 - p^(1/k))`, rounded up to a power of two. Solving for
-    /// the capped `k` rather than assuming the `k`-optimal split is what keeps
-    /// a small target reachable: the cap costs bits, not accuracy, until
-    /// [`BLOOM_MAX_BITS`] binds.
+    /// `k = round(ln(2) * m / n)` slices, capped at [`BLOOM_MAX_SLICES`], over
+    /// the bit budget `m = ceil(-n * ln(p) / ln(2)^2)` for `n = expected_items`
+    /// (at least 1) at target `p`. The ceiling on `m` makes `k` a function of
+    /// `n` as well as `p`, costing one slice more than `round(log2(1/p))` for
+    /// the smallest loads. Then the slice width that hits `p` with exactly that
+    /// many slices, `cols = -n / ln(1 - p^(1/k))`, rounded up to a power of
+    /// two. Solving for the capped `k` rather than assuming the `k`-optimal
+    /// split is what keeps a small target reachable: the cap costs bits, not
+    /// accuracy, until [`BLOOM_MAX_BITS`] binds.
     ///
     /// The power-of-two rounding keeps the column fold free of modulo bias, so
     /// the measured rate lands at or under the target rather than above it.
@@ -338,5 +345,523 @@ impl<H: SketchHasher> Bloom<FastPath, H> {
     pub fn contains(&self, value: &DataInput) -> bool {
         let hashed_val = <BitMatrix as FastPathHasher<H>>::hash_for_matrix(&self.bits, value);
         self.bits.fast_query_min(&hashed_val, |cell, _, _| *cell)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WIDE_COLS: usize = 1 << 10;
+    const NARROW_COLS: usize = 16;
+
+    fn keys(count: u64) -> Vec<DataInput<'static>> {
+        (0..count).map(DataInput::U64).collect()
+    }
+
+    fn slice_bits(filter: &BitMatrix, row: usize) -> Vec<bool> {
+        (0..filter.cols()).map(|col| filter.get(row, col)).collect()
+    }
+
+    /// The sizing helper is the only thing a caller can inspect before paying
+    /// for the allocation, so it has to describe the filter `with_capacity`
+    /// actually builds — a drift between the two would make every
+    /// capacity-planning decision wrong.
+    #[test]
+    fn with_capacity_builds_exactly_the_geometry_dimensions_for_reports() {
+        for expected in [0usize, 1, 17, 1_000, 250_000] {
+            for target in [0.5, 0.1, 0.01, 1e-4, 1e-6] {
+                let (rows, cols) = Bloom::<RegularPath>::dimensions_for(expected, target);
+                let built = Bloom::<RegularPath>::with_capacity(expected, target);
+                assert_eq!(
+                    (built.rows(), built.cols()),
+                    (rows, cols),
+                    "with_capacity({expected}, {target}) built {}x{} but dimensions_for reported {rows}x{cols}",
+                    built.rows(),
+                    built.cols()
+                );
+            }
+        }
+    }
+
+    /// The slice count is split out of the bit budget for the expected load, so
+    /// it tracks `expected_items` as well as the target: rounding the budget up
+    /// buys one slice more than `round(log2(1/p))` for the smallest loads, and
+    /// the two agree once the load is larger. The cap binds either way.
+    #[test]
+    fn the_slice_count_comes_from_the_bit_budget_not_the_target_alone() {
+        for (expected, target, slices) in
+            [(1usize, 0.05, 5usize), (1, 1.0 / 128.0, 8), (2, 1e-4, 14)]
+        {
+            let exponent = (1.0f64 / target).log2().round() as usize;
+            let (rows, _) = Bloom::<RegularPath>::dimensions_for(expected, target);
+            assert_eq!(
+                rows, slices,
+                "dimensions_for({expected}, {target}) chose {rows} slices, not {slices}"
+            );
+            assert_eq!(
+                rows,
+                exponent + 1,
+                "the budget for {expected} items no longer costs a slice over \
+                 round(log2(1/{target})) = {exponent}"
+            );
+        }
+
+        for target in [0.5, 0.05, 0.01, 1.0 / 128.0, 1e-4, 3e-6] {
+            let exponent = (1.0f64 / target)
+                .log2()
+                .round()
+                .clamp(1.0, BLOOM_MAX_SLICES as f64) as usize;
+            for expected in [1_000usize, 100_000, 10_000_000] {
+                let (rows, _) = Bloom::<RegularPath>::dimensions_for(expected, target);
+                assert_eq!(
+                    rows, exponent,
+                    "dimensions_for({expected}, {target}) chose {rows} slices, \
+                     round(log2(1/p)) is {exponent}"
+                );
+            }
+        }
+
+        let (capped, _) = Bloom::<RegularPath>::dimensions_for(1_000_000, 1e-12);
+        assert_eq!(
+            capped, BLOOM_MAX_SLICES,
+            "a target needing more slices than the seed list holds chose {capped}"
+        );
+    }
+
+    /// A target outside `(0, 1)` is clamped rather than rejected, and the clamp
+    /// lands on the interval's own endpoints: a caller who passes `0.0` must get
+    /// the sharpest filter the sizing can express, not a degenerate one.
+    #[test]
+    fn a_target_outside_the_open_unit_interval_is_clamped_to_the_endpoints() {
+        let lowest = Bloom::<RegularPath>::dimensions_for(1_000, f64::MIN_POSITIVE);
+        let highest = Bloom::<RegularPath>::dimensions_for(1_000, 1.0 - f64::EPSILON);
+        for below in [0.0, -0.0, -1.0, f64::MIN] {
+            assert_eq!(
+                Bloom::<RegularPath>::dimensions_for(1_000, below),
+                lowest,
+                "target {below} did not clamp up to the smallest positive rate {lowest:?}"
+            );
+        }
+        for above in [1.0, 1.5, f64::MAX] {
+            assert_eq!(
+                Bloom::<RegularPath>::dimensions_for(1_000, above),
+                highest,
+                "target {above} did not clamp down to the largest rate below one {highest:?}"
+            );
+        }
+        for (rows, cols) in [lowest, highest] {
+            assert!(rows >= 1 && cols >= 1, "clamping produced {rows}x{cols}");
+            assert!(
+                cols.is_power_of_two(),
+                "clamped cols {cols} is not a power of two"
+            );
+        }
+    }
+
+    /// A NaN target cannot be ordered, so clamping it would silently produce a
+    /// filter that answers yes to everything; sizing panics instead.
+    #[test]
+    #[should_panic(expected = "target false-positive rate must be finite")]
+    fn a_target_that_is_not_a_number_panics_instead_of_sizing_a_degenerate_filter() {
+        Bloom::<RegularPath>::dimensions_for(1_000, f64::NAN);
+    }
+
+    /// Same for an infinite target, and the panic has to come from
+    /// `with_capacity` too, not only from the helper it delegates to.
+    #[test]
+    #[should_panic(expected = "target false-positive rate must be finite")]
+    fn an_infinite_target_panics_instead_of_sizing_a_degenerate_filter() {
+        Bloom::<RegularPath>::with_capacity(1_000, f64::INFINITY);
+    }
+
+    /// Sizing for nothing must still produce a filter, not a zero dimension
+    /// that would panic the moment a key arrives.
+    #[test]
+    fn sizing_for_zero_expected_items_still_yields_a_filter_that_answers() {
+        let (rows, cols) = Bloom::<RegularPath>::dimensions_for(0, 0.01);
+        assert!(
+            rows >= 1 && cols >= 1,
+            "sizing for nothing gave {rows}x{cols}"
+        );
+        assert_eq!(
+            (rows, cols),
+            Bloom::<RegularPath>::dimensions_for(1, 0.01),
+            "sizing for zero items differs from sizing for one"
+        );
+
+        let mut filter = Bloom::<RegularPath>::with_capacity(0, 0.01);
+        let key = DataInput::Str("only");
+        filter.insert(&key);
+        assert!(
+            filter.contains(&key),
+            "a minimally sized filter lost its only member"
+        );
+    }
+
+    /// `Default` is what every sketch built without a size gets, so its geometry
+    /// is pinned to the two public constants and those must name a filter the
+    /// hash family can actually serve.
+    #[test]
+    fn the_default_geometry_is_the_documented_pair() {
+        let filter = Bloom::<RegularPath>::default();
+        assert_eq!(
+            (filter.rows(), filter.cols()),
+            (BLOOM_DEFAULT_ROWS, BLOOM_DEFAULT_COLS),
+            "Default built {}x{}",
+            filter.rows(),
+            filter.cols()
+        );
+        assert!(
+            filter.rows() <= BLOOM_MAX_SLICES,
+            "the default {} rows exceed the {BLOOM_MAX_SLICES} independent slices",
+            filter.rows()
+        );
+        assert!(
+            filter.cols().is_power_of_two(),
+            "the default slice width {} is not a power of two",
+            filter.cols()
+        );
+        assert_eq!(
+            filter.effective_rows(),
+            filter.rows(),
+            "the default geometry wastes {} rows on duplicate seeds",
+            filter.rows() - filter.effective_rows()
+        );
+        assert!(
+            filter.bit_capacity() <= BLOOM_MAX_BITS,
+            "the default geometry wants {} bits, past the {BLOOM_MAX_BITS} ceiling",
+            filter.bit_capacity()
+        );
+        assert!(filter.is_empty(), "a fresh default filter has bits set");
+    }
+
+    /// Row `r + BLOOM_MAX_SLICES` draws the same seed as row `r`, so it holds
+    /// the same bits and buys no selectivity. Pinning this is what makes
+    /// `effective_rows` an honest count rather than a guess.
+    #[test]
+    fn slices_past_the_seed_list_duplicate_an_earlier_slice_bit_for_bit() {
+        for (cols, stream) in [(WIDE_COLS, 200), (NARROW_COLS, 4)] {
+            let rows = BLOOM_MAX_SLICES + 3;
+            let mut filter = Bloom::<RegularPath>::with_dimensions(rows, cols);
+            for key in keys(stream) {
+                filter.insert(&key);
+            }
+            assert!(
+                filter.fill_ratio() < 1.0,
+                "{rows}x{cols}: a saturated filter makes every slice trivially equal"
+            );
+            for row in 0..rows - BLOOM_MAX_SLICES {
+                assert_eq!(
+                    slice_bits(filter.as_bits(), row),
+                    slice_bits(filter.as_bits(), row + BLOOM_MAX_SLICES),
+                    "{rows}x{cols}: slice {row} and slice {} differ",
+                    row + BLOOM_MAX_SLICES
+                );
+            }
+            assert_eq!(
+                filter.effective_rows(),
+                BLOOM_MAX_SLICES,
+                "{rows}x{cols}: effective_rows counted the duplicate slices"
+            );
+        }
+    }
+
+    /// Whether the fast path duplicates past the seed list is decided by the
+    /// layout it picks for the matrix hash. Wide slices need one hash per row
+    /// and row `r + BLOOM_MAX_SLICES` then draws the same seed as row `r`; a
+    /// narrow enough matrix packs into a single hash whose rows each decode
+    /// their own bit window, and the slices stay distinct. `effective_rows`
+    /// caps the count in both layouts, under-reporting the packed one.
+    #[test]
+    fn the_fast_path_duplicates_slices_only_when_the_matrix_hash_does_not_pack() {
+        let rows = BLOOM_MAX_SLICES + 3;
+
+        assert_eq!(
+            crate::hash_mode_for_matrix(rows, WIDE_COLS),
+            crate::MatrixHashMode::Rows,
+            "a {rows}x{WIDE_COLS} matrix hash no longer needs a hash per row"
+        );
+        let mut wide = Bloom::<FastPath>::with_dimensions(rows, WIDE_COLS);
+        for key in keys(200) {
+            wide.insert(&key);
+        }
+        assert!(
+            wide.fill_ratio() < 1.0,
+            "{rows}x{WIDE_COLS}: a saturated filter makes every slice trivially equal"
+        );
+        for row in 0..rows - BLOOM_MAX_SLICES {
+            assert_eq!(
+                slice_bits(wide.as_bits(), row),
+                slice_bits(wide.as_bits(), row + BLOOM_MAX_SLICES),
+                "{rows}x{WIDE_COLS}: slice {row} and slice {} differ",
+                row + BLOOM_MAX_SLICES
+            );
+        }
+
+        assert_eq!(
+            crate::hash_mode_for_matrix(rows, NARROW_COLS),
+            crate::MatrixHashMode::Packed128,
+            "a {rows}x{NARROW_COLS} matrix hash no longer packs into one value"
+        );
+        let mut narrow = Bloom::<FastPath>::with_dimensions(rows, NARROW_COLS);
+        for key in keys(4) {
+            narrow.insert(&key);
+        }
+        assert!(
+            narrow.fill_ratio() < 1.0,
+            "{rows}x{NARROW_COLS}: a saturated filter makes every slice trivially equal"
+        );
+        for row in 0..rows - BLOOM_MAX_SLICES {
+            assert_ne!(
+                slice_bits(narrow.as_bits(), row),
+                slice_bits(narrow.as_bits(), row + BLOOM_MAX_SLICES),
+                "{rows}x{NARROW_COLS}: slice {row} and slice {} hold the same bits",
+                row + BLOOM_MAX_SLICES
+            );
+        }
+        assert_eq!(
+            narrow.effective_rows(),
+            BLOOM_MAX_SLICES,
+            "effective_rows counted the {rows} independent windows instead of capping"
+        );
+    }
+
+    /// Both rate reporters raise a per-slice probability to a slice count, so
+    /// counting the duplicate rows would report a rate the filter cannot
+    /// deliver. They must use `effective_rows`, not `rows`.
+    #[test]
+    fn both_rate_reporters_count_only_the_slices_that_discriminate() {
+        let rows = BLOOM_MAX_SLICES + 5;
+        let mut filter = Bloom::<RegularPath>::with_dimensions(rows, WIDE_COLS);
+        for key in keys(400) {
+            filter.insert(&key);
+        }
+        let fill = filter.fill_ratio();
+        assert!(
+            fill > 0.0 && fill < 1.0,
+            "fill ratio {fill} leaves the exponent unobservable"
+        );
+
+        assert_eq!(
+            filter.estimated_fpp(),
+            fill.powi(BLOOM_MAX_SLICES as i32),
+            "estimated_fpp did not use the capped slice count"
+        );
+        assert_ne!(
+            filter.estimated_fpp(),
+            fill.powi(rows as i32),
+            "estimated_fpp used all {rows} rows"
+        );
+
+        let per_slice = 1.0 - (-400.0f64 / WIDE_COLS as f64).exp();
+        assert_eq!(
+            filter.predicted_fpp(400),
+            per_slice.powi(BLOOM_MAX_SLICES as i32),
+            "predicted_fpp did not use the capped slice count"
+        );
+        assert_ne!(
+            filter.predicted_fpp(400),
+            per_slice.powi(rows as i32),
+            "predicted_fpp used all {rows} rows"
+        );
+    }
+
+    /// The two ends of the rate scale are what a caller watches for: an empty
+    /// filter must report no false positives, and one whose every bit is set
+    /// must report certainty rather than a comfortable-looking fraction.
+    #[test]
+    fn an_empty_filter_predicts_nothing_and_a_saturated_one_predicts_everything() {
+        let mut filter = Bloom::<RegularPath>::with_dimensions(3, 8);
+        assert_eq!(filter.fill_ratio(), 0.0, "a fresh filter has bits set");
+        assert_eq!(
+            filter.estimated_fpp(),
+            0.0,
+            "an empty filter claims false positives"
+        );
+        assert_eq!(
+            filter.predicted_fpp(0),
+            0.0,
+            "predicting for no items claims false positives"
+        );
+
+        let mut saturating = 0;
+        for key in keys(1_000) {
+            filter.insert(&key);
+            saturating += 1;
+            if filter.fill_ratio() == 1.0 {
+                break;
+            }
+        }
+        assert_eq!(
+            filter.fill_ratio(),
+            1.0,
+            "a 3x8 filter was still not full after {saturating} inserts"
+        );
+        assert_eq!(
+            filter.estimated_fpp(),
+            1.0,
+            "a saturated filter reported a rate below certainty"
+        );
+    }
+
+    /// The filter is partitioned: each slice owns its own columns, so one key
+    /// touches exactly one bit per row whatever the slice width. A fold that
+    /// escaped its slice, or a slice width that is not a power of two folding
+    /// wrong, shows up here as a bit count that is not the row count.
+    #[test]
+    fn a_single_insert_sets_exactly_one_bit_in_every_slice() {
+        for cols in [1usize, 2, 7, 64, 100, WIDE_COLS] {
+            for rows in [1usize, 5, BLOOM_MAX_SLICES + 2] {
+                let key = DataInput::Str("solo");
+
+                let mut regular = Bloom::<RegularPath>::with_dimensions(rows, cols);
+                regular.insert(&key);
+                assert_eq!(
+                    regular.as_bits().count_ones(),
+                    rows,
+                    "regular path set {} bits in a {rows}x{cols} filter",
+                    regular.as_bits().count_ones()
+                );
+                assert_eq!(
+                    regular.fill_ratio(),
+                    rows as f64 / (rows * cols) as f64,
+                    "regular path fill ratio disagrees with the bits set in {rows}x{cols}"
+                );
+                assert!(regular.contains(&key), "regular path lost its only member");
+
+                let mut fast = Bloom::<FastPath>::with_dimensions(rows, cols);
+                fast.insert(&key);
+                assert_eq!(
+                    fast.as_bits().count_ones(),
+                    rows,
+                    "fast path set {} bits in a {rows}x{cols} filter",
+                    fast.as_bits().count_ones()
+                );
+                assert!(fast.contains(&key), "fast path lost its only member");
+            }
+        }
+    }
+
+    /// `inserted` counts calls, not distinct keys — it is the denominator a
+    /// caller compares against `predicted_fpp`, so silently deduplicating it
+    /// would make the filter look better sized than it is. `clear` has to take
+    /// it back down with the bits.
+    #[test]
+    fn the_insert_counter_counts_calls_and_clear_returns_it_to_zero() {
+        let mut filter = Bloom::<RegularPath>::with_dimensions(4, 256);
+        assert_eq!(filter.inserted(), 0, "a fresh filter has a non-zero count");
+
+        let repeated = DataInput::Str("same");
+        for _ in 0..5 {
+            filter.insert(&repeated);
+        }
+        assert_eq!(
+            filter.inserted(),
+            5,
+            "five inserts of one key counted as {}",
+            filter.inserted()
+        );
+        assert!(!filter.is_empty(), "an inserted-into filter reports empty");
+
+        filter.bulk_insert(&keys(3));
+        assert_eq!(
+            filter.inserted(),
+            8,
+            "bulk_insert of three left the count at {}",
+            filter.inserted()
+        );
+
+        filter.clear();
+        assert_eq!(
+            filter.inserted(),
+            0,
+            "clear left the count at {}",
+            filter.inserted()
+        );
+        assert!(filter.is_empty(), "clear left bits set");
+        assert_eq!(filter.fill_ratio(), 0.0, "clear left a non-zero fill ratio");
+    }
+
+    /// A merge unions the bits, so the merged filter has seen both streams and
+    /// its count has to say so; a count that stayed put would understate the
+    /// load the filter is carrying.
+    #[test]
+    fn merging_identical_geometries_sums_the_insert_counts() {
+        let mut left = Bloom::<RegularPath>::with_dimensions(5, 512);
+        let mut right = Bloom::<RegularPath>::with_dimensions(5, 512);
+        for key in keys(30) {
+            left.insert(&key);
+        }
+        for value in 30..70u64 {
+            right.insert(&DataInput::U64(value));
+        }
+        let expected = left.inserted() + right.inserted();
+
+        left.merge_from(&right);
+        assert_eq!(
+            left.inserted(),
+            expected,
+            "merged count is {} not {expected}",
+            left.inserted()
+        );
+        for value in 0..70u64 {
+            assert!(
+                left.contains(&DataInput::U64(value)),
+                "merged filter lost member {value}"
+            );
+        }
+        assert_eq!(
+            (left.rows(), left.cols()),
+            (5, 512),
+            "merging changed the geometry"
+        );
+    }
+
+    /// Two geometries index the same key at different columns, so unioning them
+    /// word by word would produce a filter that answers no about its own
+    /// members. It must panic instead of returning that quietly.
+    #[test]
+    #[should_panic(expected = "bit matrices must have the same dimensions to be unioned")]
+    fn merging_mismatched_geometries_panics_instead_of_unioning_a_prefix() {
+        let mut left = Bloom::<RegularPath>::with_dimensions(5, 512);
+        let right = Bloom::<RegularPath>::with_dimensions(5, 256);
+        left.merge_from(&right);
+    }
+
+    /// A zero dimension is a filter with no bits to probe; construction rejects
+    /// it rather than handing back something every query would panic on.
+    #[test]
+    #[should_panic(expected = "a bit matrix needs both dimensions")]
+    fn a_zero_slice_width_is_rejected_at_construction() {
+        Bloom::<RegularPath>::with_dimensions(4, 0);
+    }
+
+    /// `bit_capacity` is the addressable grid and `size_in_bytes` is the packed
+    /// storage behind it; the second rounds each row up to whole words, so it
+    /// must cover the first without ever being confused for it.
+    #[test]
+    fn bit_capacity_and_packed_size_describe_the_same_grid() {
+        for (rows, cols) in [(1usize, 1usize), (3, 7), (5, 64), (7, 65), (23, WIDE_COLS)] {
+            let filter = Bloom::<RegularPath>::with_dimensions(rows, cols);
+            assert_eq!(
+                filter.bit_capacity(),
+                rows * cols,
+                "{rows}x{cols} reported {} addressable bits",
+                filter.bit_capacity()
+            );
+            assert_eq!(
+                filter.size_in_bytes(),
+                rows * cols.div_ceil(64) * 8,
+                "{rows}x{cols} reported {} bytes of storage",
+                filter.size_in_bytes()
+            );
+            assert!(
+                filter.size_in_bytes() * 8 >= filter.bit_capacity(),
+                "{rows}x{cols}: {} bytes cannot hold {} bits",
+                filter.size_in_bytes(),
+                filter.bit_capacity()
+            );
+        }
     }
 }
