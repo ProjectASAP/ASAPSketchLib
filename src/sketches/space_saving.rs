@@ -17,7 +17,7 @@
 //! bucket list and walks it to reach its destination, one step per bucket it
 //! passes.
 //!
-//! Both lists are arenas of indices rather than pointers: `counters` is
+//! Both lists are arenas of indices rather than pointers: `monitored` is
 //! allocated once up to `capacity` and reused in place, and `buckets` recycles
 //! through a free list. Only the `(key, count, error)` triples reach the wire;
 //! the arenas and the key index are rebuilt from them on load.
@@ -71,7 +71,7 @@ struct Bucket {
 #[derive(Clone, Debug)]
 pub struct SpaceSaving<H: SketchHasher = DefaultXxHasher> {
     capacity: usize,
-    counters: Vec<MonitoredKey>,
+    monitored: Vec<MonitoredKey>,
     buckets: Vec<Bucket>,
     bucket_free: Vec<usize>,
     bucket_head: usize,
@@ -96,7 +96,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
         let capacity = capacity.max(1);
         Self {
             capacity,
-            counters: Vec::with_capacity(capacity),
+            monitored: Vec::with_capacity(capacity),
             buckets: Vec::new(),
             bucket_free: Vec::new(),
             bucket_head: NIL,
@@ -117,13 +117,13 @@ impl<H: SketchHasher> SpaceSaving<H> {
     /// Keys currently monitored.
     #[inline(always)]
     pub fn len(&self) -> usize {
-        self.counters.len()
+        self.monitored.len()
     }
 
     /// True while nothing has been recorded.
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.counters.is_empty()
+        self.monitored.is_empty()
     }
 
     /// Total weight recorded, monitored or displaced.
@@ -140,7 +140,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
     /// nothing.
     #[inline(always)]
     pub fn min_count(&self) -> u64 {
-        let lowest = if self.counters.len() == self.capacity && self.bucket_head != NIL {
+        let lowest = if self.monitored.len() == self.capacity && self.bucket_head != NIL {
             self.buckets[self.bucket_head].count
         } else {
             0
@@ -150,7 +150,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
 
     /// Drops every counter.
     pub fn clear(&mut self) {
-        self.counters.clear();
+        self.monitored.clear();
         self.buckets.clear();
         self.bucket_free.clear();
         self.bucket_head = NIL;
@@ -184,7 +184,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
             return;
         }
 
-        if self.counters.len() < self.capacity {
+        if self.monitored.len() < self.capacity {
             let seated = self.discarded_max.saturating_add(count);
             let discarded_max = self.discarded_max;
             self.seat(digest, input_to_owned(value), seated, discarded_max);
@@ -199,10 +199,10 @@ impl<H: SketchHasher> SpaceSaving<H> {
             self.discarded_max
         );
         self.discarded_max = lowest;
-        self.unindex(self.counters[victim].digest, victim);
-        self.counters[victim].key = input_to_owned(value);
-        self.counters[victim].digest = digest;
-        self.counters[victim].error = lowest;
+        self.unindex(self.monitored[victim].digest, victim);
+        self.monitored[victim].key = input_to_owned(value);
+        self.monitored[victim].digest = digest;
+        self.monitored[victim].error = lowest;
         self.index.entry(digest).or_default().push(victim);
         self.raise(victim, count);
     }
@@ -223,7 +223,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
     pub fn estimate(&self, value: &DataInput) -> u64 {
         let digest = H::hash64_seeded(0, value);
         match self.find(digest, value) {
-            Some(cid) => self.buckets[self.counters[cid].bucket].count,
+            Some(cid) => self.buckets[self.monitored[cid].bucket].count,
             None => 0,
         }
     }
@@ -236,7 +236,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
     pub fn upper_bound(&self, value: &DataInput) -> u64 {
         let digest = H::hash64_seeded(0, value);
         match self.find(digest, value) {
-            Some(cid) => self.buckets[self.counters[cid].bucket].count,
+            Some(cid) => self.buckets[self.monitored[cid].bucket].count,
             None => self.min_count(),
         }
     }
@@ -247,7 +247,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
     pub fn error(&self, value: &DataInput) -> u64 {
         let digest = H::hash64_seeded(0, value);
         match self.find(digest, value) {
-            Some(cid) => self.counters[cid].error,
+            Some(cid) => self.monitored[cid].error,
             None => self.min_count(),
         }
     }
@@ -258,8 +258,8 @@ impl<H: SketchHasher> SpaceSaving<H> {
         let digest = H::hash64_seeded(0, value);
         match self.find(digest, value) {
             Some(cid) => {
-                let count = self.buckets[self.counters[cid].bucket].count;
-                count.saturating_sub(self.counters[cid].error) > self.min_count()
+                let count = self.buckets[self.monitored[cid].bucket].count;
+                count.saturating_sub(self.monitored[cid].error) > self.min_count()
             }
             None => false,
         }
@@ -268,18 +268,18 @@ impl<H: SketchHasher> SpaceSaving<H> {
     /// The `k` monitored keys with the largest counts, highest first, as
     /// `(key, count, error)`.
     pub fn top_k(&self, k: usize) -> Vec<(HeapItem, u64, u64)> {
-        let mut out = Vec::with_capacity(k.min(self.counters.len()));
+        let mut out = Vec::with_capacity(k.min(self.monitored.len()));
         let mut bid = self.bucket_tail;
         while bid != NIL && out.len() < k {
             let count = self.buckets[bid].count;
             let mut cid = self.buckets[bid].head;
             while cid != NIL && out.len() < k {
                 out.push((
-                    self.counters[cid].key.clone(),
+                    self.monitored[cid].key.clone(),
                     count,
-                    self.counters[cid].error,
+                    self.monitored[cid].error,
                 ));
-                cid = self.counters[cid].next;
+                cid = self.monitored[cid].next;
             }
             bid = self.buckets[bid].prev;
         }
@@ -288,7 +288,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
 
     /// Every monitored key as `(key, count, error)`, in no particular order.
     pub fn entries(&self) -> Vec<(HeapItem, u64, u64)> {
-        self.counters
+        self.monitored
             .iter()
             .map(|c| (c.key.clone(), self.buckets[c.bucket].count, c.error))
             .collect()
@@ -311,7 +311,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
 
         let mut merged: HashMap<u64, SmallVec<[MergeEntry; 2]>, DigestBuildHasher> =
             HashMap::default();
-        for c in &self.counters {
+        for c in &self.monitored {
             merged.entry(c.digest).or_default().push(MergeEntry {
                 key: c.key.clone(),
                 digest: c.digest,
@@ -320,7 +320,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
                 paired: false,
             });
         }
-        for c in &other.counters {
+        for c in &other.monitored {
             let count = other.buckets[c.bucket].count;
             let slot = merged.entry(c.digest).or_default();
             match slot.iter_mut().find(|entry| entry.key == c.key) {
@@ -374,7 +374,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
         self.index.get(&digest).and_then(|ids| {
             ids.iter()
                 .copied()
-                .find(|cid| self.counters[*cid].key == *value)
+                .find(|cid| self.monitored[*cid].key == *value)
         })
     }
 
@@ -382,7 +382,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
         self.index.get(&digest).and_then(|ids| {
             ids.iter()
                 .copied()
-                .find(|cid| self.counters[*cid].key == *key)
+                .find(|cid| self.monitored[*cid].key == *key)
         })
     }
 
@@ -397,8 +397,8 @@ impl<H: SketchHasher> SpaceSaving<H> {
 
     /// Takes a free counter for `key` at `count` with `error`.
     fn seat(&mut self, digest: u64, key: HeapItem, count: u64, error: u64) {
-        let cid = self.counters.len();
-        self.counters.push(MonitoredKey {
+        let cid = self.monitored.len();
+        self.monitored.push(MonitoredKey {
             key,
             digest,
             error,
@@ -413,7 +413,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
 
     /// Moves `cid` up by `count`, creating the destination bucket if needed.
     fn raise(&mut self, cid: usize, count: u64) {
-        let from = self.counters[cid].bucket;
+        let from = self.monitored[cid].bucket;
         let target_count = self.buckets[from].count.saturating_add(count);
         if target_count == self.buckets[from].count {
             return;
@@ -475,30 +475,30 @@ impl<H: SketchHasher> SpaceSaving<H> {
 
     fn attach(&mut self, cid: usize, bid: usize) {
         let head = self.buckets[bid].head;
-        self.counters[cid].prev = NIL;
-        self.counters[cid].next = head;
-        self.counters[cid].bucket = bid;
+        self.monitored[cid].prev = NIL;
+        self.monitored[cid].next = head;
+        self.monitored[cid].bucket = bid;
         if head != NIL {
-            self.counters[head].prev = cid;
+            self.monitored[head].prev = cid;
         }
         self.buckets[bid].head = cid;
     }
 
     fn detach(&mut self, cid: usize) {
-        let bid = self.counters[cid].bucket;
-        let prev = self.counters[cid].prev;
-        let next = self.counters[cid].next;
+        let bid = self.monitored[cid].bucket;
+        let prev = self.monitored[cid].prev;
+        let next = self.monitored[cid].next;
         if prev != NIL {
-            self.counters[prev].next = next;
+            self.monitored[prev].next = next;
         } else {
             self.buckets[bid].head = next;
         }
         if next != NIL {
-            self.counters[next].prev = prev;
+            self.monitored[next].prev = prev;
         }
-        self.counters[cid].prev = NIL;
-        self.counters[cid].next = NIL;
-        self.counters[cid].bucket = NIL;
+        self.monitored[cid].prev = NIL;
+        self.monitored[cid].next = NIL;
+        self.monitored[cid].bucket = NIL;
         if self.buckets[bid].head == NIL {
             self.drop_bucket(bid);
         }
@@ -581,7 +581,7 @@ impl<H: SketchHasher> Serialize for SpaceSaving<H> {
             total: self.total,
             discarded_max: self.discarded_max,
             entries: self
-                .counters
+                .monitored
                 .iter()
                 .map(|c| (&c.key, self.buckets[c.bucket].count, c.error))
                 .collect(),
@@ -629,7 +629,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
 
         let mut summary = Self {
             capacity: state.capacity,
-            counters: Vec::with_capacity(entries.len()),
+            monitored: Vec::with_capacity(entries.len()),
             buckets: Vec::new(),
             bucket_free: Vec::new(),
             bucket_head: NIL,
@@ -648,7 +648,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
         }
 
         let smallest = summary
-            .counters
+            .monitored
             .iter()
             .map(|c| summary.buckets[c.bucket].count)
             .min()
@@ -660,7 +660,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
             ));
         }
         let recorded = summary
-            .counters
+            .monitored
             .iter()
             .map(|c| summary.buckets[c.bucket].count.saturating_sub(c.error))
             .fold(0u64, u64::saturating_add);
@@ -679,14 +679,14 @@ impl<H: SketchHasher> SpaceSaving<H> {
     /// Checks every Stream-Summary invariant: both directions of both linked
     /// lists, strict count ordering, arena bookkeeping and index agreement.
     fn validate(&self) -> Result<(), String> {
-        if self.counters.len() > self.capacity {
+        if self.monitored.len() > self.capacity {
             return Err(format!(
                 "{} counters over a capacity of {}",
-                self.counters.len(),
+                self.monitored.len(),
                 self.capacity
             ));
         }
-        if self.counters.is_empty() != (self.bucket_head == NIL) {
+        if self.monitored.is_empty() != (self.bucket_head == NIL) {
             return Err("the bucket list disagrees with counter residency".to_string());
         }
 
@@ -737,20 +737,20 @@ impl<H: SketchHasher> SpaceSaving<H> {
             return Err("the bucket list reads differently in each direction".to_string());
         }
 
-        let mut seen = vec![false; self.counters.len()];
+        let mut seen = vec![false; self.monitored.len()];
         for bid in &live {
             let count = self.buckets[*bid].count;
             let mut chain: Vec<usize> = Vec::new();
             let mut previous = NIL;
             let mut cid = self.buckets[*bid].head;
             while cid != NIL {
-                if cid >= self.counters.len() {
+                if cid >= self.monitored.len() {
                     return Err(format!("counter {cid} is outside the arena"));
                 }
                 if seen[cid] {
                     return Err(format!("counter {cid} is reached twice"));
                 }
-                let counter = &self.counters[cid];
+                let counter = &self.monitored[cid];
                 if counter.prev != previous {
                     return Err(format!("counter {cid} does not point back at {previous}"));
                 }
@@ -776,7 +776,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
                     return Err(format!("bucket {bid}'s counter list cycles backwards"));
                 }
                 backwards.push(cid);
-                cid = self.counters[cid].prev;
+                cid = self.monitored[cid].prev;
             }
             backwards.reverse();
             if backwards != chain {
@@ -813,19 +813,19 @@ impl<H: SketchHasher> SpaceSaving<H> {
             ));
         }
 
-        let mut indexed = vec![false; self.counters.len()];
+        let mut indexed = vec![false; self.monitored.len()];
         for (digest, slot) in &self.index {
             if slot.is_empty() {
                 return Err(format!("digest {digest} indexes nothing"));
             }
             for cid in slot {
-                if *cid >= self.counters.len() {
+                if *cid >= self.monitored.len() {
                     return Err(format!("digest {digest} indexes counter {cid}"));
                 }
                 if indexed[*cid] {
                     return Err(format!("counter {cid} is indexed twice"));
                 }
-                if self.counters[*cid].digest != *digest {
+                if self.monitored[*cid].digest != *digest {
                     return Err(format!("counter {cid} is filed under the wrong digest"));
                 }
                 indexed[*cid] = true;

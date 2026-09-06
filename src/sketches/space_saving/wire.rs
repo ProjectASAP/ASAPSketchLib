@@ -5,7 +5,7 @@
 //! constant, the `key_type` mapping, and the `serialize_to_bytes` /
 //! `deserialize_from_bytes` impls) while the algorithm lives in the parent
 //! module file. Being a descendant module, it reads the summary's private
-//! `counters` / `buckets` / `total` / `discarded_max` fields and reuses the private
+//! `monitored` / `buckets` / `total` / `discarded_max` fields and reuses the private
 //! `rebuild` entry point directly, without widening any field visibility. See
 //! `docs/asapv1_wire_format.md` §3.5.
 //!
@@ -373,7 +373,7 @@ impl<H: SketchHasher + HashProfile> SpaceSaving<H> {
     /// stable across a round trip.
     fn wire_entries(&self) -> Vec<(&HeapItem, u64, u64)> {
         let mut entries: Vec<(&HeapItem, u64, u64)> = self
-            .counters
+            .monitored
             .iter()
             .map(|counter| {
                 (
