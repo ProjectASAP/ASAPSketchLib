@@ -56,7 +56,7 @@ uniform insert/query API.
 ## Types
 
 - `HashSketchEnsemble<H = DefaultXxHasher>` — the ensemble container, generic over the hasher.
-- `EnsembleSketch` — enum wrapping the sketch variants that can live inside an ensemble: `CountMinFast`, `CountFast`, `HllErtl`, `HllRegular`, `HllHip`.
+- `EnsembleSketch` — enum wrapping the sketch variants that can live inside an ensemble: `CountMinFast`, `CountFast`, `HllErtl`, `HllClassic`, `HllHip`.
 
 ## Compatible Sketches
 

@@ -1,4 +1,4 @@
-//! Hydra hierarchical sketch framework.
+//! Hydra sketch framework.
 //!
 //! A Hydra is an `r x w` grid of counters over a fixed set of named *key
 //! columns*. Each incoming record supplies one value per column and fans out
@@ -185,7 +185,7 @@ impl KeySchema {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-/// Hierarchical sketch grid for subpopulation queries.
+/// Sketch grid for subpopulation queries.
 pub struct Hydra {
     /// Number of rows in the sketch grid.
     pub row_num: usize,

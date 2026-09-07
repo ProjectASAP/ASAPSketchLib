@@ -1,13 +1,11 @@
-//! Portable MessagePack wire format shared with `sketchlib-go`.
+//! Older per-sketch MessagePack wire types, being retired.
 //!
-//! Every type that crosses the wire is described here in a per-algorithm
-//! submodule whose filename mirrors the corresponding file in
-//! `sketchlib-go`. Both representations are kept byte-compatible at the
-//! envelope level even though the in-language struct shapes differ.
-//!
-//! Touching anything in this module is a protocol change: the Go side
-//! must be kept in lock-step, and the cross-language golden-byte tests
-//! must continue to pass.
+//! Each per-algorithm submodule holds one sketch's pre-envelope wire type.
+//! What `sketchlib-go` mirrors is ASAPv1 — the framing in `envelope.rs`
+//! plus the per-sketch `wire.rs` beside each sketch — not these types.
+//! [`hll::HllSketch`] is the exception: it encodes through the HLL sketch's
+//! own ASAPv1 framing, metadata and payload, so the two agree byte for
+//! byte. Prefer a sketch's own `serialize_to_bytes`; do not add callers here.
 
 pub mod countminsketch;
 pub mod countminsketch_topk;

@@ -164,7 +164,7 @@ signals a backwards-compatible change.
   skipped; a positional encoding of the three-field form does not. Nothing
   in-crate writes the positional form — the portable MessagePack wire for the
   top-k sketches carries a `(key, value)` list and rebuilds through `update`,
-  and the goldens cover CMS and HLL envelopes only.
+  and no golden covers a top-k envelope.
 - **BREAKING (`serde` shape of `Nitro`, and therefore of `Vector2D` and any
   sketch embedding one):** `Nitro::rounding_state` is now a serialized field,
   appended after `mask`, so a sketch resumed from a decode continues its weight
@@ -387,11 +387,10 @@ signals a backwards-compatible change.
   fan-out across the subpopulation lattice checked against exact
   per-subpopulation truth, wildcard marginals reconciled against the cells
   beneath them, exact shard-merge equality, MessagePack round trips for every
-  counter variant, subkey injectivity for delimiter-laden key values, and
-  `MultiHeadHydra`'s equivalence to independent single-head Hydras. A Theorem 2
-  check (Manousis et al., VLDB 2022) asserts the additive `eps * G_s` bound
-  against the exact binomial median-failure rate over 314 subpopulations at
-  `G_s = 840k`, in both the sparse deployment regime (5x4096) and a
+  counter variant, and subkey injectivity for delimiter-laden key values. A
+  Theorem 2 check (Manousis et al., VLDB 2022) asserts the additive `eps * G_s`
+  bound against the exact binomial median-failure rate over 314 subpopulations
+  at `G_s = 840k`, in both the sparse deployment regime (5x4096) and a
   deliberately overloaded grid (5x256) where the in-bound fraction is actually
   exercised. The mixed `HashSketchEnsemble` test moved here from
   `tests/e2e_cardinality.rs`.

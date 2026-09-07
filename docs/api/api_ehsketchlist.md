@@ -11,13 +11,14 @@ Unified enum wrapper for sketch payloads used by EH-style frameworks.
 ```rust
 enum EHSketchList {
     CM(CountMin<Vector2D<i32>, FastPath>),
-    CS(Count<Vector2D<i32>, FastPath>),
+    COCO(Coco),
     COUNTL2HH(CountL2HH),
+    CS(Count<Vector2D<i32>, FastPath>),
+    DDS(DDSketch),
+    ELASTIC(Elastic),
     HLL(HyperLogLog<ErtlMLE>),
     KLL(KLL),
-    DDS(DDSketch),
-    COCO(Coco),
-    ELASTIC(Elastic),
+    #[cfg(feature = "experimental")]
     UNIFORM(UniformSampling),
     UNIVMON(UnivMon),
 }
@@ -96,7 +97,6 @@ let _ = sk.query(&DataInput::U64(1));
 
 ## Caveats
 
-- Some variant paths still contain `todo!()` branches in input conversion.
 - Some merge/query variant combinations are intentionally unsupported.
 
 ## Status

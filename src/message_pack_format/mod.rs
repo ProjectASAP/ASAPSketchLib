@@ -1,22 +1,21 @@
-//! MessagePack format description shared with `sketchlib-go`.
+//! Rust-side MessagePack serialization plumbing.
 //!
-//! Split into two sub-modules by audience:
+//! The current format is **ASAPv1**: each sketch serializes into one
+//! self-delimiting envelope — a sketch-agnostic frame (magic, version,
+//! `kind_id`, two length prefixes) around a metadata map and a payload
+//! array. The framing lives in `envelope.rs`; the `kind_id`, metadata and
+//! payload are per-sketch, in the `wire.rs` beside each sketch under
+//! [`crate::sketches`] and [`crate::sketch_framework`]. `sketchlib-go`
+//! mirrors ASAPv1, `asapv1_golden/` guards against drift, and
+//! `docs/asapv1_wire_format.md` is the spec.
 //!
-//! - [`portable`] — cross-language wire format shared with `sketchlib-go`.
-//!   Every type that crosses the wire lives here in a per-algorithm
-//!   submodule whose filename mirrors the corresponding file in
-//!   `sketchlib-go`. Touching this module is
-//!   a protocol change and requires the Go side to be kept in lock-step
-//!   (golden-byte tests catch drift).
+//! Two sub-modules are the older path, being retired:
 //!
-//! - [`native`] — thin trait shims over the existing `serialize_to_bytes`
-//!   / `deserialize_from_bytes` methods on the pure-Rust generic sketch
-//!   types in [`crate::sketches`]. The byte format is internal to Rust
-//!   — Go never reads it. Free to evolve without cross-language
-//!   coordination.
+//! - [`portable`] — per-sketch wire types predating the envelope.
+//! - [`native`] — thin shims over the sketches' `serialize_to_bytes` /
+//!   `deserialize_from_bytes`, each a pass-through to ASAPv1.
 //!
-//! The [`MessagePackCodec`] trait and unified [`Error`] type live at this
-//! top level so both worlds share the same encode/decode contract.
+//! [`MessagePackCodec`] and [`Error`] are the contract both share.
 
 pub mod codec;
 pub(crate) mod envelope;

@@ -4,7 +4,7 @@ This page covers three distinct categories of advanced usage in `asap_sketchlib`
 
 ---
 
-## 1. Hierarchical Queries
+## 1. Subpopulation Queries
 
 **Goal**: Query a stream broken down by one or more categorical dimensions (e.g., "frequency of errors, grouped by region and service").
 
@@ -12,7 +12,7 @@ This page covers three distinct categories of advanced usage in `asap_sketchlib`
 
 **Solution: `Hydra`**
 
-`Hydra` maintains an `r x c` grid of sketches over a fixed schema of labelled key columns. A single `update` supplies one value per column and fans out into all `2^D - 1` non-empty subpopulations that row belongs to. A query then constrains any subset of the columns.
+`Hydra` maintains an `r x c` grid of sketches over a fixed schema of labelled key columns. A single `update` supplies one value per column and fans out into all `2^D - 1` non-empty subpopulations that row belongs to. A query then constrains one or more columns.
 
 ```rust
 use asap_sketchlib::{DataInput, Hydra, input::HydraCounter};
@@ -36,7 +36,7 @@ API reference: [`docs/api/api_hydra.md`](./api/api_hydra.md)
 
 **Goal**: Maintain several different sketch statistics over the same stream while minimizing redundant hash computation.
 
-**The problem**: If you need frequency counts, cardinality, and quantiles simultaneously over the same stream, naively inserting into three separate sketches computes the hash of each element three times.
+**The problem**: If you need frequency counts and cardinality simultaneously over the same stream, naively inserting into two separate sketches computes the hash of each element twice.
 
 **Solution: `HashSketchEnsemble` and `UnivMon`**
 

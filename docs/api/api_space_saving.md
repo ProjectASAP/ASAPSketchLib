@@ -21,11 +21,11 @@ capacity. A weighted `insert_many` lands further along the bucket list and walks
 it to reach its destination, one step per bucket it passes, so only the unit
 path is constant-work.
 
-Both lists are arenas of indices rather than pointers. `counters` is allocated
-once up to `capacity` and reused in place — an eviction overwrites the victim's
-slot — and `buckets` recycles through a free list. The key index is keyed by an
-xxh3 digest and hashes it through `DigestBuildHasher` rather than a second
-time.
+Both lists are arenas of indices rather than pointers. Counter slots are
+allocated once up to `capacity` and reused in place — an eviction overwrites
+the victim's slot — and buckets recycle through a free list. The key index is
+keyed by a 64-bit digest, hashed through `DigestBuildHasher` rather than a
+second time.
 
 ## Constructors
 

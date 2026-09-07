@@ -33,7 +33,7 @@ This document provides a high-level overview of implemented and planned features
 
 ### Frameworks
 
-**Hydra** - Hierarchical heavy hitters for multi-dimensional queries ([apis.md](apis.md))
+**Hydra** - Subpopulation queries over multi-dimensional keys ([apis.md](apis.md))
 
 **UnivMon** - Universal monitoring (L1, L2, entropy, cardinality from single structure) ([apis.md](apis.md))
 
@@ -67,7 +67,7 @@ This document provides a high-level overview of implemented and planned features
 
 ### Serialization
 
-**MessagePack (rmp-serde) and Protobuf (prost)** - Dual serialization support across most sketch types
+**MessagePack (rmp-serde)** - Serialization support across most sketch types
 
 ### Sampling
 
@@ -125,11 +125,12 @@ MessagePack (`rmp-serde`) support. **serde support** means the type derives `Ser
 | SpaceSaving | Yes | Yes |
 | Bloom | Yes | Yes |
 | Hydra | Yes | Yes |
-| UnivMon / UnivMon Optimized | Yes | Yes |
+| UnivMon | Yes | Yes |
+| UnivMon Optimized | No | Yes |
 | UnivMonQ (experimental) | Internal wire DTO | Yes |
 | NitroBatch | Yes | In Progress |
 | EHSketchList | Yes | Yes |
-| ExponentialHistogram | Yes | Yes |
+| ExponentialHistogram | No | Yes |
 
 Protobuf (prost): `.proto` definitions exist for CountMin, Count, HLL, DDSketch, KLL, Elastic, Coco, Hydra, and UnivMon. Rust conversion code is in progress.
 

@@ -1206,7 +1206,7 @@ Direction: **custom per-sketch payload replaces the `portable` types, and `sketc
 Good direction (more compact, higher fidelity, less Rust-internal duplication), but it moves the contract from shared code to discipline. To keep it safe:
 
 1. **This spec**: byte-level, language-neutral, per sketch.
-2. **Golden byte-vector fixtures** checked into both repos; both languages decode and re-encode them byte-identically. These replace the `portable`-as-oracle round-trip test that guards drift today.
+2. **Golden byte-vector fixtures** checked into both repos; both languages decode and re-encode them byte-identically. These replace the `portable`-as-oracle round-trip test.
 3. **This registry**, mirrored, never independently allocated.
 
 Fixtures exist for six `kind_id`s — HLL's three estimators, Count-Min, Count Sketch and compact KLL — and `sketchlib-go` mirrors those. Every other kind this spec fixes has a payload here and **no fixture and no Go mirror**, so this document is the only contract for it; `asapv1_golden/README.md` lists the gap.
@@ -1216,8 +1216,8 @@ Rust derives the hash spec from a generic `HashProfile` bound on the hasher type
 On the Go side the profile is simply **written into** the metadata on encode and **read from** it on decode.
 Go MUST validate the profile it reads (same fail-closed intent as Rust): a sketch is only mergeable/queryable if its `hash_profile_id` + seeds match the profile Go is prepared to reproduce.
 
-Sequencing: do not delete `portable` until (2) exists; the current `native bytes == portable bytes` test is the only drift guard right now.
-Keep it through the transition, retire `portable` once goldens are in place.
+Sequencing: (2) covers six `kind_id`s, and the one `native bytes == portable bytes` test is HLL-only, since no other `portable` type emits ASAPv1 bytes.
+Retire `portable` once the fixtures cover the rest.
 
 ---
 

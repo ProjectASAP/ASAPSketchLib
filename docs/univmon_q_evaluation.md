@@ -121,12 +121,9 @@ fold and balanced merge trees. Extremely concentrated cases whose observed
 support fits the candidate table use the complete universal recurrence and
 were exact in this matrix.
 
-The update gap is not solely a construction-level result. The current UnivMon
-`HHHeap` rebuilds its candidate-position map after retained-key updates, so its
-cost grows with candidate capacity and hot-key skew. UnivMon-Q maintains its
-candidate state incrementally. UnivMon-Q also saves memory through packed
-32-bit counters and geometric width reduction, whereas this UnivMon baseline
-uses fixed-width 64-bit counter layers.
+UnivMon-Q saves memory through packed 32-bit counters and geometric width
+reduction, whereas this UnivMon baseline uses fixed-width 64-bit counter
+layers.
 
 ## Correctness checks
 

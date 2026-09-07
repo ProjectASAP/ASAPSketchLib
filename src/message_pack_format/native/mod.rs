@@ -1,12 +1,11 @@
-//! Native MessagePack codec impls for the pure-Rust sketch types in
-//! [`crate::sketches`].
+//! Older `MessagePackCodec` shims over the pure-Rust sketch types in
+//! [`crate::sketches`], being retired.
 //!
-//! These impls are thin shims over each sketch's existing
-//! `serialize_to_bytes` / `deserialize_from_bytes` methods, exposing
-//! them through the unified [`crate::message_pack_format::MessagePackCodec`]
-//! trait. The byte format is internal to Rust — Go (`sketchlib-go`)
-//! never reads it. For the cross-language wire format, see
-//! [`crate::message_pack_format::portable`].
+//! Each impl forwards to that sketch's own `serialize_to_bytes` /
+//! `deserialize_from_bytes`, so the bytes are ASAPv1 — the framing in
+//! `envelope.rs` plus the per-sketch `wire.rs` — and the shim adds nothing
+//! to them. Call those methods directly; `docs/asapv1_wire_format.md`
+//! specifies the format `sketchlib-go` mirrors.
 
 pub mod countminsketch;
 pub mod countsketch;
