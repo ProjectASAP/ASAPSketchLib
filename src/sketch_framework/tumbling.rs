@@ -602,16 +602,32 @@ mod tests {
         };
         let mut tw: TumblingWindow<FoldCMS> = TumblingWindow::new(100, 3, config, 4);
 
-        // Fill 4 windows (max_windows=3 closed + active).
+        // One key per window: five windows open, four of them close, and the
+        // fourth close pushes the retained count past max_windows.
         for w in 0..5 {
             tw.insert(w * 100, &DataInput::U64(w), 1);
         }
 
-        // We should have exactly 3 closed windows (oldest evicted).
-        assert!(
-            tw.closed_count() <= 3,
-            "closed_count {} should be <= max_windows 3",
-            tw.closed_count()
+        assert_eq!(
+            tw.closed_count(),
+            3,
+            "max_windows 3 retains exactly three closed windows"
+        );
+
+        // Windows 1, 2 and 3 are the retained ones and window 4 is active, so
+        // the merge sees their keys and not window 0's.
+        let merged = tw.query_all();
+        for w in 1..5u64 {
+            assert_eq!(
+                merged.query(&DataInput::U64(w)),
+                1,
+                "window {w}'s key is still in the merge"
+            );
+        }
+        assert_eq!(
+            merged.query(&DataInput::U64(0)),
+            0,
+            "the evicted window's key is gone from the merge, not merely capped"
         );
     }
 
@@ -627,20 +643,37 @@ mod tests {
 
         let initial_total = tw.pool_total_allocated();
 
-        // Create enough windows to trigger eviction.
+        // Six keys open six windows: five close and three are evicted, so
+        // three sketches go back to the pool and every close after the first
+        // eviction is served from the free list.
         for w in 0..6 {
             tw.insert(w * 100, &DataInput::U64(w), 1);
         }
 
-        // Pool should have recycled sketches, so available > 0.
-        assert!(
-            tw.pool_available() > 0,
-            "pool should have recycled sketches after eviction"
+        assert_eq!(tw.closed_count(), 2, "max_windows 2 retains two windows");
+        assert_eq!(
+            tw.pool_available(),
+            1,
+            "the last evicted sketch is waiting in the pool"
         );
-        // Total allocated should not grow unboundedly.
-        assert!(
-            tw.pool_total_allocated() <= initial_total + 6,
-            "pool should reuse sketches, not allocate indefinitely"
+        assert_eq!(
+            tw.pool_total_allocated(),
+            initial_total,
+            "recycling covers every window after the pool was primed, so nothing new is allocated"
+        );
+
+        // The free list is a stack, so the active window is running on the
+        // sketch window 2 was using. `put` clears on the way in, so window 2's
+        // key must not read back through it.
+        assert_eq!(
+            tw.active_sketch().query(&DataInput::U64(5)),
+            1,
+            "the recycled sketch holds the active window's own key"
+        );
+        assert_eq!(
+            tw.active_sketch().query(&DataInput::U64(2)),
+            0,
+            "a recycled sketch is cleared, so its previous window's key is gone"
         );
     }
 
@@ -1526,15 +1559,48 @@ mod tests {
         let merged = tw.query_all();
 
         // Ground truth top-k sorted by frequency (descending).
-        let mut truth_sorted: Vec<(u64, i64)> = truth.into_iter().collect();
+        let mut truth_sorted: Vec<(u64, i64)> = truth.iter().map(|(k, v)| (*k, *v)).collect();
         truth_sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
         let true_top_k: Vec<u64> = truth_sorted.iter().take(top_k).map(|&(k, _)| k).collect();
 
         // Heap entries from merged sketch.
         let heap_entries = merged.heap().heap();
-        assert!(
-            !heap_entries.is_empty(),
-            "heap should not be empty after merging {num_windows} windows"
+        assert_eq!(
+            heap_entries.len(),
+            top_k,
+            "merging {num_windows} windows fills the heap"
+        );
+
+        // The counts the heap reports, not just the keys it holds. A resident's
+        // count is the merged estimate taken when it was reconciled in, so it
+        // trails the final estimate but never exceeds it, and Count-Min's
+        // one-sided error puts that estimate at or above the truth.
+        let mut smallest = i64::MAX;
+        for item in heap_entries {
+            let crate::HeapItem::U64(key) = item.key else {
+                panic!("a U64 stream seats U64 keys, got {:?}", item.key);
+            };
+            let estimate = merged.query(&DataInput::U64(key));
+            assert!(item.count > 0, "resident {key} carries a count of zero");
+            assert!(
+                item.count <= estimate,
+                "resident {key}'s count {} exceeds the merged estimate {estimate}",
+                item.count
+            );
+            if let Some(&exact) = truth.get(&key) {
+                assert!(
+                    estimate >= exact,
+                    "Count-Min undercounted {key}: {estimate} < {exact}"
+                );
+            }
+            smallest = smallest.min(item.count);
+        }
+
+        // The bounded min-heap keeps its smallest resident at the root; that is
+        // what the next eviction compares against.
+        assert_eq!(
+            heap_entries[0].count, smallest,
+            "the root is not the smallest resident"
         );
 
         // Every key in the true top-k should appear in the heap.
@@ -1771,14 +1837,43 @@ mod tests {
 
         let merged = tw.query_all();
 
-        let mut truth_sorted: Vec<(u64, i64)> = truth.into_iter().collect();
+        let mut truth_sorted: Vec<(u64, i64)> = truth.iter().map(|(k, v)| (*k, *v)).collect();
         truth_sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
         let true_top_k: Vec<u64> = truth_sorted.iter().take(top_k).map(|&(k, _)| k).collect();
 
         let heap_entries = merged.heap().heap();
-        assert!(
-            !heap_entries.is_empty(),
-            "heap should not be empty after merging {num_windows} windows"
+        assert_eq!(
+            heap_entries.len(),
+            top_k,
+            "merging {num_windows} windows fills the heap"
+        );
+
+        // The counts the heap reports, not just the keys it holds. Count
+        // Sketch's error is two-sided, so a resident's count is checked
+        // against the truth as a relative band rather than as a floor.
+        let mut smallest = i64::MAX;
+        for item in heap_entries {
+            let crate::HeapItem::U64(key) = item.key else {
+                panic!("a U64 stream seats U64 keys, got {:?}", item.key);
+            };
+            assert!(item.count > 0, "resident {key} carries a count of zero");
+            if let Some(&exact) = truth.get(&key) {
+                let estimate = merged.query(&DataInput::U64(key));
+                let error = (estimate - exact).abs() as f64 / exact as f64;
+                assert!(
+                    error < 0.02,
+                    "resident {key}: estimate {estimate} is {:.0}% off the exact {exact}",
+                    error * 100.0
+                );
+            }
+            smallest = smallest.min(item.count);
+        }
+
+        // The bounded min-heap keeps its smallest resident at the root; that is
+        // what the next eviction compares against.
+        assert_eq!(
+            heap_entries[0].count, smallest,
+            "the root is not the smallest resident"
         );
 
         let mut found_in_heap = 0usize;
