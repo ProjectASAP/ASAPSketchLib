@@ -349,7 +349,6 @@ impl<H: SketchHasher> SpaceSaving<H> {
         flat.sort_unstable_by(|a, b| {
             b.count
                 .cmp(&a.count)
-                .then_with(|| a.digest.cmp(&b.digest))
                 .then_with(|| key_order(&a.key).cmp(&key_order(&b.key)))
         });
 
@@ -533,8 +532,7 @@ struct MergeEntry {
     paired: bool,
 }
 
-/// A total order over keys, breaking the merge ties that counts and digests
-/// leave open.
+/// A total order over keys, breaking the ties that counts leave open.
 fn key_order(key: &HeapItem) -> (u8, u128, &[u8]) {
     match key {
         HeapItem::I8(v) => (0, *v as i128 as u128, b""),
@@ -1303,6 +1301,85 @@ mod tests {
         assert!(
             !left.is_guaranteed(&DataInput::I64(8)),
             "nothing outranks a ceiling it does not clear"
+        );
+    }
+
+    /// A count tie straddling the capacity boundary is cut by `key_order`
+    /// alone, so a truncating merge keeps the keys the encoder emits first and
+    /// the digests do not choose the survivors.
+    #[test]
+    fn a_truncating_merge_keeps_the_keys_the_encoder_emits_first() {
+        fn left_side() -> SpaceSaving {
+            let mut left: SpaceSaving = SpaceSaving::with_capacity(4);
+            left.insert_many(&DataInput::I64(1), 9);
+            for key in [10i64, 20, 30] {
+                left.insert_many(&DataInput::I64(key), 3);
+            }
+            left
+        }
+        fn right_side() -> SpaceSaving {
+            let mut right: SpaceSaving = SpaceSaving::with_capacity(3);
+            for key in [40i64, 50, 60] {
+                right.insert_many(&DataInput::I64(key), 2);
+            }
+            right
+        }
+        fn keys_of(summary: &SpaceSaving) -> Vec<i64> {
+            summary
+                .entries()
+                .iter()
+                .map(|(key, _, _)| match key {
+                    HeapItem::I64(v) => *v,
+                    other => panic!("unexpected key form {other:?}"),
+                })
+                .collect()
+        }
+        fn sorted_keys(summary: &SpaceSaving) -> Vec<i64> {
+            let mut keys = keys_of(summary);
+            keys.sort_unstable();
+            keys
+        }
+
+        let mut merged = left_side();
+        merged.merge(&right_side());
+        merged.validate().expect("after a truncating merge");
+        let mut swapped = right_side();
+        swapped.merge(&left_side());
+        swapped.validate().expect("after the swapped merge");
+
+        for key in [10i64, 20, 30, 40, 50, 60] {
+            assert_eq!(
+                merged.upper_bound(&DataInput::I64(key)),
+                5,
+                "key {key} did not join the tie at the capacity boundary"
+            );
+        }
+        assert_eq!(
+            sorted_keys(&merged),
+            vec![1, 10, 20, 30],
+            "the tie was cut somewhere other than the key order"
+        );
+        assert_eq!(
+            sorted_keys(&swapped),
+            vec![1, 10, 20],
+            "a narrower cut of the same tie did not follow the key order"
+        );
+        for dropped in [40i64, 50, 60] {
+            assert!(
+                key_order(&HeapItem::I64(30)) < key_order(&HeapItem::I64(dropped)),
+                "key {dropped} was dropped although it sorts before the last survivor"
+            );
+        }
+
+        let bytes = merged
+            .serialize_to_bytes()
+            .expect("serialize the survivors");
+        let emitted: SpaceSaving =
+            SpaceSaving::deserialize_from_bytes(&bytes).expect("deserialize the survivors");
+        assert_eq!(
+            keys_of(&emitted),
+            vec![1, 10, 20, 30],
+            "the encoder emits an order the merge did not keep"
         );
     }
 

@@ -103,8 +103,8 @@ other side can say about it. The union is then trimmed back to `capacity`, and
 the merged ceiling rises to at least the sum of the two `min_count`s — a key
 both sides dropped can have reached that much between them.
 
-The union is ordered by count and broken out of ties by digest and then by key,
-so merging the same two summaries always yields the same survivors.
+The union is ordered by count and broken out of ties by key, the order the
+wire emits, so merging the same two summaries always yields the same survivors.
 
 This is **not** equivalent to running one summary over the concatenated streams:
 a key both sides evicted cannot be recovered. `merge_equivalence_battery` does
