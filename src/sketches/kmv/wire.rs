@@ -123,7 +123,10 @@ impl<H: SketchHasher + HashProfile> KMV<H> {
     /// [`HashProfile`], so it truthfully describes how the sketch was hashed.
     ///
     /// Fails on a `k` of zero, on a `k` past the metadata's `u32` field, and on
-    /// a retained set the bound does not cover — the states decode refuses.
+    /// a retained set the bound does not cover — the states decode refuses. `k`
+    /// and the heap's own bound are both public, so a `k` that disagrees with
+    /// the bound it is meant to name fails too: emitting it would rebuild the
+    /// sketch around a different eviction bound.
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
         let k = u32::try_from(self.k).map_err(|_| {
             RmpEncodeError::Syntax(format!("KMV k {} exceeds the u32 metadata field", self.k))
@@ -145,6 +148,13 @@ impl<H: SketchHasher + HashProfile> KMV<H> {
             return Err(RmpEncodeError::Syntax(
                 "KMV holds the same hash twice".to_string(),
             ));
+        }
+        if self.k_vals.capacity() != self.k {
+            return Err(RmpEncodeError::Syntax(format!(
+                "KMV k {} disagrees with the retained bound {}",
+                self.k,
+                self.k_vals.capacity()
+            )));
         }
         let metadata = rmp_serde::to_vec_named(&kmv_metadata::<H>(k))?;
         let payload = rmp_serde::to_vec(&KmvPayload { hashes })?;
@@ -508,6 +518,39 @@ mod tests {
             .expect_err("a retained set past k must not serialize")
             .to_string();
         assert!(problem.contains("2 hashes over a k of 1"), "got {problem}");
+    }
+
+    /// `k` and the heap's bound are both public fields, so they can be set apart
+    /// from outside the module. Emitting the declared `k` would rebuild the
+    /// sketch around an eviction bound the source never had, in either
+    /// direction, so the encode refuses both.
+    #[test]
+    fn kmv_refuses_a_k_that_disagrees_with_the_retained_bound() {
+        let mut wider: KMV = KMV::new(4);
+        wider.insert_by_hash(7);
+        wider.k = 100;
+        let problem = wider
+            .serialize_to_bytes()
+            .expect_err("a k over the retained bound must not serialize")
+            .to_string();
+        assert!(
+            problem.contains("KMV k 100 disagrees with the retained bound 4"),
+            "got {problem}"
+        );
+
+        let narrower: KMV = KMV {
+            k: 1,
+            k_vals: CommonHeap::new_max(4),
+            _hasher: PhantomData,
+        };
+        let problem = narrower
+            .serialize_to_bytes()
+            .expect_err("a k under the retained bound must not serialize")
+            .to_string();
+        assert!(
+            problem.contains("KMV k 1 disagrees with the retained bound 4"),
+            "got {problem}"
+        );
     }
 
     // A test-only custom hasher: hashes exactly like `DefaultXxHasher` but

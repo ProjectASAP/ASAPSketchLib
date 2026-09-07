@@ -83,6 +83,11 @@ impl Default for UnivMon {
     }
 }
 
+/// Layers one pyramid may hold. [`bottom_layer_for_hash`] and the query
+/// recurrences shift a 64-bit key hash right by up to `layer_size - 1`, so a
+/// deeper pyramid would shift past the hash's width.
+pub const MAX_LAYER_SIZE: usize = 64;
+
 /// Deepest pyramid layer the given key hash reaches.
 #[inline(always)]
 pub fn bottom_layer_for_hash(hash: u64, layer_size: usize) -> usize {
@@ -117,6 +122,10 @@ impl UnivMon {
         assert!(sketch_row > 0, "sketch row count must be positive");
         assert!(sketch_col > 0, "sketch column count must be positive");
         assert!(layer_size > 0, "layer count must be positive");
+        assert!(
+            layer_size <= MAX_LAYER_SIZE,
+            "layer count must be at most MAX_LAYER_SIZE {MAX_LAYER_SIZE}"
+        );
         let sk_vec: Vec<L2HH> = (0..layer_size)
             .map(|i| {
                 L2HH::COUNT(CountL2HH::with_dimensions_and_seed(

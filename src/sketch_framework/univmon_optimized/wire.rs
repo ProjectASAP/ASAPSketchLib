@@ -23,8 +23,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::message_pack_format::envelope;
 use crate::sketch_framework::univmon::wire::{
-    decode_pyramid, encode_pyramid, pyramid_key_type, pyramid_state, rebuild_layers,
-    update_mode_of, update_mode_tag,
+    check_layer_size, decode_pyramid, encode_pyramid, pyramid_key_type, pyramid_state,
+    rebuild_layers, update_mode_of, update_mode_tag,
 };
 use crate::{DefaultXxHasher, HashProfile};
 
@@ -106,6 +106,31 @@ fn geometry_of(layer_size: usize, layout: &PyramidLayout) -> Vec<(usize, usize)>
         .collect()
 }
 
+/// Rejects a layout the algorithm never has: `layer_size`, `heap_size` and
+/// both tiers' dimensions are each positive. The encoder and the decoder both
+/// call this, so the two doors cannot drift.
+fn check_layout_dimensions(
+    layer_size: usize,
+    heap_size: usize,
+    elephant_row: usize,
+    elephant_col: usize,
+    mouse_row: usize,
+    mouse_col: usize,
+) -> Result<(), String> {
+    if layer_size == 0
+        || heap_size == 0
+        || elephant_row == 0
+        || elephant_col == 0
+        || mouse_row == 0
+        || mouse_col == 0
+    {
+        return Err(format!(
+            "UnivMonPyramid layer_size, heap_size and both tiers' dimensions must be non-zero: layer_size={layer_size}, elephant_row={elephant_row}, elephant_col={elephant_col}, mouse_row={mouse_row}, mouse_col={mouse_col}, heap_size={heap_size}"
+        ));
+    }
+    Ok(())
+}
+
 /// Total accumulators the declared layout implies, one per row per layer.
 fn accumulator_count(layer_size: usize, layout: &PyramidLayout) -> Option<usize> {
     let elephants = layer_size.min(layout.elephant_layers as usize);
@@ -123,10 +148,22 @@ impl UnivMonPyramid {
     /// [`DefaultXxHasher`]'s [`HashProfile`], the hasher the pyramid is built
     /// on.
     ///
-    /// Fails when a layer's geometry or seed index disagrees with the declared
-    /// layout, when the heaps' keys mix `HeapItem` variants or hold a 128-bit
-    /// key, or when a structural parameter overflows its `u32` metadata field.
+    /// Fails when a structural parameter is zero, when a layer's geometry or
+    /// seed index disagrees with the declared layout, when a layer's heap holds
+    /// one wire key twice, when the heaps' keys mix `HeapItem` variants or hold
+    /// a 128-bit key, or when a structural parameter overflows its `u32`
+    /// metadata field.
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
+        check_layout_dimensions(
+            self.layer_size,
+            self.heap_size,
+            self.elephant_row,
+            self.elephant_col,
+            self.mouse_row,
+            self.mouse_col,
+        )
+        .map_err(RmpEncodeError::Syntax)?;
+        check_layer_size("UnivMonPyramid", self.layer_size).map_err(RmpEncodeError::Syntax)?;
         let field = |name: &str, value: usize| {
             u32::try_from(value).map_err(|_| {
                 RmpEncodeError::Syntax(format!(
@@ -198,11 +235,22 @@ impl UnivMonPyramid {
             ));
         }
         let (layer_size, heap_size) = (meta.layer_size as usize, meta.heap_size as usize);
-        if layer_size == 0 || heap_size == 0 {
-            return Err(RmpDecodeError::Uncategorized(format!(
-                "UnivMonPyramid layer_size and heap_size must be non-zero: layer_size={layer_size}, heap_size={heap_size}"
-            )));
-        }
+        let (elephant_row, elephant_col, mouse_row, mouse_col) = (
+            meta.elephant_row as usize,
+            meta.elephant_col as usize,
+            meta.mouse_row as usize,
+            meta.mouse_col as usize,
+        );
+        check_layout_dimensions(
+            layer_size,
+            heap_size,
+            elephant_row,
+            elephant_col,
+            mouse_row,
+            mouse_col,
+        )
+        .map_err(RmpDecodeError::Uncategorized)?;
+        check_layer_size("UnivMonPyramid", layer_size).map_err(RmpDecodeError::Uncategorized)?;
         let decoded = decode_pyramid(&meta.key_type, payload)?;
         // The declared layout is measured against the accumulators the payload
         // actually carries before the geometry is built from it.
@@ -220,10 +268,10 @@ impl UnivMonPyramid {
             hh_layers,
             layer_size,
             elephant_layers: meta.elephant_layers as usize,
-            elephant_row: meta.elephant_row as usize,
-            elephant_col: meta.elephant_col as usize,
-            mouse_row: meta.mouse_row as usize,
-            mouse_col: meta.mouse_col as usize,
+            elephant_row,
+            elephant_col,
+            mouse_row,
+            mouse_col,
             heap_size,
             bucket_size,
             update_mode: update_mode_of(mode_tag)?,
@@ -235,6 +283,7 @@ impl UnivMonPyramid {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sketch_framework::univmon::MAX_LAYER_SIZE;
     use crate::sketch_framework::univmon::wire::PyramidPayload;
     use crate::sketches::countsketch_topk::CountL2HH;
     use crate::{
@@ -545,6 +594,30 @@ mod tests {
             shaped(
                 4,
                 PyramidLayout {
+                    elephant_row: 0,
+                    ..layout()
+                },
+                4,
+            ),
+            shaped(
+                4,
+                PyramidLayout {
+                    mouse_row: 0,
+                    ..layout()
+                },
+                4,
+            ),
+            shaped(
+                4,
+                PyramidLayout {
+                    mouse_col: 0,
+                    ..layout()
+                },
+                4,
+            ),
+            shaped(
+                4,
+                PyramidLayout {
                     mouse_row: MATRIX_MAX_ROWS as u32,
                     mouse_col: 4096,
                     ..layout()
@@ -560,6 +633,27 @@ mod tests {
             );
         }
 
+        // A zero row count against an empty payload: the accumulator check
+        // alone passes (0 rows over any layer count names 0 accumulators), so
+        // the tiers' dimensions must be refused before the geometry is sized.
+        let mut empty = payload_of::<String>(&encoded);
+        empty.counts.clear();
+        empty.l2.clear();
+        empty.keys.clear();
+        empty.heap_counts.clear();
+        let zero_rows = PyramidLayout {
+            elephant_row: 0,
+            mouse_row: 0,
+            ..layout()
+        };
+        let problem = UnivMonPyramid::deserialize_from_bytes(&crafted(
+            &shaped(u32::MAX, zero_rows, 4),
+            &empty,
+        ))
+        .expect_err("a zero tier row count must be rejected, not sized from")
+        .to_string();
+        assert!(problem.contains("must be non-zero"), "got {problem}");
+
         let mut short = payload_of::<String>(&encoded);
         short.heap_lens.pop();
         assert!(UnivMonPyramid::deserialize_from_bytes(&crafted(&base, &short)).is_err());
@@ -567,6 +661,107 @@ mod tests {
         let mut mode = payload_of::<String>(&encoded);
         mode.update_mode = 9;
         assert!(UnivMonPyramid::deserialize_from_bytes(&crafted(&base, &mode)).is_err());
+    }
+
+    /// The constructor asserts all four tier dimensions are positive, so a
+    /// layout whose mouse layers never materialize must still declare theirs:
+    /// a pyramid decoded with zero mouse dimensions panics on any merge
+    /// against a normally built one.
+    #[test]
+    fn pyramid_rejects_zero_dimensions_of_a_tier_it_never_materializes() {
+        let mut one_tier = UnivMonPyramid::new(4, 4, 2, 16, 2, 8, 3);
+        one_tier.insert(&DataInput::U64(7), 3);
+        let encoded = one_tier.serialize_to_bytes().expect("serialize");
+        let mut meta = metadata_of(&encoded);
+        meta.mouse_row = 0;
+        meta.mouse_col = 0;
+        let payload = payload_of::<u64>(&encoded);
+        let problem = UnivMonPyramid::deserialize_from_bytes(&crafted(&meta, &payload))
+            .expect_err("a zero mouse dimension must be rejected")
+            .to_string();
+        assert!(problem.contains("must be non-zero"), "got {problem}");
+    }
+
+    /// A layer's heap can seat one key twice — `update` compares residents with
+    /// `HeapItem`'s equality and `NaN != NaN`, so a second `NaN` takes its own
+    /// seat — and `rebuild_heap` refuses that payload. The shared encode path
+    /// runs the same `check_distinct_keys` per layer, so the pyramid never
+    /// emits it.
+    #[test]
+    fn pyramid_refuses_to_serialize_a_layer_holding_a_key_twice() {
+        let mut nans = UnivMonPyramid::new(4, 2, 3, 16, 2, 8, 4);
+        nans.hh_layers[2].update(&DataInput::F64(f64::NAN), 5);
+        nans.hh_layers[2].update(&DataInput::F64(f64::NAN), 4);
+        assert_eq!(nans.hh_layers[2].len(), 2, "the two NaNs did not both seat");
+        let problem = nans
+            .serialize_to_bytes()
+            .expect_err("a layer holding one key twice must not serialize")
+            .to_string();
+        assert!(
+            problem.contains("the same key appears twice"),
+            "got {problem}"
+        );
+        assert!(problem.contains("layer 2"), "got {problem}");
+    }
+
+    /// The layout fields are public, so a caller can zero one after
+    /// construction (the constructor asserts them positive). The decoder
+    /// refuses a zero dimension, so the encoder must too. Each case below is
+    /// built by writing the public field directly.
+    #[test]
+    fn pyramid_refuses_to_serialize_a_zero_dimension() {
+        for zero in [
+            "layer_size",
+            "heap_size",
+            "elephant_row",
+            "elephant_col",
+            "mouse_row",
+            "mouse_col",
+        ] {
+            let mut pyramid = UnivMonPyramid::new(4, 2, 3, 16, 2, 8, 4);
+            match zero {
+                "layer_size" => pyramid.layer_size = 0,
+                "heap_size" => pyramid.heap_size = 0,
+                "elephant_row" => pyramid.elephant_row = 0,
+                "elephant_col" => pyramid.elephant_col = 0,
+                "mouse_row" => pyramid.mouse_row = 0,
+                _ => pyramid.mouse_col = 0,
+            }
+            let problem = match pyramid.serialize_to_bytes() {
+                Ok(_) => panic!("a zero {zero} must not serialize"),
+                Err(err) => err.to_string(),
+            };
+            assert!(problem.contains("must be non-zero"), "got {problem}");
+        }
+    }
+
+    /// The layer finder shifts a 64-bit hash by up to `layer_size - 1`, so
+    /// [`MAX_LAYER_SIZE`] layers is the ceiling: the boundary round-trips and a
+    /// deeper pyramid is refused at the decode door.
+    #[test]
+    fn pyramid_rejects_layers_past_the_shift_bound() {
+        let deepest = UnivMonPyramid::new(4, 2, 2, 16, 2, 8, MAX_LAYER_SIZE);
+        let encoded = deepest.serialize_to_bytes().expect("serialize");
+        assert!(UnivMonPyramid::deserialize_from_bytes(&encoded).is_ok());
+
+        let layers = MAX_LAYER_SIZE + 1;
+        let mut meta = metadata_of(&encoded);
+        meta.layer_size = layers as u32;
+        let mut payload: PyramidPayload<u64> = payload_of(&encoded);
+        payload.counts = vec![0; 2 * (2 * 16) + (layers - 2) * (2 * 8)];
+        payload.l2 = vec![0; 2 * layers];
+        payload.heap_lens = vec![0; layers];
+        payload.candidate_complete = vec![true; layers];
+        let problem = UnivMonPyramid::deserialize_from_bytes(&crafted(&meta, &payload))
+            .expect_err("a pyramid past the shift bound must be rejected")
+            .to_string();
+        assert!(problem.contains("MAX_LAYER_SIZE"), "got {problem}");
+    }
+
+    #[test]
+    #[should_panic(expected = "at most MAX_LAYER_SIZE")]
+    fn pyramid_refuses_constructing_past_the_shift_bound() {
+        UnivMonPyramid::new(4, 2, 2, 16, 2, 8, MAX_LAYER_SIZE + 1);
     }
 
     /// A pyramid whose layers disagree with their declared tier or seed index

@@ -92,7 +92,7 @@ impl DdSketch {
     /// Construct an empty sketch.
     pub fn new(alpha: f64) -> Self {
         assert!(
-            (0.0..1.0).contains(&alpha),
+            alpha > 0.0 && alpha < 1.0,
             "alpha must be in (0,1); alpha=0 makes ln(gamma)=0 and every guard degenerate"
         );
         Self {

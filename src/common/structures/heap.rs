@@ -60,8 +60,16 @@ pub(crate) const PREALLOCATED_SLOTS: usize = 1024;
 impl<T, O: CommonHeapOrder<T>> CommonHeap<T, O> {
     /// Creates a new heap with the specified capacity and ordering.
     pub fn with_capacity(capacity: usize, order: O) -> Self {
+        Self::with_expected_len(capacity, capacity, order)
+    }
+
+    /// Creates a heap of `capacity` that reserves for `expected_len` elements
+    /// rather than for the capacity, so a caller that already knows how many
+    /// elements it is about to push does not reserve for a capacity it will not
+    /// fill. `capacity` still fixes [`Self::capacity`] and [`Self::is_full`].
+    pub fn with_expected_len(capacity: usize, expected_len: usize, order: O) -> Self {
         Self {
-            data: Vec::with_capacity(capacity.min(PREALLOCATED_SLOTS)),
+            data: Vec::with_capacity(expected_len.min(capacity).min(PREALLOCATED_SLOTS)),
             size: capacity,
             order,
         }

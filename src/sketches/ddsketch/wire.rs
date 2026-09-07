@@ -64,9 +64,10 @@ fn dd_metadata(alpha: f64) -> DdMetadata {
 /// `[counts, offset, sum, min, max]`. `counts` is the dense bucket store,
 /// carried verbatim including the growth padding, so a decoded sketch
 /// re-serializes byte-identically; the bucket index of `counts[i]` is
-/// `offset + i`. `sum` / `min` / `max` are the exact ingested scalars, which
-/// the bucket counts do not determine. The total sample count is the sum of
-/// `counts` and so is not carried.
+/// `offset + i`. `sum` / `min` / `max` are the sketch's running scalars, which
+/// the bucket counts do not determine: exact over the values passed to `add`,
+/// and the bucket representative for a bucket promoted through `apply_delta`.
+/// The total sample count is the sum of `counts` and so is not carried.
 #[derive(Debug, Serialize, Deserialize)]
 struct DdPayload {
     counts: Vec<u64>,

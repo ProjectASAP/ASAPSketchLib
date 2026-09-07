@@ -205,7 +205,7 @@ pub fn ddsketch_indexable_bounds(alpha: f64) -> (f64, f64) {
 impl DDSketch {
     /// Creates a new DDSketch with relative accuracy guarantee `alpha` (must be in `(0, 1)`).
     pub fn new(alpha: f64) -> Self {
-        assert!((0.0..1.0).contains(&alpha), "alpha must be in (0,1)");
+        assert!(alpha > 0.0 && alpha < 1.0, "alpha must be in (0,1)");
         let gamma = (1.0 + alpha) / (1.0 - alpha);
         let log_gamma = gamma.ln();
         let inv_log_gamma = 1.0 / log_gamma;
@@ -221,6 +221,17 @@ impl DDSketch {
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
         }
+    }
+
+    /// Advances the running `sum` by `delta`, saturating at `f64::MAX` instead
+    /// of reaching `+inf`. The wire format refuses a non-finite `sum` on a
+    /// populated store, so an unguarded `+=` would leave a legally-ingested
+    /// sketch that can never be serialized. `count` and the bucket store stay
+    /// exact, so only `sum` degrades, and only past `f64::MAX`.
+    #[inline(always)]
+    fn add_to_sum(&mut self, delta: f64) {
+        let next = self.sum + delta;
+        self.sum = if next.is_finite() { next } else { f64::MAX };
     }
 
     /// Adds a positive finite numeric sample to the sketch; non-positive or
@@ -243,7 +254,7 @@ impl DDSketch {
         }
 
         self.count += 1;
-        self.sum += v;
+        self.add_to_sum(v);
         if v < self.min {
             self.min = v;
         }
@@ -297,7 +308,7 @@ impl DDSketch {
 
         let representative = self.bin_representative(delta.index);
         self.count += delta.value;
-        self.sum += representative * delta.value as f64;
+        self.add_to_sum(representative * delta.value as f64);
         if representative < self.min {
             self.min = representative;
         }
@@ -373,7 +384,10 @@ impl DDSketch {
         self.alpha
     }
 
-    /// Returns the running sum of all positive samples ingested.
+    /// Returns the running sum. Exact over the values passed to [`Self::add`];
+    /// a bucket promoted through [`Self::apply_delta`] contributes its bucket
+    /// representative instead, and the total saturates at `f64::MAX` rather
+    /// than overflowing to `+inf`.
     pub fn sum(&self) -> f64 {
         self.sum
     }
@@ -417,7 +431,7 @@ impl DDSketch {
         }
 
         self.count += other.count;
-        self.sum += other.sum;
+        self.add_to_sum(other.sum);
         if other.min < self.min {
             self.min = other.min;
         }

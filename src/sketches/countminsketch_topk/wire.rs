@@ -10,7 +10,7 @@
 //!
 //! CMSHeap is one algorithm — a single kind_id `0x03 0x00`. The structural
 //! parameters — the matrix dimensions (`rows` / `cols`), the base **counter
-//! type** (i64/f64), the column-derivation **mode** (fast/regular), the heap
+//! type** (i32/i64/f64), the column-derivation **mode** (fast/regular), the heap
 //! capacity `k` and the heap's `key_type` — all live in the metadata, so the
 //! payload is `[counts, keys, heap_counts]`: the base matrix packed row-major
 //! followed by the heap's entries.
@@ -49,7 +49,7 @@ where
     ///
     /// Fails when the matrix's cell count disagrees with its own dimensions,
     /// when the heap's keys mix `HeapItem` variants or hold a 128-bit key, or
-    /// when `k` overflows the metadata's `u32` field.
+    /// when `k` or `cols` overflows the metadata's `u32` field.
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
         let rows = self.cms.rows();
         let cols = self.cms.cols();
@@ -69,11 +69,16 @@ where
                 self.heap.capacity()
             ))
         })?;
+        let wire_cols = u32::try_from(cols).map_err(|_| {
+            RmpEncodeError::Syntax(format!(
+                "ASAPv1 CMSHeap envelope: cols {cols} exceeds the u32 metadata field"
+            ))
+        })?;
         let entries = heap_entries(&self.heap);
         let key_type = wire_key_type(&entries)?;
         let metadata = rmp_serde::to_vec_named(&topk_metadata::<H>(
             rows as u32,
-            cols as u32,
+            wire_cols,
             T::COUNTER_TYPE,
             Mode::MODE,
             k,
@@ -479,8 +484,10 @@ mod tests {
         );
     }
 
-    /// `i32` is a Count Sketch wire counter but not a Count-Min one, so its name
-    /// must not decode into a CMSHeap.
+    /// `counter_type` is pinned by the target: `i32`, `i64` and `f64` are all
+    /// Count-Min wire counters, so an `i32`-labelled envelope is well-formed —
+    /// but it names a counter this `i64` sketch does not hold, and must not
+    /// decode into it.
     #[test]
     fn cms_heap_rejects_a_foreign_counter_type_name() {
         let metadata = rmp_serde::to_vec_named(&topk_metadata::<DefaultXxHasher>(

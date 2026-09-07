@@ -130,16 +130,34 @@ where
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
         let rows = self.counts.rows();
         let cols = self.counts.cols();
+        let counts = self.counts.as_slice();
+        // The decoder refuses a zero dimension, so the encoder must too: with
+        // `rows == 0` the length check below passes trivially (`0 == 0*cols`).
+        if rows == 0 || cols == 0 {
+            return Err(RmpEncodeError::Syntax(format!(
+                "ASAPv1 CMS envelope: dimensions must be non-zero: rows={rows}, cols={cols}"
+            )));
+        }
         check_matrix_rows("CMS", rows)
             .map_err(|e| RmpEncodeError::Syntax(format!("ASAPv1 CMS envelope: {e}")))?;
+        if counts.len() != rows.saturating_mul(cols) {
+            return Err(RmpEncodeError::Syntax(format!(
+                "ASAPv1 CMS envelope: counts length {} != rows*cols {}",
+                counts.len(),
+                rows.saturating_mul(cols)
+            )));
+        }
+        let cols_u32 = u32::try_from(cols).map_err(|_| {
+            RmpEncodeError::Syntax(format!("ASAPv1 CMS envelope: cols {cols} exceeds u32"))
+        })?;
         let metadata = rmp_serde::to_vec_named(&cms_metadata::<H>(
             rows as u32,
-            cols as u32,
+            cols_u32,
             T::COUNTER_TYPE,
             Mode::MODE,
         ))?;
         let payload = rmp_serde::to_vec(&CmsPayload::<T> {
-            counts: self.counts.as_slice().to_vec(),
+            counts: counts.to_vec(),
         })?;
         Ok(envelope::encode(CMS_KIND, &metadata, &payload))
     }
@@ -358,6 +376,36 @@ mod tests {
                 .serialize_to_bytes()
                 .is_ok()
         );
+    }
+
+    /// An unpopulated matrix carries dimensions its cells do not match.
+    /// Serializing it must fail rather than emit bytes the decoder refuses.
+    #[test]
+    fn count_min_rejects_serializing_an_unfilled_matrix() {
+        let sketch =
+            CountMin::<Vector2D<i64>, RegularPath>::from_storage(Vector2D::<i64>::init(2, 4));
+        assert!(
+            sketch.serialize_to_bytes().is_err(),
+            "a matrix whose cell count disagrees with its dimensions must not serialize"
+        );
+    }
+
+    /// A `rows == 0` matrix satisfies the length check trivially (`0 == 0*cols`)
+    /// but is refused on decode, so serializing it must fail rather than emit
+    /// bytes the format would not read back.
+    #[test]
+    fn count_min_rejects_serializing_zero_rows() {
+        let sketch = CountMin::<Vector2D<i64>, RegularPath>::from_storage(Vector2D::from_fn(
+            0,
+            4,
+            |_, _| 0i64,
+        ));
+        assert_eq!(sketch.rows(), 0);
+        let problem = sketch
+            .serialize_to_bytes()
+            .expect_err("a zero-row matrix must not serialize")
+            .to_string();
+        assert!(problem.contains("non-zero"), "got {problem}");
     }
 
     /// Fail closed on an unexpected metadata key (mirrors the HLL test).

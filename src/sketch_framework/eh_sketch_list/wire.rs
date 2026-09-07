@@ -172,6 +172,9 @@ pub(crate) fn sketch_state(sketch: &EHSketchList) -> Result<SketchState, RmpEnco
 pub(crate) fn rebuild_sketch(triple: &SketchState) -> Result<EHSketchList, RmpDecodeError> {
     let kind_id = triple.kind_id.as_slice();
     check_variant_available(kind_id)?;
+    if variant_name(kind_id).is_none() {
+        return Err(unknown_variant(kind_id));
+    }
     let bytes = envelope::encode(kind_id, &triple.descriptor, &triple.state);
     match kind_id {
         CM_KIND => Ok(EHSketchList::CM(crate::CountMin::deserialize_from_bytes(
@@ -458,6 +461,23 @@ pub(crate) mod tests {
             .expect_err("an unknown kind_id must not decode")
             .to_string();
         assert!(message.contains("not a wire variant"), "{message}");
+    }
+
+    /// A nested kind_id longer than the envelope's one-byte length field is
+    /// rejected as unknown, before any block is assembled.
+    #[test]
+    fn eh_sketch_list_rejects_an_over_long_kind_id() {
+        for len in [256usize, 4096] {
+            let triple = SketchState {
+                kind_id: vec![0x14; len],
+                descriptor: Vec::new(),
+                state: Vec::new(),
+            };
+            let message = EHSketchList::deserialize_from_bytes(&envelope_for(&triple))
+                .expect_err("an over-long kind_id must not decode")
+                .to_string();
+            assert!(message.contains("not a wire variant"), "{message}");
+        }
     }
 
     /// The nested ids are pinned to one algorithm each: HLL is Ertl-MLE and KLL

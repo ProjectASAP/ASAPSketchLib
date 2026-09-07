@@ -98,6 +98,31 @@ fn check_bucket(index: usize, bucket: &EHBucket) -> Result<(), String> {
     Ok(())
 }
 
+/// Rejects a bucket that is not a clone of the prototype: every bucket carries
+/// the prototype's own `kind_id`. Both directions call this, so the encode and
+/// decode predicates cannot drift.
+fn check_variant(index: usize, bucket_kind: &[u8], prototype_kind: &[u8]) -> Result<(), String> {
+    if bucket_kind != prototype_kind {
+        return Err(format!(
+            "bucket {index} carries kind_id {bucket_kind:02x?}, the prototype's is {prototype_kind:02x?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects a pair of adjacent buckets that is not oldest-to-newest: bucket
+/// `index` may not begin before bucket `index - 1` ends. Both directions call
+/// this, so the encode and decode predicates cannot drift.
+fn check_order(index: usize, previous_max_time: u64, min_time: u64) -> Result<(), String> {
+    if min_time < previous_max_time {
+        return Err(format!(
+            "buckets {} and {index} are out of order: [_, {previous_max_time}] precedes [{min_time}, _]",
+            index - 1
+        ));
+    }
+    Ok(())
+}
+
 // Wire serialization for ExponentialHistogram. `wire` is a descendant of the
 // framework module, so this impl reads the parent's derivation rules directly.
 impl ExponentialHistogram {
@@ -105,9 +130,10 @@ impl ExponentialHistogram {
     /// (kind_id `0x13 0x00`). `window` and `k` land in the metadata; the
     /// payload is the buckets, their sizes and time ranges, and the prototype.
     ///
-    /// A `k` of zero, a bucket the algorithm never reaches, and a `merge_norm`
-    /// that disagrees with the prototype are errors rather than bytes that
-    /// would be refused on decode.
+    /// A `k` of zero, a bucket the algorithm never reaches, a bucket list that
+    /// is not oldest-to-newest, a bucket naming a different variant than the
+    /// prototype, and a `merge_norm` that disagrees with the prototype are
+    /// errors rather than bytes that would be refused on decode.
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
         let fail = |problem: String| {
             RmpEncodeError::Syntax(format!("ASAPv1 ExponentialHistogram envelope: {problem}"))
@@ -123,17 +149,24 @@ impl ExponentialHistogram {
                 self.merge_norm
             )));
         }
+        let prototype = sketch_state(&self.type_to_clone)?;
         let mut buckets = Vec::with_capacity(self.payload.len());
         let mut sizes = Vec::with_capacity(self.payload.len());
         for (index, bucket) in self.payload.iter().enumerate() {
             check_bucket(index, bucket).map_err(fail)?;
+            if index > 0 {
+                check_order(index, self.payload[index - 1].max_time, bucket.min_time)
+                    .map_err(fail)?;
+            }
             sizes.push(u64::try_from(bucket.size).map_err(|_| {
                 fail(format!(
                     "bucket {index} size {} exceeds the u64 payload field",
                     bucket.size
                 ))
             })?);
-            buckets.push(sketch_state(&bucket.bucket)?);
+            let state = sketch_state(&bucket.bucket)?;
+            check_variant(index, &state.kind_id, &prototype.kind_id).map_err(fail)?;
+            buckets.push(state);
         }
         let metadata = rmp_serde::to_vec_named(&eh_metadata(self.window, k))?;
         let payload = rmp_serde::to_vec(&EhPayload {
@@ -141,7 +174,7 @@ impl ExponentialHistogram {
             sizes,
             min_times: self.payload.iter().map(|b| b.min_time).collect(),
             max_times: self.payload.iter().map(|b| b.max_time).collect(),
-            prototype: sketch_state(&self.type_to_clone)?,
+            prototype,
         })?;
         Ok(envelope::encode(EH_KIND, &metadata, &payload))
     }
@@ -187,7 +220,17 @@ impl ExponentialHistogram {
         }
         let mut decoded = Vec::with_capacity(count);
         for (index, triple) in p.buckets.iter().enumerate() {
+            if index > 0 {
+                check_order(index, p.max_times[index - 1], p.min_times[index])
+                    .map_err(RmpDecodeError::Uncategorized)?;
+            }
             let sketch = rebuild_sketch(triple)?;
+            // Every bucket is a clone of the prototype, so one that names a
+            // different algorithm could never have been produced — and would
+            // refuse to merge on the first query.
+            check_variant(index, &triple.kind_id, &p.prototype.kind_id).map_err(|problem| {
+                RmpDecodeError::Uncategorized(format!("ExponentialHistogram {problem}"))
+            })?;
             let bucket = EHBucket {
                 l2_mass: compute_l2_mass(&sketch),
                 bucket: sketch,
@@ -222,7 +265,7 @@ mod tests {
     };
     use crate::sketch_framework::eh_sketch_list::wire::{CM_KIND, UNIFORM_KIND};
     use crate::sketch_framework::eh_sketch_list::{EHSketchList, SketchNorm};
-    use crate::{CountMin, DataInput, FastPath, Vector2D};
+    use crate::{Count, CountMin, DataInput, FastPath, Vector2D};
 
     /// A histogram over Count-Min buckets with a few timestamped updates.
     fn populated_eh() -> ExponentialHistogram {
@@ -493,6 +536,164 @@ mod tests {
             min_times: vec![0],
             max_times: vec![0],
             prototype: sketch_state(&sketch).expect("state"),
+        };
+        assert!(ExponentialHistogram::deserialize_from_bytes(&envelope_for(&payload)).is_err());
+    }
+
+    /// A bucket whose nested kind_id differs from the prototype's is rejected:
+    /// the buckets and the prototype are one algorithm, so a heterogeneous
+    /// payload never reaches a merge that would refuse it.
+    #[test]
+    fn eh_rejects_a_bucket_that_disagrees_with_the_prototype() {
+        let cm = EHSketchList::CM(CountMin::<Vector2D<i32>, FastPath>::with_dimensions(3, 8));
+        let cs = EHSketchList::CS(Count::<Vector2D<i32>, FastPath>::with_dimensions(3, 8));
+        let payload = EhPayload {
+            buckets: vec![
+                sketch_state(&cm).expect("state"),
+                sketch_state(&cs).expect("state"),
+            ],
+            sizes: vec![1, 1],
+            min_times: vec![0, 1],
+            max_times: vec![0, 1],
+            prototype: sketch_state(&cm).expect("state"),
+        };
+        let message = ExponentialHistogram::deserialize_from_bytes(&envelope_for(&payload))
+            .expect_err("a heterogeneous bucket list must not decode")
+            .to_string();
+        assert!(message.contains("the prototype's is"), "{message}");
+
+        // Homogeneous buckets that all disagree with the prototype are caught
+        // just the same.
+        let payload = EhPayload {
+            buckets: vec![sketch_state(&cs).expect("state")],
+            sizes: vec![1],
+            min_times: vec![0],
+            max_times: vec![0],
+            prototype: sketch_state(&cm).expect("state"),
+        };
+        assert!(ExponentialHistogram::deserialize_from_bytes(&envelope_for(&payload)).is_err());
+    }
+
+    /// `payload` and `type_to_clone` are public fields, so a caller can seat a
+    /// bucket of another variant by hand. The decoder refuses that payload, so
+    /// the encoder must too. The histogram below is built by writing those
+    /// public fields directly, not through `update`.
+    #[test]
+    fn eh_refuses_to_serialize_a_bucket_that_disagrees_with_the_prototype() {
+        let mut mixed = populated_eh();
+        let foreign = EHSketchList::CS(Count::<Vector2D<i32>, FastPath>::with_dimensions(3, 8));
+        let last = mixed.payload.len() - 1;
+        mixed.payload[last].l2_mass = compute_l2_mass(&foreign);
+        mixed.payload[last].bucket = foreign;
+
+        let message = mixed
+            .serialize_to_bytes()
+            .expect_err("a bucket of another variant must not serialize")
+            .to_string();
+        assert!(message.contains("the prototype's is"), "{message}");
+    }
+
+    /// Buckets are oldest to newest: a shuffled payload is rejected rather than
+    /// answering interval queries from the wrong end of the window.
+    #[test]
+    fn eh_rejects_buckets_out_of_order() {
+        let sketch = EHSketchList::CM(CountMin::<Vector2D<i32>, FastPath>::with_dimensions(3, 8));
+        let triple = || sketch_state(&sketch).expect("state");
+        let payload = EhPayload {
+            buckets: vec![triple(), triple()],
+            sizes: vec![1, 1],
+            min_times: vec![50, 10],
+            max_times: vec![59, 19],
+            prototype: triple(),
+        };
+        let message = ExponentialHistogram::deserialize_from_bytes(&envelope_for(&payload))
+            .expect_err("shuffled buckets must not decode")
+            .to_string();
+        assert!(message.contains("out of order"), "{message}");
+
+        // Overlapping neighbours are out of order too: bucket 1 starts before
+        // bucket 0 ends.
+        let payload = EhPayload {
+            buckets: vec![triple(), triple()],
+            sizes: vec![1, 1],
+            min_times: vec![10, 15],
+            max_times: vec![19, 25],
+            prototype: triple(),
+        };
+        assert!(ExponentialHistogram::deserialize_from_bytes(&envelope_for(&payload)).is_err());
+
+        // Touching neighbours are in order.
+        let payload = EhPayload {
+            buckets: vec![triple(), triple()],
+            sizes: vec![1, 1],
+            min_times: vec![10, 19],
+            max_times: vec![19, 25],
+            prototype: triple(),
+        };
+        assert!(ExponentialHistogram::deserialize_from_bytes(&envelope_for(&payload)).is_ok());
+    }
+
+    /// The encode path holds the same order rule. `update` appends a bucket at
+    /// whatever timestamp it is handed, so a stream that goes backwards builds
+    /// a histogram whose buckets are not oldest-to-newest — a state whose
+    /// `cover` is false for every interval and whose interval queries answer
+    /// from the whole payload. It has no encoding.
+    #[test]
+    fn eh_refuses_to_serialize_buckets_out_of_order() {
+        let mut eh = ExponentialHistogram::new(
+            8,
+            1000,
+            EHSketchList::CM(CountMin::<Vector2D<i32>, FastPath>::with_dimensions(3, 8)),
+        );
+        eh.update(50, &DataInput::U64(1));
+        eh.update(10, &DataInput::U64(2));
+        assert_eq!(
+            (eh.payload[0].min_time, eh.payload[1].min_time),
+            (50, 10),
+            "a backwards stream must be what builds the out-of-order payload"
+        );
+        let message = eh
+            .serialize_to_bytes()
+            .expect_err("an out-of-order payload must not serialize")
+            .to_string();
+        assert!(message.contains("out of order"), "{message}");
+    }
+
+    /// A nested kind_id longer than the envelope's one-byte length field is
+    /// rejected, in a bucket and as the prototype, before any block is
+    /// assembled from it.
+    #[test]
+    fn eh_rejects_an_over_long_kind_id() {
+        let sketch = EHSketchList::CM(CountMin::<Vector2D<i32>, FastPath>::with_dimensions(3, 8));
+        let long = || SketchState {
+            kind_id: vec![0x13; 256],
+            descriptor: Vec::new(),
+            state: Vec::new(),
+        };
+        let payload = EhPayload {
+            buckets: vec![long()],
+            sizes: vec![1],
+            min_times: vec![0],
+            max_times: vec![0],
+            prototype: long(),
+        };
+        assert!(ExponentialHistogram::deserialize_from_bytes(&envelope_for(&payload)).is_err());
+
+        let payload = EhPayload {
+            buckets: Vec::new(),
+            sizes: Vec::new(),
+            min_times: Vec::new(),
+            max_times: Vec::new(),
+            prototype: long(),
+        };
+        assert!(ExponentialHistogram::deserialize_from_bytes(&envelope_for(&payload)).is_err());
+
+        let payload = EhPayload {
+            buckets: vec![sketch_state(&sketch).expect("state")],
+            sizes: vec![1],
+            min_times: vec![0],
+            max_times: vec![0],
+            prototype: long(),
         };
         assert!(ExponentialHistogram::deserialize_from_bytes(&envelope_for(&payload)).is_err());
     }

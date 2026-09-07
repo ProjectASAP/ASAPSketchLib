@@ -29,8 +29,10 @@
 //! types, so a summary holding one refuses to serialize — as does one whose
 //! monitored keys mix variants, `String` and `Bytes` included. A `Bytes` key is
 //! written as msgpack `bin` through `WireBytes` and read back from `bin` alone,
-//! so any byte string survives whether or not it is UTF-8 and a `str`-keyed
-//! payload relabelled `"bytes"` is refused.
+//! so any byte string survives whether or not it is UTF-8; a `String` key goes
+//! through `WireString` and is read back from `str` alone. Neither family
+//! decodes as the other, so a `str`-keyed payload relabelled `"bytes"` and a
+//! UTF-8 `bin`-keyed payload relabelled `"string"` are both refused.
 //!
 //! ## Emitted order (byte-stable round trips)
 //!
@@ -45,7 +47,7 @@ use rmp_serde::{decode::Error as RmpDecodeError, encode::Error as RmpEncodeError
 use serde::{Deserialize, Serialize};
 
 use crate::message_pack_format::envelope;
-use crate::message_pack_format::wire_key::WireBytes;
+use crate::message_pack_format::wire_key::{WireBytes, WireString};
 use crate::{HashProfile, HeapItem, SketchHasher};
 
 use super::{SpaceSaving, SpaceSavingState, key_order};
@@ -200,7 +202,7 @@ fn encode_payload(
             let mut keys = Vec::with_capacity(entries.len());
             for (key, _, _) in entries {
                 match key {
-                    HeapItem::String(value) => keys.push(value.clone()),
+                    HeapItem::String(value) => keys.push(WireString(value.clone())),
                     _ => return Err(mixed_variant_error(key_type, key)),
                 }
             }
@@ -273,7 +275,20 @@ fn decode_payload(
         "usize" => unpack!(USIZE, usize),
         "f32" => unpack!(F32, f32),
         "f64" => unpack!(F64, f64),
-        "string" => unpack!(String, String),
+        "string" => {
+            let decoded: SpaceSavingPayload<WireString> = from_slice(payload)?;
+            (
+                decoded
+                    .keys
+                    .into_iter()
+                    .map(|key| HeapItem::String(key.into_string()))
+                    .collect::<Vec<HeapItem>>(),
+                decoded.counts,
+                decoded.errors,
+                decoded.total,
+                decoded.discarded_max,
+            )
+        }
         "bytes" => {
             let decoded: SpaceSavingPayload<WireBytes> = from_slice(payload)?;
             (
@@ -742,6 +757,13 @@ mod tests {
         let raw_bytes = raw.serialize_to_bytes().expect("serialize");
         let (_, _, raw_payload) = envelope::split(&raw_bytes).expect("split");
 
+        // Bytes that ARE valid UTF-8: relabelled "string" they would decode
+        // into `HeapItem::String` keys unless the string decode refuses `bin`.
+        let mut utf8: SpaceSaving = SpaceSaving::with_capacity(4);
+        utf8.insert(&DataInput::Bytes(b"alpha"));
+        let utf8_bytes = utf8.serialize_to_bytes().expect("serialize");
+        let (_, _, utf8_payload) = envelope::split(&utf8_bytes).expect("split");
+
         for (claimed, payload) in [
             ("u64", string_payload),
             ("string", number_payload),
@@ -749,6 +771,7 @@ mod tests {
             ("bytes", string_payload),
             ("u64", raw_payload),
             ("string", raw_payload),
+            ("string", utf8_payload),
         ] {
             let metadata =
                 rmp_serde::to_vec_named(&space_saving_metadata::<DefaultXxHasher>(4, claimed))

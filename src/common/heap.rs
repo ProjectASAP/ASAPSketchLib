@@ -58,13 +58,20 @@ impl From<HHHeapState> for HHHeap {
 impl HHHeap {
     /// Creates a new HHHeap with capacity k.
     pub fn new(k: usize) -> Self {
+        Self::with_expected_len(k, k)
+    }
+
+    /// Creates a heap of capacity `k` whose heap array and index reserve for
+    /// `expected_len` residents rather than for `k`. Capacity semantics are
+    /// unchanged — [`Self::capacity`] is still `k`, and the heap still turns a
+    /// key away once it holds `k` — so this only moves the reservation off a
+    /// declared capacity the caller does not yet have the entries to fill.
+    pub fn with_expected_len(k: usize, expected_len: usize) -> Self {
+        let reserved = expected_len.min(k).min(PREALLOCATED_SLOTS);
         HHHeap {
-            heap: CommonHeap::new_min(k),
-            slots: Vec::with_capacity(k.min(PREALLOCATED_SLOTS)),
-            positions: Index::with_capacity_and_hasher(
-                k.min(PREALLOCATED_SLOTS),
-                DigestBuildHasher::default(),
-            ),
+            heap: CommonHeap::with_expected_len(k, expected_len, KeepSmallest),
+            slots: Vec::with_capacity(reserved),
+            positions: Index::with_capacity_and_hasher(reserved, DigestBuildHasher::default()),
             k,
         }
     }
