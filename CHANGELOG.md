@@ -10,6 +10,13 @@ signals a backwards-compatible change.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-07
+
+Breaking release. Adds `Bloom` and `SpaceSaving`, completes ASAPv1 wire
+coverage for every implemented sketch, and corrects the Nitro row sampler.
+The wire format and the `serde` shape of several types changed; see
+**Changed** below for the payloads and types affected.
+
 ### Added
 
 - **`UnivMonQQuery::ordered_query_diagnostics`**, returning
@@ -525,7 +532,8 @@ Initial crates.io release.
 
 Pre-release tag. Not published to crates.io.
 
-[Unreleased]: https://github.com/ProjectASAP/asap_sketchlib/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/ProjectASAP/asap_sketchlib/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ProjectASAP/asap_sketchlib/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/ProjectASAP/asap_sketchlib/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/ProjectASAP/asap_sketchlib/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ProjectASAP/asap_sketchlib/compare/v0.1.0...v0.2.0
