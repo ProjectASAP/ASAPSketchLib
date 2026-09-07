@@ -446,7 +446,7 @@ Its structural parameters — the grid dimensions (`rows` / `cols`) and the colu
 `inserted` is **not** derivable from `words` — re-inserting a key sets no new bit — so it is carried. Everything else the filter reports is: `fill_ratio`, `estimated_fpp` and `predicted_fpp` are all recomputed from the bits and the dimensions, and none of them appear.
 
 **Wire-eligible geometries.** The wire covers what `Bloom::with_capacity` produces: `1 <= rows <= 20` (`BLOOM_MAX_SLICES`, defined as `MATRIX_MAX_ROWS`, the seed list length), a **power-of-two** `cols`, and `rows * cols <= 2^31` (`BLOOM_MAX_BITS`).
-`Bloom::with_dimensions` is free to build a filter outside that subset — more rows than there are seeds (which duplicate an earlier slice bit for bit), or a modulo-folded width — and such a filter is rejected on **both** sides, so the format never emits bytes it would refuse to read back.
+`Bloom::with_dimensions` is free to build a modulo-folded width, which is outside that subset and rejected on **both** sides, so the format never emits bytes it would refuse to read back.
 This mirrors Count-Min, whose wire covers i32/i64/f64 counters while the in-memory type stays freer (Section 3.2, Section 5).
 
 **Decode rules** (all fail closed, per Section 1's decoder rules):

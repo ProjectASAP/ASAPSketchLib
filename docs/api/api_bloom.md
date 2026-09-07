@@ -36,11 +36,10 @@ delivered rate lands under the target rather than over it. `dimensions_for`
 reports the choice without allocating.
 
 The cap is the reason the width is solved for `k` rather than taken as the
-`k`-optimal split `m/k`. Row `r` hashes with seed index `r % 20`, so a filter
-asking for 23 slices would get 20 distinct hash functions and 3 copies. Capping
-`k` and widening the slices to compensate costs bits — about 20% more at
-`p = 1e-12` — and delivers the target, where the `k`-optimal split would have
-delivered `2^-20` no matter what was asked for.
+`k`-optimal split `m/k`. The hasher has 20 seeds, so 20 slices is as many as can
+hash independently. Capping `k` and widening the slices to compensate costs
+bits — about 20% more at `p = 1e-12` — and delivers the target, where the
+`k`-optimal split would have delivered `2^-20` no matter what was asked for.
 
 `with_capacity` and `dimensions_for` **panic on a NaN or infinite
 `target_fpp`**; a finite value outside `(0, 1)` is clamped into it. A target
@@ -52,8 +51,7 @@ at about 1 false positive in 11,500.
 
 `with_dimensions` is the escape hatch when memory is fixed. A non-power-of-two
 `cols` folds with a modulo and carries the bias the sized path avoids. More than
-`BLOOM_MAX_SLICES` rows is legal but pointless: rows past the seed list repeat
-an earlier row bit for bit.
+`BLOOM_MAX_SLICES` rows, or a zero dimension, **panics**.
 
 ## Insert/Update
 
@@ -79,18 +77,15 @@ fn estimated_fpp(&self) -> f64
 fn fill_ratio(&self) -> f64
 fn inserted(&self) -> u64
 fn rows(&self) -> usize
-fn effective_rows(&self) -> usize
 fn cols(&self) -> usize
 fn bit_capacity(&self) -> usize
 fn size_in_bytes(&self) -> usize
 fn is_empty(&self) -> bool
 ```
 
-`predicted_fpp` is the model, `(1 - e^(-n/cols))^effective_rows`.
-`estimated_fpp` reads the bits actually set, so it is the one to trust on a
-filter whose distinct count is unknown. Both raise the per-slice rate to
-`effective_rows`, not `rows`: duplicate slices agree by construction and add no
-selectivity, so counting them would report a rate the filter cannot deliver.
+`predicted_fpp` is the model, `(1 - e^(-n/cols))^rows`. `estimated_fpp` reads
+the bits actually set, so it is the one to trust on a filter whose distinct
+count is unknown.
 
 ## Merge
 
@@ -118,20 +113,20 @@ row-major plus the insert counter, with the word stride derived from `cols`.
 
 The wire covers the geometries `with_capacity` produces: at most
 `BLOOM_MAX_SLICES` slices, a power-of-two `cols`, and at most `BLOOM_MAX_BITS`
-bits. `with_dimensions` can build a filter outside that subset, and both
-`serialize_to_bytes` and `deserialize_from_bytes` reject it, so the format never
-emits bytes it would refuse to read back. Decode also rejects a word count that
-disagrees with the declared dimensions, and any bit set in a row's trailing
-padding past `cols` — unreachable by `contains`, but counted by `count_ones`, so
-it would skew `fill_ratio` and `estimated_fpp` alone.
+bits. `with_dimensions` can build a non-power-of-two `cols` outside that subset,
+and both `serialize_to_bytes` and `deserialize_from_bytes` reject it, so the
+format never emits bytes it would refuse to read back. Decode also rejects a
+word count that disagrees with the declared dimensions, and any bit set in a
+row's trailing padding past `cols` — unreachable by `contains`, but counted by
+`count_ones`, so it would skew `fill_ratio` and `estimated_fpp` alone.
 
 Independently of ASAPv1, `Bloom` is plain `Serialize`/`Deserialize`; that form is
 `{ bits, inserted, mode }`, where `mode` is `"regular"` or `"fast"`. Decoding
 into the other hash path fails rather than producing a filter that reports its
-own members absent. `BitMatrix` carries `{ words, rows, cols }` only — the word
-stride and the fold masks are recomputed on decode, and a payload whose word
-count disagrees with its dimensions is rejected there rather than panicking
-later.
+own members absent, and so does a row count past `BLOOM_MAX_SLICES`. `BitMatrix`
+carries `{ words, rows, cols }` only — the word stride and the fold masks are
+recomputed on decode, and a payload whose word count disagrees with its
+dimensions is rejected there rather than panicking later.
 
 ## Examples
 
@@ -160,9 +155,9 @@ if !seen.contains(&DataInput::Str("10.0.0.2:443")) {
   as non-interchangeable regardless — a filter validated on an agreeing
   geometry will lose almost every member on a packed one. The `mode` tag makes
   a cross-path decode fail rather than fail silently.
-- Selectivity stops at `BLOOM_MAX_SLICES` (20) slices, the hasher's seed count.
-  `with_capacity` never asks for more; `with_dimensions` will, and the extra
-  rows cost memory and a hash each for nothing.
+- `BLOOM_MAX_SLICES` (20), the hasher's seed count, is the most slices a filter
+  can have. `with_capacity` never asks for more, and `with_dimensions` panics if
+  asked.
 - `with_dimensions(1, 1)` is legal and answers yes to everything after the
   first insert.
 
