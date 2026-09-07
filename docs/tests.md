@@ -540,7 +540,7 @@ Wire tests: [`src/sketches/elastic/wire.rs`](../src/sketches/elastic/wire.rs)
 | test_name | test_description | what_is_tested |
 | --- | --- | --- |
 | `init_with_dimensions_sizes_both_parts` | Both parts take the requested dimensions. | `init_with_dimensions(12, 2, 256)` is verified to yield 12 heavy buckets and a 2x256 light layer. |
-| `init_with_length_keeps_the_default_light_layer` | The old constructor is unchanged. | `init_with_length(8)` is verified to yield 8 heavy buckets over `DEFAULT_LIGHT_ROWS` x `DEFAULT_LIGHT_COLS`. |
+| `init_with_length_keeps_the_default_light_layer` | `init_with_length` sizes the heavy table alone and leaves the light layer at its defaults. | `init_with_length(8)` is verified to yield 8 heavy buckets over `DEFAULT_LIGHT_ROWS` x `DEFAULT_LIGHT_COLS`. |
 | `an_empty_heavy_table_is_rejected` | A zero bucket count panics. | `init_with_length(0)` is verified to panic with "at least one heavy bucket" rather than divide by zero in the bucket index. |
 | `a_negative_heavy_table_is_rejected` | A negative bucket count panics. | `init_with_length(-1)` is verified to panic rather than widen to a huge `usize`. |
 | `an_empty_light_layer_is_rejected` | A zero-row light layer panics. | `init_with_dimensions(8, 0, 4096)` is verified to panic with "non-empty light layer". |
