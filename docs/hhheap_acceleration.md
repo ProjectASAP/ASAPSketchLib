@@ -92,5 +92,5 @@ derived rather than carried, and a decoded heap rebuilds it before first use.
 A named-map encoding that carries an index field still decodes, since the extra
 key is skipped; a positional encoding of the three-field form does not. Nothing
 in-crate writes the positional form: the portable MessagePack wire for the top-k
-sketches carries a `(key, value)` list and rebuilds through `update`, and the
-goldens cover CMS and HLL envelopes only.
+sketches carries a `(key, value)` list and rebuilds through `update`, and no
+golden covers a top-k envelope.

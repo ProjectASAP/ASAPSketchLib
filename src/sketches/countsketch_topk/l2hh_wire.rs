@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 
 use crate::common::hash::check_matrix_rows;
+use crate::common::structures::matrix_storage::cols_mask_bits;
 use crate::message_pack_format::envelope;
 use crate::{HashProfile, SketchHasher, Vector1D, Vector2D};
 
@@ -89,16 +90,47 @@ struct L2hhPayload {
     l2: Vec<i64>,
 }
 
-/// Rejects a zero dimension and a row count past `MATRIX_MAX_ROWS`.
+/// Rejects a zero dimension, a row count past `MATRIX_MAX_ROWS`, and a
+/// geometry whose per-row hash fields do not fit in one 128-bit key hash.
+///
 /// `Vector2D` derives its column mask via `cols.ilog2()`, which panics on
 /// `cols == 0`.
+///
+/// CountL2HH draws one 128-bit hash per key and slices it per row: row `r`
+/// reads its column from bits `[r * mask_bits, (r + 1) * mask_bits)` and its
+/// sign from bit `127 - r`, where `mask_bits = cols_mask_bits(cols)`. Each row
+/// therefore claims `mask_bits + 1` of the 128 bits, so the fields are in
+/// range and disjoint exactly while `rows * (mask_bits + 1) <= 128` — the
+/// budget `<u128 as MatrixFastHash>::assert_compatible` asserts, restated here
+/// as a `Result` so both wire doors fail closed instead of panicking.
 pub(crate) fn check_dimensions(rows: usize, cols: usize) -> Result<(), String> {
     if rows == 0 || cols == 0 {
         return Err(format!(
             "CountL2HH dimensions must be non-zero: rows={rows}, cols={cols}"
         ));
     }
-    check_matrix_rows("CountL2HH", rows)
+    check_matrix_rows("CountL2HH", rows)?;
+    let mask_bits = cols_mask_bits(cols) as usize;
+    let bits_required = mask_bits.saturating_add(1).saturating_mul(rows);
+    if bits_required > 128 {
+        return Err(format!(
+            "CountL2HH rows={rows}, cols={cols} needs {bits_required} hash bits \
+             ({mask_bits} column bits + 1 sign bit per row), past the 128 the key hash carries"
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects a seed index the hasher's seed list does not hold. Seed selection
+/// wraps (`seed_idx % seed_list.len()`), so an out-of-range index would give a
+/// second encoding of a state the in-range index already encodes.
+pub(crate) fn check_seed_index(seed_idx: usize, seed_list_len: usize) -> Result<(), String> {
+    if seed_idx >= seed_list_len {
+        return Err(format!(
+            "CountL2HH seed_index {seed_idx} is past the seed list's {seed_list_len} entries"
+        ));
+    }
+    Ok(())
 }
 
 /// The `(counts, l2)` sub-payload one CountL2HH contributes, in the order the
@@ -180,10 +212,13 @@ impl<H: SketchHasher + HashProfile> CountL2HH<H> {
     /// [`HashProfile`], so it truthfully describes how the sketch was hashed.
     ///
     /// Fails when the state disagrees with its own dimensions, when an `l2`
-    /// accumulator is negative, or when a dimension or the seed index
-    /// overflows its `u32` metadata field.
+    /// accumulator is negative, when the geometry needs more hash bits than
+    /// the 128-bit key hash carries, when the seed index is past the hasher's
+    /// seed list, or when a dimension or the seed index overflows its `u32`
+    /// metadata field.
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
         check_dimensions(self.row, self.col).map_err(RmpEncodeError::Syntax)?;
+        check_seed_index(self.seed_idx, H::seed_list().len()).map_err(RmpEncodeError::Syntax)?;
         let (counts, l2) = layer_state(self)?;
         let field = |name: &str, value: usize| {
             u32::try_from(value).map_err(|_| {
@@ -222,6 +257,8 @@ impl<H: SketchHasher + HashProfile> CountL2HH<H> {
                 "ASAPv1 CountL2HH envelope: metadata mismatch".to_string(),
             ));
         }
+        check_seed_index(meta.seed_index as usize, meta.seed_list.len())
+            .map_err(RmpDecodeError::Uncategorized)?;
         let p: L2hhPayload = from_slice(payload)?;
         rebuild_layer::<H>(
             meta.rows as usize,
@@ -465,10 +502,9 @@ mod tests {
         let meta = l2hh_metadata::<DefaultXxHasher>(0, 4, 0);
         assert!(Std::deserialize_from_bytes(&crafted(&meta, Vec::new(), vec![0; 4])).is_err());
 
-        let huge = l2hh_metadata::<DefaultXxHasher>(0, MATRIX_MAX_ROWS as u32, 1 << 24);
+        let huge = l2hh_metadata::<DefaultXxHasher>(0, 1, 1 << 24);
         assert!(
-            Std::deserialize_from_bytes(&crafted(&huge, vec![1, 2, 3], vec![0; MATRIX_MAX_ROWS]))
-                .is_err(),
+            Std::deserialize_from_bytes(&crafted(&huge, vec![1, 2, 3], vec![0; 1])).is_err(),
             "counts length must match rows*cols"
         );
 
@@ -553,6 +589,81 @@ mod tests {
         assert!(
             from_slice::<L2hhMetadata>(&rmp_serde::to_vec_named(&without).unwrap()).is_err(),
             "a missing required key must be rejected"
+        );
+    }
+
+    /// One 128-bit key hash gives each row `mask_bits + 1` bits, so a geometry
+    /// needing more than 128 of them is not a sketch either door may pass.
+    /// `rows = 12, cols = 4096` and `rows = 13, cols = 2048` both need 156:
+    /// their last row shifts the hash by 132, past the 127-bit ceiling.
+    #[test]
+    fn count_l2hh_rejects_a_geometry_past_the_hash_budget() {
+        for (rows, cols) in [(12usize, 4096usize), (13, 2048)] {
+            let problem = Std::with_dimensions(rows, cols)
+                .serialize_to_bytes()
+                .expect_err("a geometry past the hash budget must not serialize")
+                .to_string();
+            assert!(problem.contains("hash bits"), "got {problem}");
+
+            let bytes = crafted(
+                &l2hh_metadata::<DefaultXxHasher>(0, rows as u32, cols as u32),
+                vec![0; rows * cols],
+                vec![0; rows],
+            );
+            let problem = Std::deserialize_from_bytes(&bytes)
+                .expect_err("a geometry past the hash budget must not decode")
+                .to_string();
+            assert!(problem.contains("hash bits"), "got {problem}");
+        }
+    }
+
+    /// The same budget covers the case that does not panic: 10 rows of 4096
+    /// columns fill bits 0..119 with column fields while the sign bits start at
+    /// 118, so two rows would read a column out of bits that are already signs.
+    #[test]
+    fn count_l2hh_rejects_column_fields_overlapping_the_sign_bits() {
+        assert!(
+            Std::with_dimensions(10, 4096).serialize_to_bytes().is_err(),
+            "column fields must not reach into the sign bits"
+        );
+        // The widest geometry each column count still admits.
+        assert!(Std::with_dimensions(9, 4096).serialize_to_bytes().is_ok());
+        assert!(Std::with_dimensions(10, 2048).serialize_to_bytes().is_ok());
+        assert!(
+            Std::with_dimensions(11, 2048).serialize_to_bytes().is_err(),
+            "column fields must not reach into the sign bits"
+        );
+    }
+
+    /// Seed selection wraps, so a seed index past the seed list is a second
+    /// encoding of a state an in-range index already encodes — and two such
+    /// sketches would refuse to merge. Neither door accepts it.
+    #[test]
+    fn count_l2hh_rejects_a_seed_index_past_the_seed_list() {
+        let seeds = <DefaultXxHasher as HashProfile>::seed_list().len();
+        let wrapped = seeds + 5;
+
+        let problem = CountL2HH::<DefaultXxHasher>::with_dimensions_and_seed(2, 8, wrapped)
+            .serialize_to_bytes()
+            .expect_err("a wrapped seed index must not serialize")
+            .to_string();
+        assert!(problem.contains("seed_index"), "got {problem}");
+
+        let bytes = crafted(
+            &l2hh_metadata::<DefaultXxHasher>(wrapped as u32, 2, 8),
+            vec![0; 16],
+            vec![0; 2],
+        );
+        let problem = Std::deserialize_from_bytes(&bytes)
+            .expect_err("a wrapped seed index must not decode")
+            .to_string();
+        assert!(problem.contains("seed_index"), "got {problem}");
+
+        // The last in-range index is eligible.
+        assert!(
+            CountL2HH::<DefaultXxHasher>::with_dimensions_and_seed(2, 8, seeds - 1)
+                .serialize_to_bytes()
+                .is_ok()
         );
     }
 

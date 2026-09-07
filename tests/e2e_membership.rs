@@ -210,7 +210,7 @@ fn a_union_equals_the_filter_of_the_concatenated_stream() {
         whole.insert(&DataInput::I64(key));
     }
 
-    left.merge_from(&right);
+    left.merge(&right);
     assert_eq!(left.as_bits().count_ones(), whole.as_bits().count_ones());
     assert_eq!(left.inserted(), whole.inserted());
 
@@ -269,10 +269,6 @@ fn sizing_meets_the_target_and_is_one_power_of_two_from_missing_it() {
 
 /// The slice count is capped at the number of seeds the hasher actually has,
 /// and every slice a sized filter builds is a distinct hash function.
-///
-/// Row `r` hashes with seed `r % 20`, so a 23-slice filter is a 20-slice
-/// filter carrying three duplicates: it costs the memory of 23 and delivers
-/// the rate of 20.
 #[test]
 fn sizing_never_asks_for_more_slices_than_the_seed_list_has() {
     for (n, p) in [(10_000usize, 1e-7), (10_000, 1e-9), (10_000, 1e-12)] {
@@ -291,7 +287,6 @@ fn sizing_never_asks_for_more_slices_than_the_seed_list_has() {
             vec![],
             "n={n} p={p:e}: {rows}x{cols} has slices that are the same hash function"
         );
-        assert_eq!(filter.effective_rows(), rows);
     }
 }
 
@@ -450,95 +445,6 @@ fn an_infinite_target_rate_is_rejected() {
 #[should_panic(expected = "target false-positive rate must be finite")]
 fn a_negative_infinite_target_rate_is_rejected() {
     let _ = Bloom::<RegularPath>::with_capacity(1_000, f64::NEG_INFINITY);
-}
-
-/// Slices past the seed list repeat an earlier slice bit for bit, so they add
-/// storage and a hash without adding selectivity. Both rate estimates count
-/// only the slices that discriminate, so what they report is what a probe set
-/// measures.
-#[test]
-fn extra_slices_past_the_seed_list_do_not_sharpen_the_filter() {
-    const COLS: usize = 1 << 14;
-    let capped = {
-        let mut f = Bloom::<RegularPath>::with_dimensions(BLOOM_MAX_SLICES, COLS);
-        f.bulk_insert(
-            &members()
-                .into_iter()
-                .map(DataInput::I64)
-                .collect::<Vec<_>>(),
-        );
-        f
-    };
-    let padded = {
-        let mut f = Bloom::<RegularPath>::with_dimensions(BLOOM_MAX_SLICES + 5, COLS);
-        f.bulk_insert(
-            &members()
-                .into_iter()
-                .map(DataInput::I64)
-                .collect::<Vec<_>>(),
-        );
-        f
-    };
-
-    let capped_rate = false_positive_rate(|k| capped.contains(&DataInput::I64(k)));
-    let padded_rate = false_positive_rate(|k| padded.contains(&DataInput::I64(k)));
-    assert!(
-        capped_rate > 0.0,
-        "the geometry must deliver a measurable rate for this to mean anything"
-    );
-    assert_eq!(
-        capped_rate, padded_rate,
-        "five extra slices changed the answers, so they are not duplicates"
-    );
-
-    assert_eq!(padded.effective_rows(), BLOOM_MAX_SLICES);
-    assert_eq!(
-        padded.predicted_fpp(MEMBERS as usize),
-        capped.predicted_fpp(MEMBERS as usize),
-        "the extra slices are claimed to sharpen a rate they cannot move"
-    );
-
-    let predicted = padded.predicted_fpp(MEMBERS as usize);
-    let band = sampling_band(predicted);
-    assert!(
-        (padded_rate - predicted).abs() <= band,
-        "measured {padded_rate:e} is more than {band:e} from predicted {predicted:e}"
-    );
-    assert!(
-        padded.estimated_fpp() <= padded_rate * 1.5,
-        "estimated {:e} promises more than the measured {padded_rate:e}",
-        padded.estimated_fpp()
-    );
-    assert!(
-        padded.estimated_fpp() >= padded_rate * 0.75,
-        "estimated {:e} claims better than the measured {padded_rate:e}",
-        padded.estimated_fpp()
-    );
-    // The five duplicate slices raise neither the bits set per slice nor the
-    // slices that discriminate, so the fill-based estimate lands where the
-    // capped filter's does.
-    assert!(
-        (padded.estimated_fpp() / capped.estimated_fpp() - 1.0).abs() <= 0.05,
-        "estimated {:e} differs from the capped filter's {:e}",
-        padded.estimated_fpp(),
-        capped.estimated_fpp()
-    );
-}
-
-/// The mechanism behind the cap, pinned on both paths: row `r` and row
-/// `r + 20` receive the same seed and therefore the same bits.
-#[test]
-fn slices_repeat_exactly_at_the_seed_list_boundary() {
-    let expected: Vec<(usize, usize)> = (0..5).map(|r| (r, r + BLOOM_MAX_SLICES)).collect();
-
-    let mut regular = Bloom::<RegularPath>::with_dimensions(BLOOM_MAX_SLICES + 5, 1024);
-    let mut fast = Bloom::<FastPath>::with_dimensions(BLOOM_MAX_SLICES + 5, 1024);
-    for key in 0..2_000i64 {
-        regular.insert(&DataInput::I64(key));
-        fast.insert(&DataInput::I64(key));
-    }
-    assert_eq!(duplicate_slice_pairs(regular.as_bits()), expected);
-    assert_eq!(duplicate_slice_pairs(fast.as_bits()), expected);
 }
 
 /// A single-bit filter is degenerate but must still answer, and a single row
@@ -749,7 +655,7 @@ fn a_fast_path_union_equals_the_filter_of_the_concatenated_stream() {
         }
         whole.insert(&DataInput::I64(key));
     }
-    left.merge_from(&right);
+    left.merge(&right);
     assert_eq!(all_bits(left.as_bits()), all_bits(whole.as_bits()));
     assert_eq!(left.inserted(), whole.inserted());
     for key in 0..10_000i64 {
@@ -762,7 +668,7 @@ fn a_fast_path_union_equals_the_filter_of_the_concatenated_stream() {
 fn merging_filters_of_different_widths_panics() {
     let mut left = Bloom::<RegularPath>::with_dimensions(7, 1 << 14);
     let right = Bloom::<RegularPath>::with_dimensions(7, 1 << 13);
-    left.merge_from(&right);
+    left.merge(&right);
 }
 
 #[test]
@@ -770,7 +676,7 @@ fn merging_filters_of_different_widths_panics() {
 fn merging_filters_of_different_slice_counts_panics() {
     let mut left = Bloom::<RegularPath>::with_dimensions(7, 1 << 14);
     let right = Bloom::<RegularPath>::with_dimensions(8, 1 << 14);
-    left.merge_from(&right);
+    left.merge(&right);
 }
 
 /// `bulk_insert` is the loop, not a different filter.

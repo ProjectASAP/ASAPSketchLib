@@ -33,7 +33,7 @@ This document provides a high-level overview of implemented and planned features
 
 ### Frameworks
 
-**Hydra** - Hierarchical heavy hitters for multi-dimensional queries ([apis.md](apis.md))
+**Hydra** - Subpopulation queries over multi-dimensional keys ([apis.md](apis.md))
 
 **UnivMon** - Universal monitoring (L1, L2, entropy, cardinality from single structure) ([apis.md](apis.md))
 
@@ -49,7 +49,7 @@ This document provides a high-level overview of implemented and planned features
 
 **ExponentialHistogram** - Sliding window coordinator for mergeable sketches
 
-**TumblingWindow** - Non-overlapping windows with built-in support for the experimental UnivMon-Q sketch
+**TumblingWindow** - Non-overlapping windows over pooled mergeable sketches, with built-in support for FoldCMS, FoldCS, KLL and the experimental UnivMon-Q
 
 **EHUnivOptimized** - Hybrid two-tier ExponentialHistogram for UnivMon with sketch memory reuse (currently `Unstable`)
 
@@ -67,7 +67,7 @@ This document provides a high-level overview of implemented and planned features
 
 ### Serialization
 
-**MessagePack (rmp-serde) and Protobuf (prost)** - Dual serialization support across most sketch types
+**MessagePack (rmp-serde)** - Serialization support across most sketch types
 
 ### Sampling
 
@@ -80,26 +80,6 @@ This document provides a high-level overview of implemented and planned features
 ### Performance
 
 Insertion throughput measured on 10,000,000 Zipf-distributed `int64` values (s=1.1, support=100k), averaged over 10 seeded runs.
-
-#### Count-Min Sketch
-
-![CMS Insertion Throughput (5×2048)](./benchmark_plots/plots/cms/cms_throughput_insertion.png)
-
-![CMS Insertion Throughput (5×32768)](./benchmark_plots/plots/cms32k/cms32k_throughput_insertion.png)
-
-#### Count
-
-![Count Insertion Throughput (5×2048)](./benchmark_plots/plots/cs/cs_throughput_insertion.png)
-
-![Count Insertion Throughput (5×32768)](./benchmark_plots/plots/cs32k/cs32k_throughput_insertion.png)
-
-#### HyperLogLog
-
-![HLL Insertion Throughput](./benchmark_plots/plots/hll/hll_throughput_insertion.png)
-
-#### KLL
-
-![KLL Insertion Throughput](./benchmark_plots/plots/kll/kll_throughput_insertion.png)
 
 ### Testing
 
@@ -125,11 +105,12 @@ MessagePack (`rmp-serde`) support. **serde support** means the type derives `Ser
 | SpaceSaving | Yes | Yes |
 | Bloom | Yes | Yes |
 | Hydra | Yes | Yes |
-| UnivMon / UnivMon Optimized | Yes | Yes |
+| UnivMon | Yes | Yes |
+| UnivMon Optimized | No | Yes |
 | UnivMonQ (experimental) | Internal wire DTO | Yes |
 | NitroBatch | Yes | In Progress |
 | EHSketchList | Yes | Yes |
-| ExponentialHistogram | Yes | Yes |
+| ExponentialHistogram | No | Yes |
 
 Protobuf (prost): `.proto` definitions exist for CountMin, Count, HLL, DDSketch, KLL, Elastic, Coco, Hydra, and UnivMon. Rust conversion code is in progress.
 

@@ -40,7 +40,7 @@ fn max(&self) -> Option<f64>
 ## Merge
 
 ```rust
-fn merge(&mut self, other: &DDSketch)
+fn merge(&mut self, other: &DDSketch) -> Result<(), String>
 ```
 
 ## Serialization
@@ -108,7 +108,7 @@ other rank. The two agree at most `q` and diverge at small `n` or ragged `q`
 ## Caveats
 
 - Inputs must be positive values.
-- Merge requires compatible configuration (`alpha`).
+- Merge returns `Err` unless both sketches share the same `alpha`.
 
 ## Status
 

@@ -178,11 +178,6 @@ struct CdfComposition {
 
 /// Read-only view of the two quantities the ordered-query error bound
 /// `sup_x |F_hat(x) - F(x)| <= 2 E_H + P_hat_R * epsilon_R` is stated over.
-///
-/// Neither is otherwise reachable from outside the crate, which previously left
-/// the bound unverifiable: a test could only check the special case where the
-/// heavy set is empty. Nothing here changes an answer or the wire format — it
-/// reports state the CDF construction already computed.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OrderedQueryDiagnostics {
     /// The values the CDF treated as heavy, with the frequency it credited to

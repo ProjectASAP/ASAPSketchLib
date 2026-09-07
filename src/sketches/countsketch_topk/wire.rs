@@ -56,7 +56,7 @@ where
     ///
     /// Fails when the matrix's cell count disagrees with its own dimensions,
     /// when the heap's keys mix `HeapItem` variants or hold a 128-bit key, or
-    /// when `k` overflows the metadata's `u32` field.
+    /// when `k` or `cols` overflows the metadata's `u32` field.
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
         let rows = self.cs.rows();
         let cols = self.cs.cols();
@@ -76,11 +76,16 @@ where
                 self.heap.capacity()
             ))
         })?;
+        let wire_cols = u32::try_from(cols).map_err(|_| {
+            RmpEncodeError::Syntax(format!(
+                "ASAPv1 CSHeap envelope: cols {cols} exceeds the u32 metadata field"
+            ))
+        })?;
         let entries = heap_entries(&self.heap);
         let key_type = wire_key_type(&entries)?;
         let metadata = rmp_serde::to_vec_named(&topk_metadata::<H>(
             rows as u32,
-            cols as u32,
+            wire_cols,
             T::COUNTER_TYPE,
             Mode::MODE,
             k,

@@ -799,7 +799,7 @@ mod tests {
     /// End-to-end coverage of `Vector2D::col_for_row` — the cached-field
     /// decode path — with NON-power-of-two column counts. Every in-tree
     /// FastPath caller uses pow2 cols, so without this test the non-pow2
-    /// branch of the rewritten decode is never executed at all.
+    /// branch of the decode is never executed at all.
     ///
     /// Each insert is mirrored into a reference matrix whose placements are
     /// computed independently (`shift → mask → % cols`), then both full

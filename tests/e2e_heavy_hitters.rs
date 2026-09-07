@@ -329,7 +329,7 @@ fn a_merge_keeps_the_total_and_never_reads_low() {
     let left_truth = truth_of(&left_stream);
     let right_truth = truth_of(&right_stream);
 
-    left.merge_from(&right);
+    left.merge(&right);
 
     assert_eq!(left.total(), stream.len() as u64);
     assert!(left.len() <= left.capacity());
@@ -489,7 +489,7 @@ fn a_merge_into_an_under_full_summary_keeps_the_ceiling_honest() {
         right.insert(&DataInput::I64(8));
     }
 
-    left.merge_from(&right);
+    left.merge(&right);
 
     assert_eq!(left.len(), 1);
     assert!(left.len() < left.capacity());
@@ -516,8 +516,8 @@ fn a_merge_chain_stays_one_sided_against_the_truth() {
     let truth = truth_of(&stream);
 
     let mut merged = filled(64, &shards[0]);
-    merged.merge_from(&filled(512, &shards[1]));
-    merged.merge_from(&filled(7, &shards[2]));
+    merged.merge(&filled(512, &shards[1]));
+    merged.merge(&filled(7, &shards[2]));
 
     assert_eq!(merged.total(), stream.len() as u64);
     assert!(merged.len() <= merged.capacity());
@@ -572,7 +572,7 @@ fn a_merge_picks_the_same_survivors_every_time() {
         for key in right_keys {
             right.insert(&DataInput::I64(key));
         }
-        left.merge_from(&right);
+        left.merge(&right);
         left.top_k(usize::MAX)
             .iter()
             .map(|(key, count, error)| (key_of(key), *count, *error))
@@ -605,7 +605,7 @@ fn a_merge_picks_the_same_survivors_every_time() {
 fn a_round_trip_carries_the_merged_ceiling() {
     let stream = stream();
     let mut merged = filled(32, &stream[..stream.len() / 2]);
-    merged.merge_from(&filled(4, &stream[stream.len() / 2..]));
+    merged.merge(&filled(4, &stream[stream.len() / 2..]));
 
     let bytes = rmp_serde::to_vec(&merged).expect("serialize");
     let decoded: SpaceSaving = rmp_serde::from_slice(&bytes).expect("deserialize");
@@ -632,19 +632,20 @@ fn crafted_state_fails_closed() {
     struct CraftedState {
         capacity: usize,
         total: u64,
-        floor: u64,
+        discarded_max: u64,
         entries: Vec<(HeapItem, u64, u64)>,
     }
 
-    let crafted = |capacity: usize, total: u64, floor: u64, entries: Vec<(HeapItem, u64, u64)>| {
-        rmp_serde::to_vec(&CraftedState {
-            capacity,
-            total,
-            floor,
-            entries,
-        })
-        .expect("serialize")
-    };
+    let crafted =
+        |capacity: usize, total: u64, discarded_max: u64, entries: Vec<(HeapItem, u64, u64)>| {
+            rmp_serde::to_vec(&CraftedState {
+                capacity,
+                total,
+                discarded_max,
+                entries,
+            })
+            .expect("serialize")
+        };
 
     let refused = [
         (crafted(0, 100, 0, Vec::new()), "capacity is zero"),

@@ -37,10 +37,12 @@ signals a backwards-compatible change.
   same entry are identical) and solves the slice width for that count, so
   `predicted_fpp` never claims a rate the filter cannot deliver; each slice is
   rounded up to a power of two, which removes the column fold's modulo bias.
-  Total bits are capped at `BLOOM_MAX_BITS`, and a non-finite target rate is
-  rejected. Union is exact, so the filter shards without loss. The `BloomMode`
-  marker tags the hash path on the wire, so bytes written by one path do not
-  decode into the other.
+  Every door holds the slice bound: `with_dimensions` panics past it and both
+  serialized forms reject it, so a filter that cannot be stored cannot be built
+  either. Total bits are capped at `BLOOM_MAX_BITS`, and a non-finite target
+  rate is rejected. Union is exact, so the filter shards without loss. The
+  `BloomMode` marker tags the hash path on the wire, so bytes written by one
+  path do not decode into the other.
 - **`SpaceSaving`, a fixed-counter heavy-hitter summary.** The paper's
   Stream-Summary: count-ordered buckets in a doubly linked list, each owning a
   doubly linked list of its counters, plus a key index — so a unit arrival moves
@@ -50,7 +52,7 @@ signals a backwards-compatible change.
   `upper_bound` never reads below the truth for any key in the stream: the
   summary carries the largest count known to have left it, so the ceiling
   survives a merge that leaves it holding fewer keys than its capacity. Counts
-  saturate rather than wrap, and `merge_from` picks the same survivors on every
+  saturate rather than wrap, and `merge` picks the same survivors on every
   run. Only the monitored `(key, count, error)` triples reach the wire; the
   arena is rebuilt on load and a payload that does not describe a valid summary
   is rejected.
@@ -135,8 +137,9 @@ signals a backwards-compatible change.
   Coco's table (`0x0c 0x00`), UnivMon (`0x10 0x00`) and UnivMon Optimized
   (`0x11 0x00`) layers, and CountL2HH (`0x19 0x00`) — Bloom (`0x17 0x00`)
   already drew this line. UnivMon-Q (`0x1a 0x00`) is unaffected: its rows are
-  bit fields of one 128-bit hash, bounded by that budget instead. A wider matrix
-  is still buildable in memory; it no longer serializes.
+  bit fields of one 128-bit hash, bounded by that budget instead. A wider
+  counter matrix is still buildable in memory; it no longer serializes, and
+  Bloom refuses one at construction.
 - **Made `HHHeap::update` independent of capacity.** The key index was rebuilt
   in full after every accepted update, cloning each resident's key, so the top-k
   structure behind `CMSHeap`, `CSHeap`, `FoldCMS`, `FoldCS`, `UnivMon` and the
@@ -161,7 +164,7 @@ signals a backwards-compatible change.
   skipped; a positional encoding of the three-field form does not. Nothing
   in-crate writes the positional form — the portable MessagePack wire for the
   top-k sketches carries a `(key, value)` list and rebuilds through `update`,
-  and the goldens cover CMS and HLL envelopes only.
+  and no golden covers a top-k envelope.
 - **BREAKING (`serde` shape of `Nitro`, and therefore of `Vector2D` and any
   sketch embedding one):** `Nitro::rounding_state` is now a serialized field,
   appended after `mask`, so a sketch resumed from a decode continues its weight
@@ -384,11 +387,10 @@ signals a backwards-compatible change.
   fan-out across the subpopulation lattice checked against exact
   per-subpopulation truth, wildcard marginals reconciled against the cells
   beneath them, exact shard-merge equality, MessagePack round trips for every
-  counter variant, subkey injectivity for delimiter-laden key values, and
-  `MultiHeadHydra`'s equivalence to independent single-head Hydras. A Theorem 2
-  check (Manousis et al., VLDB 2022) asserts the additive `eps * G_s` bound
-  against the exact binomial median-failure rate over 314 subpopulations at
-  `G_s = 840k`, in both the sparse deployment regime (5x4096) and a
+  counter variant, and subkey injectivity for delimiter-laden key values. A
+  Theorem 2 check (Manousis et al., VLDB 2022) asserts the additive `eps * G_s`
+  bound against the exact binomial median-failure rate over 314 subpopulations
+  at `G_s = 840k`, in both the sparse deployment regime (5x4096) and a
   deliberately overloaded grid (5x256) where the in-bound fraction is actually
   exercised. The mixed `HashSketchEnsemble` test moved here from
   `tests/e2e_cardinality.rs`.

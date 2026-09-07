@@ -110,7 +110,7 @@ Converted:
   bit grid packed into `u64`s plus the insert count; the wire covers the
   geometries `Bloom::with_capacity` produces.
 - **Space-Saving** (`src/sketches/space_saving/wire.rs`, kind `0x18 0x00`) — the
-  payload is the `(key, count, error)` triples plus `total` and `floor`; the
+  payload is the `(key, count, error)` triples plus `total` and `discarded_max`; the
   Stream-Summary's links and arenas are rebuilt on decode.
 - **CMSHeap** (`src/sketches/countminsketch_topk/wire.rs`, `0x03 0x00`) and
   **CSHeap** (`src/sketches/countsketch_topk/wire.rs`, `0x0a 0x00`) — a base
@@ -149,10 +149,9 @@ unified `Error` at the module root) are the **older** serialization path and are
 being **phased out** in favor of the per-sketch `wire.rs` + the shared
 `envelope.rs`.
 
-- `portable/` holds a set of per-sketch wire types that predate the envelope.
-  **`sketchlib-go` mirrors ASAPv1, not these**: the per-sketch payload under
-  `wire.rs` is the cross-language format, and the `portable` types are internal
-  to Rust.
+- `portable/` holds per-sketch wire types that predate the envelope. They
+  carry their own byte-parity goldens against `sketchlib-go` — HLL, Count-Min,
+  Count Sketch and KLL (both directions) — separate from `asapv1_golden/`.
 - `native/` is a set of thin `MessagePackCodec` shims over the sketches'
   `serialize_to_bytes` / `deserialize_from_bytes`. Every type it wraps emits the
   ASAPv1 envelope, so each shim is a pass-through.
@@ -162,7 +161,7 @@ byte-vector fixtures are the drift guard on both sides.
 
 ## Cross-language parity
 
-Cross-language parity with `sketchlib-go` is proven by **golden byte-vectors** in
+ASAPv1 parity with `sketchlib-go` is proven by **golden byte-vectors** in
 [`asapv1_golden/`](../asapv1_golden) (exercised by
 [`tests/asapv1_golden.rs`](../tests/asapv1_golden.rs)): both languages must
 decode → re-encode them byte-identically. The `kind_id` registry is mirrored
@@ -171,10 +170,10 @@ allocated.
 
 That proof covers the six `kind_id`s a fixture exists for — HLL's three
 estimators, Count-Min, Count Sketch and compact KLL. Every other implemented
-kind has **no golden and therefore no cross-language drift guard**;
+kind has **no ASAPv1 golden and therefore no ASAPv1 drift guard**;
 [`asapv1_golden/README.md`](../asapv1_golden/README.md) lists what is covered.
-`portable` is not deleted until the goldens are the drift guard on both sides,
-so it stays until that gap closes.
+The older `portable` path is guarded separately, by the `sketchlib-go` goldens
+of its own listed above.
 
 ## Cross-Reference
 

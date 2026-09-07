@@ -4,7 +4,8 @@ Status: `Ready`
 
 ## Purpose
 
-Hierarchical subpopulation sketching over semicolon-separated keys.
+Subpopulation sketching over a fixed schema of labelled key columns; an update
+fans its row out into all `2^D - 1` non-empty subpopulations.
 
 ## Type/Struct
 
@@ -13,23 +14,27 @@ Hierarchical subpopulation sketching over semicolon-separated keys.
 ## Constructors
 
 ```rust
-fn default() -> Self
-fn with_dimensions(r: usize, c: usize, sketch_type: HydraCounter) -> Self
+fn with_schema<S, I>(r: usize, c: usize, schema: I, sketch_type: HydraCounter) -> Result<Self, String>
 ```
 
 ## Insert/Update
 
 ```rust
-fn update(&mut self, key: &str, value: &DataInput, count: Option<i32>)
+fn update(&mut self, key: &[&str], value: &DataInput, count: Option<i32>) -> Result<(), String>
 ```
 
 ## Query
 
 ```rust
-fn query_key(&self, key: Vec<&str>, query: &HydraQuery) -> f64
-fn query_frequency(&self, key: Vec<&str>, value: &DataInput) -> f64
-fn query_quantile(&self, key: Vec<&str>, threshold: f64) -> f64
+fn query_key(&self, key: &[Option<&str>], query: &HydraQuery) -> Result<f64, String>
+fn query_frequency(&self, key: &[Option<&str>], value: &DataInput) -> Result<f64, String>
+fn query_quantile(&self, key: &[Option<&str>], threshold: f64) -> Result<f64, String>
+fn schema(&self) -> &[String]
 ```
+
+A key is positional and full width: one value per column on `update`, and on a
+query `Some(v)` to constrain a column or `None` to leave it free, with at least
+one constrained. `query_quantile` dispatches `HydraQuery::Cdf`.
 
 ## Merge
 
@@ -78,11 +83,12 @@ serde value.
 ## Examples
 
 ```rust
-use asap_sketchlib::{Hydra, DataInput};
+use asap_sketchlib::{DataInput, Hydra, input::HydraCounter};
 
-let mut hydra = Hydra::default();
-hydra.update("region=us;service=api", &DataInput::Str("err"), None);
-let est = hydra.query_frequency(vec!["region=us"], &DataInput::Str("err"));
+let counter = HydraCounter::CM(Default::default());
+let mut hydra = Hydra::with_schema(4, 4096, ["region", "service"], counter).unwrap();
+hydra.update(&["us", "api"], &DataInput::Str("err"), None).unwrap();
+let est = hydra.query_frequency(&[Some("us"), None], &DataInput::Str("err")).unwrap();
 assert!(est >= 1.0);
 ```
 

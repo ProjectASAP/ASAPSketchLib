@@ -4,7 +4,7 @@
 //! workflows:
 //!
 //! - windowed analytics: [`ExponentialHistogram`], [`TumblingWindow`]
-//! - subpopulation and hierarchical queries: [`Hydra`]
+//! - subpopulation queries: [`Hydra`]
 //! - universal multi-metric monitoring: [`UnivMon`] and experimental [`UnivMonQ`]
 //! - batch update acceleration: [`NitroBatch`]
 //! - shared-hash or multi-sketch coordination: [`HashSketchEnsemble`]

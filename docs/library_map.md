@@ -7,20 +7,20 @@
   - `structures/` - High-performance data structures (`Vector1D`, `Vector2D`, `Vector3D`, `BitMatrix`, `CommonHeap`, `MatrixStorage`, `FixedMatrix`)
   - `heap.rs` - `HHHeap` convenience wrapper for heavy hitter tracking
   - `hash.rs` - Hashing utilities (`hash_for_matrix`, `hash64_seeded`, `SEEDLIST`, `BOTTOM_LAYER_FINDER`) plus `SketchHasher` for custom hasher injection and `DigestHasher` / `DigestBuildHasher` for maps keyed by an already-hashed digest
-  - `mode.rs` is under `src/sketches/` and provides `RegularPath` / `FastPath` type-level insert/estimate path selection
+  - `hashspec.rs` - `HashSpec`/`derive_index`/`derive_sign` byte parity with `sketchlib-go`; `numerical.rs` - `NumericalValue`; `structure_utils.rs` - `Nitro`, `NitroContext`, `ToF64`
 
 - **`src/sketches/`** - Sketch implementations (status source: [apis.md](./apis.md))
-  - `Ready` in API index: `countminsketch.rs`, `countsketch.rs`, `hll.rs`, `kll.rs`, `ddsketch.rs`, `countminsketch_topk.rs`, `countsketch_topk.rs`, `space_saving.rs`, `bloom.rs`
-  - `Unstable` in API index: `coco.rs`, `elastic.rs`, `uniform.rs`, `kmv.rs`
-  - Not in the API index: `fold_cms.rs`, `fold_cs.rs`, `octo_delta.rs`, `mode.rs`
+  - `Ready` in API index: `countminsketch.rs`, `countsketch.rs`, `hll.rs`, `kll.rs`, `ddsketch.rs`, `countminsketch_topk.rs`, `countsketch_topk.rs`, `space_saving.rs`, `bloom.rs`, `elastic.rs`, `coco.rs`
+  - `Unstable` in API index: `uniform.rs`, `kmv.rs`
+  - Not in the API index: `fold_cms.rs`, `fold_cs.rs`, `kll_dynamic.rs`, `octo_delta.rs`, `mode.rs` (`RegularPath` / `FastPath`)
   - A sketch on the ASAPv1 wire format uses a `<sketch>.rs` (algorithm) + `<sketch>/wire.rs` (serialization) split: `hll.rs`, `countminsketch.rs`, `countminsketch_topk.rs`, `countsketch.rs`, `countsketch_topk.rs`, `kll.rs`, `kll_dynamic.rs`, `ddsketch.rs`, `elastic.rs`, `coco.rs`, `uniform.rs`, `kmv.rs`, `bloom.rs` and `space_saving.rs` (see [asapv1_wire_format.md](./asapv1_wire_format.md))
   - Two of those directories carry a second, shared wire module: `countminsketch_topk/heap_wire.rs` holds the top-k heap encoding CMSHeap and CSHeap share, and `countsketch_topk/l2hh_wire.rs` holds CountL2HH's own encoding plus the layer sub-payload the UnivMon family inlines
 
 - **`src/sketch_framework/`** - Orchestration and serving layers (status source: [apis.md](./apis.md))
-  - `Ready` in API index: `hydra.rs`, `hashlayer.rs`, `univmon.rs`, `univmon_optimized.rs`, `nitro.rs`, `eh.rs`, `eh_sketch_list.rs`
+  - `Ready` in API index: `hydra.rs`, `hashlayer.rs`, `univmon.rs`, `univmon_optimized.rs`, `nitro.rs`, `eh.rs`, `eh_sketch_list.rs`, `octo.rs`
   - `Experimental` in API index: `univmon_q.rs`
   - `Unstable` in API index: `eh_univ_optimized.rs`
-  - Not in the API index: `octo.rs`, `tumbling.rs`, `sketch_catalog.rs`
+  - Not in the API index: `tumbling.rs`, `sketch_catalog.rs`
   - The same `<framework>.rs` + `<framework>/wire.rs` split carries the ASAPv1 wire format for `hydra.rs`, `univmon.rs`, `univmon_optimized.rs`, `univmon_q.rs`, `eh.rs` and `eh_sketch_list.rs`
 
 - **`src/message_pack_format/`** - Serialization plumbing ([message_pack_format.md](./message_pack_format.md)). The current format is **ASAPv1**, specified in [asapv1_wire_format.md](./asapv1_wire_format.md)

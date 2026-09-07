@@ -17,10 +17,9 @@
 //!
 //! The wire covers the geometries [`Bloom::with_capacity`] produces: at most
 //! [`BLOOM_MAX_SLICES`] slices, a power-of-two `cols`, and at most
-//! [`BLOOM_MAX_BITS`] bits. [`Bloom::with_dimensions`] can build a filter
-//! outside that subset (more rows than the seed list has entries, or a
-//! modulo-folded width); such a filter is rejected on **both** sides, so the
-//! format never emits bytes it would refuse to read back.
+//! [`BLOOM_MAX_BITS`] bits. [`Bloom::with_dimensions`] can build a
+//! modulo-folded width, which is outside that subset and rejected on **both**
+//! sides, so the format never emits bytes it would refuse to read back.
 
 use rmp_serde::{decode::Error as RmpDecodeError, encode::Error as RmpEncodeError, from_slice};
 use serde::{Deserialize, Serialize};
@@ -513,7 +512,8 @@ mod tests {
     }
 
     /// More slices than the seed list has entries is outside the wire-eligible
-    /// subset, on both sides.
+    /// subset, so crafted bytes declaring them are refused before anything is
+    /// sized from the declared row count.
     #[test]
     fn bloom_rejects_too_many_rows() {
         let rows = BLOOM_MAX_SLICES + 1;
@@ -521,12 +521,6 @@ mod tests {
         assert!(
             err.contains("BLOOM_MAX_SLICES"),
             "rows past BLOOM_MAX_SLICES must be rejected as such, got {err}"
-        );
-        assert!(
-            Bloom::<RegularPath>::with_dimensions(rows, 64)
-                .serialize_to_bytes()
-                .is_err(),
-            "a filter past BLOOM_MAX_SLICES must not serialize either"
         );
         // The boundary itself is eligible.
         let ok = crafted(

@@ -3015,8 +3015,6 @@ mod worker_tests {
     #[test]
     #[should_panic(expected = "exceeds the 128-bit hash budget")]
     fn a_univmon_worker_refuses_a_geometry_that_outruns_the_hash() {
-        // 13 rows x 11 column bits = 143 > 128. Debug builds used to panic on
-        // the shift; release builds wrapped it and aliased row 12 onto row 1.
         L2hhWorkerSketch::new(13, 2048, 0);
     }
 
@@ -3033,9 +3031,6 @@ mod worker_tests {
 
     #[test]
     fn every_worker_reads_one_threshold_the_same_way() {
-        // The signed one-byte workers used to clamp to i8::MAX while the shared
-        // threshold and the full sketches clamped to 255, so a tau in 128..=255
-        // meant two different things in the same pipeline.
         let tau = 200u32;
         let key = DataInput::U64(9);
 
@@ -3538,9 +3533,6 @@ mod runtime_tests {
 
     #[test]
     fn an_inverted_control_band_is_normalised_rather_than_fatal() {
-        // OctoAdaptiveThreshold's fields are public and clamp panics on an
-        // inverted range. That panic used to land on the aggregator thread and
-        // surface on the caller's as an unrelated "worker receiver dropped".
         let settings = OctoAdaptiveThreshold {
             target_queue_len: 10,
             alpha: 0.25,
@@ -3747,71 +3739,6 @@ mod runtime_tests {
             "one more occurrence per key makes every one of them a candidate"
         );
         assert!(at.estimate(&DataInput::U64(0)) >= tau as i32);
-    }
-
-    #[test]
-    fn zz_probe_starvation() {
-        // Interleaved order, tight columns: can a key need MORE than tau?
-        let tau = CM_PROMASK;
-        for &(rows, cols, nkeys) in &[(3usize, 16usize, 20u64), (3, 8, 20), (1, 32, 20), (3, 4, 8)]
-        {
-            for off in [0u64, 1000, 7777] {
-                let mut inputs: Vec<DataInput<'_>> = Vec::new();
-                for _ in 0..tau {
-                    for key in off..off + nkeys {
-                        inputs.push(DataInput::U64(key));
-                    }
-                }
-                let sk = run_octo(&inputs, &config(1), CmTopKOctoPlan::new(rows, cols), || {
-                    CmTopKOctoAggregator::new(rows, cols, 1024)
-                })
-                .parent
-                .sketch;
-                println!(
-                    "interleaved rows={rows} cols={cols} keys={nkeys} off={off}: heap={} (want {nkeys})",
-                    sk.heap().len()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn zz_probe_collision_fragility() {
-        let tau = CM_PROMASK;
-        for &(rows, cols, nkeys, workers) in &[
-            (3usize, 1024usize, 20u64, 4usize),
-            (3, 1024, 20, 1),
-            (3, 256, 20, 4),
-            (3, 128, 20, 4),
-            (3, 64, 20, 4),
-            (3, 1024, 60, 4),
-            (3, 1024, 100, 4),
-            (3, 1024, 200, 4),
-        ] {
-            let run = |occ: u32, off: u64| {
-                let mut inputs: Vec<DataInput<'_>> = Vec::new();
-                for key in off..off + nkeys {
-                    for _ in 0..occ {
-                        inputs.push(DataInput::U64(key));
-                    }
-                }
-                run_octo(
-                    &inputs,
-                    &config(workers),
-                    CmTopKOctoPlan::new(rows, cols),
-                    || CmTopKOctoAggregator::new(rows, cols, 1024),
-                )
-                .parent
-                .sketch
-            };
-            for off in [0u64, 1000, 7777, 123456] {
-                let b = run(tau - 1, off).heap().len();
-                let a = run(tau, off).heap().len();
-                println!(
-                    "rows={rows} cols={cols} keys={nkeys} workers={workers} off={off}: below={b} at={a} (want 0/{nkeys})"
-                );
-            }
-        }
     }
 
     #[test]

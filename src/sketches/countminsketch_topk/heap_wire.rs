@@ -6,8 +6,8 @@
 //! descriptor metadata and the same positional payload
 //! `[counts, keys, heap_counts]`. This module is the one place that encoding
 //! lives: the metadata DTO, the payload DTO, the `key_type` mapping, the
-//! emitted order, and the heap rebuild. See `docs/asapv1_wire_format.md` §3.2,
-//! §3.5 and §3.6 for the pieces it follows.
+//! emitted order, and the heap rebuild. See `docs/asapv1_wire_format.md` §3.7
+//! and §3.10 for the pieces it follows.
 //!
 //! ## `key_type` names the exact `HeapItem` variant
 //!
@@ -43,6 +43,7 @@
 
 use rmp_serde::{decode::Error as RmpDecodeError, encode::Error as RmpEncodeError, from_slice};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use crate::message_pack_format::wire_key::WireBytes;
 use crate::{HHHeap, HashProfile, HeapItem};
@@ -93,6 +94,27 @@ fn key_order(key: &HeapItem) -> (u8, u128, &[u8]) {
         HeapItem::String(v) => (14, 0, v.as_bytes()),
         HeapItem::Bytes(v) => (15, 0, v.as_slice()),
     }
+}
+
+/// The complaint both directions report when one key is on the wire twice.
+const DUPLICATE_KEY: &str = "ASAPv1 top-k heap: the same key appears twice";
+
+/// Rejects a key set holding the same key twice, judged on the **wire**
+/// representation [`key_order`] gives it: floats by their bits, so two identical
+/// `NaN`s are one key twice while `+0.0` and `-0.0` stay two keys. Both the
+/// encode and the decode path run this one check, so neither emits nor admits a
+/// key set the other refuses. The UnivMon pyramid encoders call it per layer,
+/// so the heap-backed sketches and the pyramids share one predicate.
+pub(crate) fn check_distinct_keys<'a>(
+    keys: impl ExactSizeIterator<Item = &'a HeapItem>,
+) -> Result<(), &'static str> {
+    let mut seen: HashSet<(u8, u128, &[u8])> = HashSet::with_capacity(keys.len());
+    for key in keys {
+        if !seen.insert(key_order(key)) {
+            return Err(DUPLICATE_KEY);
+        }
+    }
+    Ok(())
 }
 
 /// Top-k descriptor metadata (ASAPv1 §2), a msgpack **map** (`to_vec_named`)
@@ -196,12 +218,15 @@ fn mixed_variant_error(key_type: &str, key: &HeapItem) -> RmpEncodeError {
 
 /// Packs the base counters and the emitted heap entries into the positional
 /// payload, with `keys` typed by `key_type`. Any key that is not of that variant
-/// fails the encode.
+/// fails the encode, as does a key the entries hold twice on the wire — a live
+/// heap can seat one, since `NaN` misses its own lookup.
 pub(crate) fn encode_payload<C: Serialize>(
     key_type: &str,
     counts: Vec<C>,
     entries: &[(&HeapItem, i64)],
 ) -> Result<Vec<u8>, RmpEncodeError> {
+    check_distinct_keys(entries.iter().map(|(key, _)| *key))
+        .map_err(|problem| RmpEncodeError::Syntax(problem.to_string()))?;
     let heap_counts: Vec<i64> = entries.iter().map(|entry| entry.1).collect();
 
     macro_rules! pack {
@@ -341,8 +366,15 @@ where
 }
 
 /// Seats the decoded entries into a heap of capacity `k`, rebuilding the index
-/// as it goes. `k` is checked against the entry count first, so a declared
-/// capacity never sizes an allocation on its own.
+/// as it goes. `k` is checked against the entry count first and the heap
+/// reserves from that count, so a declared capacity never sizes an allocation
+/// on its own.
+///
+/// The keys are checked for duplicates on their **wire** representation before
+/// any is seated — floats by their bits, so two identical `NaN`s are one key
+/// twice even though they do not compare equal — and the seated count is
+/// checked afterwards, which catches keys that are distinct on the wire but
+/// equal to the heap.
 pub(crate) fn rebuild_heap(
     k: usize,
     entries: Vec<(HeapItem, i64)>,
@@ -353,15 +385,15 @@ pub(crate) fn rebuild_heap(
             entries.len()
         )));
     }
-    let mut heap = HHHeap::new(k);
+    check_distinct_keys(entries.iter().map(|(key, _)| key))
+        .map_err(|problem| RmpDecodeError::Uncategorized(problem.to_string()))?;
+    let mut heap = HHHeap::with_expected_len(k, entries.len());
     let seated = entries.len();
     for (key, count) in entries {
         heap.update_heap_item(&key, count);
     }
     if heap.len() != seated {
-        return Err(RmpDecodeError::Uncategorized(
-            "ASAPv1 top-k heap: the same key appears twice".to_string(),
-        ));
+        return Err(RmpDecodeError::Uncategorized(DUPLICATE_KEY.to_string()));
     }
     Ok(heap)
 }
@@ -646,5 +678,66 @@ mod tests {
                 "expected a complaint about {expected}, got {problem}"
             );
         }
+    }
+
+    /// Duplicates are judged on the wire bits, not on `HeapItem`'s equality.
+    /// Two bit-identical `NaN`s do not compare equal, so both would seat and the
+    /// seated count would agree; `+0.0` and `-0.0` do compare equal but hash
+    /// apart, so the live heap seats both and that payload must still decode.
+    #[test]
+    fn heap_judges_duplicate_float_keys_on_their_bits() {
+        let crafted = |keys: Vec<f64>| {
+            let metadata = rmp_serde::to_vec_named(&topk_metadata::<DefaultXxHasher>(
+                2, 4, "i64", "regular", 4, "f64",
+            ))
+            .expect("metadata");
+            let payload = rmp_serde::to_vec(&TopKPayload {
+                counts: vec![0i64; 8],
+                keys,
+                heap_counts: vec![5i64, 4],
+            })
+            .expect("payload");
+            envelope::encode(KIND, &metadata, &payload)
+        };
+
+        let problem = decode_error(&crafted(vec![f64::NAN, f64::NAN]));
+        assert!(
+            problem.contains("the same key appears twice"),
+            "got {problem}"
+        );
+
+        let signed_zeros = crafted(vec![0.0, -0.0]);
+        let decoded = CMSHeap::<Vector2D<i64>, RegularPath>::deserialize_from_bytes(&signed_zeros)
+            .expect("two zeros of opposite sign are two keys the heap can hold");
+        assert_eq!(decoded.heap().len(), 2);
+    }
+
+    /// A live heap can seat one key twice: `update` compares residents with
+    /// `HeapItem`'s equality, and `NaN != NaN`, so a second `NaN` misses the
+    /// lookup and takes its own seat. That heap must fail the encode rather than
+    /// emit a payload the decoder refuses. `+0.0` and `-0.0` differ in their
+    /// bits, so they are two keys on both sides and still round-trip.
+    #[test]
+    fn heap_refuses_to_serialize_a_key_it_holds_twice() {
+        let nans = sketch_with(&[(DataInput::F64(f64::NAN), 5), (DataInput::F64(f64::NAN), 4)]);
+        assert_eq!(nans.heap().len(), 2, "the two NaNs did not both seat");
+        let problem = nans
+            .serialize_to_bytes()
+            .expect_err("a heap holding one key twice must not serialize")
+            .to_string();
+        assert!(
+            problem.contains("the same key appears twice"),
+            "got {problem}"
+        );
+
+        let zeros = sketch_with(&[(DataInput::F64(0.0), 5), (DataInput::F64(-0.0), 4)]);
+        assert_eq!(zeros.heap().len(), 2, "the signed zeros did not both seat");
+        let bytes = zeros
+            .serialize_to_bytes()
+            .expect("zeros of opposite sign are two keys");
+        let decoded =
+            CMSHeap::<Vector2D<i64>, RegularPath>::deserialize_from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded.heap().len(), 2);
+        assert_eq!(decoded.serialize_to_bytes().expect("re-serialize"), bytes);
     }
 }

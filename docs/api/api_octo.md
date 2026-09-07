@@ -38,7 +38,6 @@ pub struct DdDelta    { pub index: i32, pub value: u64 }
 pub struct KeyedCmDelta    { pub key: HeapItem, pub delta: CmDelta }
 pub struct KeyedCountDelta { pub key: HeapItem, pub delta: CountDelta }
 
-// experimental feature
 pub struct CocoDelta { pub key: String, pub value: u64 }
 pub enum ElasticDelta {
     Heavy { key: String, value: u32, eviction: bool },
@@ -93,8 +92,11 @@ cost is that every register improvement is sent.
 In practice 0 is the only HLL threshold worth using below that
 precondition. A register the worker has held back reads at the parent as
 an *empty* bucket rather than a low one, so the harmonic mean the
-estimator is built on collapses: over 50k distinct keys, τ=4 estimates
-about 3.2k. `HllOctoWorker::with_threshold` panics outright on a τ no
+estimator is built on collapses. Over 50k distinct keys,
+`any_hll_threshold_above_zero_costs_cardinality_accuracy` pins τ=0 as
+bit-exact against a single-threaded sketch, every step up in τ as sending
+fewer messages and estimating no higher, and τ=4 as losing more than half
+the cardinality. `HllOctoWorker::with_threshold` panics outright on a τ no
 register gain could ever reach (`>= max_hll_threshold(precision)`),
 because such a worker promotes nothing at all and leaves the parent
 empty rather than merely lagging.
@@ -108,6 +110,13 @@ pub fn threshold_for_error(epsilon: f64, l1: f64, k_prime: usize) -> u32
 Equation 4 of the paper, `τ = εL1/k'`. `k_prime` is the number of
 workers one flow may reach: 1 under `OctoPartition::HashByKey`, the
 worker count under `OctoPartition::RoundRobin`.
+
+The return is clamped to the same `1..=MAX_PROMASK` band as
+`OctoThreshold`, so an accuracy target loose enough to want a wider
+threshold than a one-byte worker counter gets `MAX_PROMASK` (127), not
+the raw `εL1/k'` — `threshold_for_error(0.001, 1e6, 1)` is 127, not
+1000. A `k_prime` of 0, or a non-finite `epsilon` or `l1`, returns the
+floor of 1. Pinned by `threshold_for_error_follows_equation_four`.
 
 ### Shared, adjustable τ
 
@@ -197,6 +206,13 @@ value `add` would itself drop. `apply_delta` advances `count` exactly and
 advances `sum`/`min`/`max` with the bucket's representative value — the
 same α-bounded estimate a deserialize-and-recompute produces.
 
+A delta naming an index outside the store's own range is **dropped**, not
+allocated: the worker's index space follows its own α, so a delta from a
+much finer mapping names a bucket this store cannot hold, and growing the
+dense array across that gap would allocate gigabytes. The count is lost
+silently — match the worker's α to the parent's. Pinned by
+`a_ddsketch_delta_from_a_finer_mapping_is_dropped_not_allocated`.
+
 ## UnivMon Delta API
 
 ```rust
@@ -250,11 +266,14 @@ survive L coin flips, so it carries roughly `n / 2^L` of the stream. One
 threshold across the whole pyramid is sized for layer 0 and starves the
 deep layers outright — and those are exactly the layers the recursive
 estimator leans on for cardinality. `univmon_layer_threshold(base, layer)`
-halves τ per layer with a floor of 1; measured on a 60k Zipf stream with
-12 layers, a flat τ=31 emptied layers 10 and 11 and collapsed the
-cardinality estimate from 3387 to 187, while the scaled rule reproduced
-the single-core estimate of 3387. Measured by
-`a_flat_threshold_starves_the_deep_univmon_layers`.
+halves τ per layer with a floor of 1. On a 60k Zipf stream with 12
+layers, `a_flat_threshold_starves_the_deep_univmon_layers`
+(`tests/e2e_octo.rs`) pins a flat τ=31 as leaving the deepest layer
+without a single non-zero cell and losing more than half the cardinality,
+while the scaled rule keeps that layer's non-zero cell count equal to the
+single-threaded sketch's and the estimate within 10% of it.
+`run_octo_univmon_reaches_the_deepest_layer` in `octo.rs` is the
+structural half only.
 
 Three pieces of state a delta stream would otherwise lose are handled
 explicitly:
@@ -283,10 +302,15 @@ pub struct CountWorkerSketch { /* Vec<i8> */ }
 pub struct DdWorkerSketch { /* HashMap<i32, u8> */ }
 pub struct L2hhWorkerSketch { /* Vec<i8>, one per UnivMon layer */ }
 
-// experimental feature
 pub struct CocoWorkerSketch { /* Vec<Option<String>> + Vec<u8> */ }
 pub struct ElasticWorkerSketch { /* heavy buckets + a CmWorkerSketch light layer */ }
 ```
+
+`L2hhWorkerSketch::new` panics when `rows · ⌈log2 cols⌉` exceeds 128:
+every row slices its column out of the same 128-bit hash, and past that
+budget the shift is undefined — debug builds panic and release builds
+wrap, aliasing a deep row onto a shallow one's column bits. 13 rows over
+2048 columns (11 bits) is the first geometry that trips it.
 
 A worker counter is cleared the moment it reaches τ, so it never exceeds
 one byte. Against the 32-bit counters a full `CountMin` uses that is the
@@ -337,8 +361,15 @@ skewed key distribution, at the cost of `k' = k`.
 
 Note that either way a *counter* is shared by whatever flows hash into
 it, and each worker may hold back up to τ of its own share, so the
-provable per-counter gap to a single-threaded sketch is `workers · (τ - 1)`. `k'τ`
-bounds only the queried flow's own held-back count.
+provable per-counter gap to a single-threaded sketch is `workers · τ`
+whatever the partition; `k'τ` bounds only the queried flow's own
+held-back count. Under a fixed τ a worker's residue in one cell is at
+most `τ - 1`, since the counter is emitted and cleared the moment it
+reaches τ; a τ the controller has *lowered* mid-run leaves residues sized
+by the highest τ that worker has held, which is why
+`run_octo_cm_tracks_a_single_threaded_sketch` and
+`the_adaptive_controller_moves_tau_during_a_real_run` pin
+`workers · τ` and `workers · MAX_PROMASK` respectively.
 
 `RoundRobin` also costs `Elastic` its one-sided guarantee: a flow that is
 a stable, unflagged resident on one worker while losing the bucket contest
@@ -413,8 +444,8 @@ and hashing there keeps the work off the dispatching thread.
 is geometric, so that is nearly always one or two.
 
 The shipped plans are `CmOctoPlan`, `CountOctoPlan`, `CmTopKOctoPlan`,
-`CountTopKOctoPlan`, `HllOctoPlan`, `DdOctoPlan`, `UnivMonOctoPlan` and,
-behind `experimental`, `CocoOctoPlan` and `ElasticOctoPlan`.
+`CountTopKOctoPlan`, `HllOctoPlan`, `DdOctoPlan`, `UnivMonOctoPlan`,
+`CocoOctoPlan` and `ElasticOctoPlan`.
 Each takes the same dimensions its worker did, plus an optional shared
 `OctoThreshold`:
 
@@ -445,7 +476,7 @@ fn finish(self) -> OctoResult<P>
 
 Between promotions a worker holds every counter still under τ. For
 Count-Min and Count that only leaves the parent low - by up to
-`workers · (τ - 1)` per cell, since each worker holds its own residue.
+`workers · τ` per cell, since each worker holds its own residue.
 For DDSketch, or a HyperLogLog running a positive threshold, an
 un-promoted cell is *absent* from the parent rather than lagging — and a
 quantile or a cardinality is exactly a statement about which cells
@@ -468,11 +499,13 @@ the result through `finish` rather than a live handle.
 workers keep that default on purpose: every delta they send carries the
 key that produced it, and a worker keeps no key storage, so a residual
 cell cannot be attributed back to a key. Their parents stay low by under
-`workers · (τ - 1)` per cell, and - the sharper consequence - a key that
+`workers · τ` per cell, and - the sharper consequence - a key that
 has never promoted is absent from the heap entirely rather than merely
 undercounted. A key promotes the first time an increment it caused takes
 some row to τ on its worker, which is its τ-th occurrence only while its
-cells are collision-free; collisions move it either way.
+cells are collision-free; collisions move it either way — the
+`octo_topk_promotion_probe` example sweeps geometries and worker counts and
+prints where the boundary lands.
 
 At the low level, `CmWorkerSketch`, `CountWorkerSketch`, `DdWorkerSketch`
 and `L2hhWorkerSketch` each expose `flush` directly.
@@ -499,11 +532,8 @@ pub fn run_octo<L, P>(
 | DDSketch | `DdOctoWorker` | `DdOctoAggregator` | `DdDelta` |
 | UnivMon | `UnivMonOctoWorker` | `UnivMonOctoAggregator` | `LayeredCountDelta` |
 | HyperLogLog | `HllOctoWorker` | `HllOctoAggregator` | `HllDelta` |
-| CocoSketch † | `CocoOctoWorker` | `CocoOctoAggregator` | `CocoDelta` |
-| Elastic † | `ElasticOctoWorker` | `ElasticOctoAggregator` | `ElasticDelta` |
-
-† requires the `experimental` feature, which is what gates `Coco` and
-`Elastic` themselves.
+| CocoSketch | `CocoOctoWorker` | `CocoOctoAggregator` | `CocoDelta` |
+| Elastic | `ElasticOctoWorker` | `ElasticOctoAggregator` | `ElasticDelta` |
 
 The `*TopK*` pairs hold the pipeline's only heavy-hitter heap, in the
 aggregator: each keyed delta updates the parent counter and then the

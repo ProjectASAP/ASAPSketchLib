@@ -29,7 +29,7 @@ fn with_dimensions_and_seed(rows: usize, cols: usize, seed_idx: usize) -> Self
 ```rust
 fn insert(&mut self, value: &DataInput)
 fn insert_many(&mut self, value: &DataInput, many: S::Counter)
-fn fast_insert_with_hash_value(&mut self, hashed_val: &S::HashValueType)
+fn fast_insert_with_hash_value(&mut self, hashed_val: &H::HashType)
 
 // CountL2HH
 fn fast_insert_with_count(&mut self, val: &DataInput, c: i64)
@@ -41,7 +41,7 @@ fn fast_insert_with_count_without_l2_and_hash(&mut self, hashed_val: u128, c: i6
 
 ```rust
 fn estimate(&self, value: &DataInput) -> f64
-fn fast_estimate_with_hash(&self, hashed_val: &S::HashValueType) -> f64
+fn fast_estimate_with_hash(&self, hashed_val: &H::HashType) -> f64
 
 // CountL2HH
 fn fast_get_est(&self, val: &DataInput) -> f64

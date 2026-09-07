@@ -12,7 +12,7 @@ use crate::common::{
     heap_item_to_sketch_input,
 };
 use crate::common::{L2HH, Vector1D};
-use crate::sketch_framework::univmon::UnivMonUpdateMode;
+use crate::sketch_framework::univmon::{MAX_LAYER_SIZE, UnivMonUpdateMode};
 use crate::sketches::countsketch_topk::CountL2HH;
 use std::collections::{HashMap, HashSet};
 
@@ -156,6 +156,10 @@ impl UnivMonPyramid {
             "sketch column counts must be positive"
         );
         assert!(total_layers > 0, "layer count must be positive");
+        assert!(
+            total_layers <= MAX_LAYER_SIZE,
+            "layer count must be at most MAX_LAYER_SIZE {MAX_LAYER_SIZE}"
+        );
         let sk_vec: Vec<L2HH> = if total_layers <= elephant_layers {
             (0..total_layers)
                 .map(|i| {

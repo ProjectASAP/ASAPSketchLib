@@ -4,7 +4,7 @@ Status: `Ready`
 
 ## Purpose
 
-Optimized two-tier UnivMon stack with sketch pooling.
+Two-tier UnivMon pyramid, and a free-list pool of scratch `UnivMon`s.
 
 ## Type/Struct
 
@@ -15,18 +15,17 @@ Optimized two-tier UnivMon stack with sketch pooling.
 
 ```rust
 // UnivSketchPool
-fn new(heap_size: usize, sketch_row: usize, sketch_col: usize, layer_size: usize, cap: usize) -> Self
+fn new(cap: usize, heap_size: usize, sketch_row: usize, sketch_col: usize, layer_size: usize) -> Self
 
 // UnivMonPyramid
 fn new(
-    top_heap_size: usize,
-    top_rows: usize,
-    top_cols: usize,
-    bottom_heap_size: usize,
-    bottom_rows: usize,
-    bottom_cols: usize,
-    layer_size: usize,
-    pool_cap: usize,
+    heap_size: usize,
+    elephant_layers: usize,
+    elephant_row: usize,
+    elephant_col: usize,
+    mouse_row: usize,
+    mouse_col: usize,
+    total_layers: usize,
 ) -> Self
 fn with_defaults() -> Self
 ```
@@ -48,7 +47,7 @@ fn calc_entropy(&self) -> f64
 fn calc_card(&self) -> f64
 fn calc_g_sum<F>(&self, g: F, is_card: bool) -> f64
 
-// Pool introspection
+// UnivSketchPool
 fn available(&self) -> usize
 fn total_allocated(&self) -> usize
 ```

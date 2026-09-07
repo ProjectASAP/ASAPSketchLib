@@ -37,9 +37,11 @@
 use rmp_serde::{decode::Error as RmpDecodeError, encode::Error as RmpEncodeError, from_slice};
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashSet;
+
 use crate::common::hash::check_matrix_rows;
 use crate::message_pack_format::envelope;
-use crate::{HashProfile, SketchHasher, Vector2D};
+use crate::{DataInput, HashProfile, SketchHasher, Vector2D};
 
 use super::{Coco, CocoBucket};
 
@@ -107,6 +109,30 @@ fn check_geometry(rows: usize, cols: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// Rejects a bucket layout no insert could produce. `insert` scans all `d`
+/// mapped buckets before electing one, so a stored key sits in row `r` only at
+/// column `hash64_seeded(r, key) % cols`, and holds at most one bucket in the
+/// whole table. `keys` must already be `rows*cols` long and `cols` non-zero.
+fn check_placement<H: SketchHasher>(keys: &[Option<String>], cols: usize) -> Result<(), String> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (i, slot) in keys.iter().enumerate() {
+        let Some(key) = slot.as_deref() else { continue };
+        let (row, col) = (i / cols, i % cols);
+        let mapped = H::hash64_seeded(row, &DataInput::Str(key)) as usize % cols;
+        if mapped != col {
+            return Err(format!(
+                "Coco bucket ({row}, {col}) holds a key that maps to column {mapped}"
+            ));
+        }
+        if !seen.insert(key) {
+            return Err(format!(
+                "Coco bucket ({row}, {col}) repeats a key already stored elsewhere in the table"
+            ));
+        }
+    }
+    Ok(())
+}
+
 // Wire serialization for Coco. `wire` is a descendant of the sketch module, so
 // this impl reads the private hasher marker and rebuilds the struct directly.
 impl<H: SketchHasher + HashProfile> Coco<H> {
@@ -114,9 +140,11 @@ impl<H: SketchHasher + HashProfile> Coco<H> {
     /// is derived from the hasher's [`HashProfile`], so it truthfully describes
     /// how the sketch was hashed.
     ///
-    /// A table whose bucket count disagrees with the sketch's own geometry, or
-    /// a geometry with a zero dimension, is an error rather than bytes that
-    /// would be refused on decode.
+    /// A table whose bucket count disagrees with the sketch's own geometry, a
+    /// geometry with a zero dimension, and a bucket layout no insert could
+    /// produce (a key outside the column its row hashes it to, or a key held by
+    /// two buckets) are all errors rather than bytes that would be refused on
+    /// decode.
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
         let (rows, cols) = (self.d, self.w);
         check_geometry(rows, cols).map_err(RmpEncodeError::Syntax)?;
@@ -132,6 +160,10 @@ impl<H: SketchHasher + HashProfile> Coco<H> {
                 buckets.len()
             )));
         }
+        let keys: Vec<Option<String>> = buckets.iter().map(|b| b.full_key.clone()).collect();
+        // The same placement and uniqueness the decoder demands, so a
+        // hand-built table fails here rather than on the way back in.
+        check_placement::<H>(&keys, cols).map_err(RmpEncodeError::Syntax)?;
         let to_u32 = |v: usize, name: &str| {
             u32::try_from(v).map_err(|_| {
                 RmpEncodeError::Syntax(format!("ASAPv1 Coco envelope: {name} {v} exceeds u32"))
@@ -142,7 +174,7 @@ impl<H: SketchHasher + HashProfile> Coco<H> {
             to_u32(cols, "cols")?,
         ))?;
         let payload = rmp_serde::to_vec(&CocoPayload {
-            keys: buckets.iter().map(|b| b.full_key.clone()).collect(),
+            keys,
             values: buckets.iter().map(|b| b.val).collect(),
         })?;
         Ok(envelope::encode(COCO_KIND, &metadata, &payload))
@@ -190,6 +222,9 @@ impl<H: SketchHasher + HashProfile> Coco<H> {
                 p.values[i]
             )));
         }
+        // Placement and uniqueness, checked after the geometry so the scan is
+        // bounded by the payload the sender actually shipped.
+        check_placement::<H>(&p.keys, cols).map_err(RmpDecodeError::Uncategorized)?;
         let table = Vector2D::from_fn(rows, cols, |r, c| {
             let i = r * cols + c;
             CocoBucket {
@@ -398,6 +433,64 @@ mod tests {
         );
     }
 
+    /// The column a `DefaultXxHasher` Coco maps `key` to in `row`.
+    fn mapped_col(row: usize, key: &str, cols: usize) -> usize {
+        DefaultXxHasher::hash64_seeded(row, &DataInput::Str(key)) as usize % cols
+    }
+
+    /// Encodes a crafted `rows`x`cols` table (row-major `(key, value)` cells).
+    fn craft(rows: usize, cols: usize, cells: Vec<(Option<String>, u64)>) -> Vec<u8> {
+        let metadata =
+            rmp_serde::to_vec_named(&coco_metadata::<DefaultXxHasher>(rows as u32, cols as u32))
+                .unwrap();
+        let payload = rmp_serde::to_vec(&CocoPayload {
+            keys: cells.iter().map(|(k, _)| k.clone()).collect(),
+            values: cells.iter().map(|(_, v)| *v).collect(),
+        })
+        .unwrap();
+        envelope::encode(COCO_KIND, &metadata, &payload)
+    }
+
+    /// A key only ever lands in the bucket its own row hashes it to, so a
+    /// payload parking it anywhere else is rejected: `recorded_flows` would
+    /// otherwise report a flow `estimate_key` answers 0 for.
+    #[test]
+    fn coco_rejects_a_key_in_a_bucket_it_does_not_hash_to() {
+        let (rows, cols) = (1, 2);
+        let key = "flow::misplaced";
+        let wrong = 1 - mapped_col(0, key, cols);
+        let mut cells = vec![(None, 0), (None, 0)];
+        cells[wrong] = (Some(key.to_string()), 11);
+
+        let problem = Coco::<DefaultXxHasher>::deserialize_from_bytes(&craft(rows, cols, cells))
+            .expect_err("a misplaced key must be rejected")
+            .to_string();
+        assert!(problem.contains("maps to column"), "got {problem}");
+    }
+
+    /// An insert scans every mapped bucket before electing one, so a key holds
+    /// at most one bucket table-wide. Two correctly placed copies are still
+    /// rejected: they would double-count in `estimate_key`.
+    #[test]
+    fn coco_rejects_a_key_stored_in_two_buckets() {
+        let (rows, cols) = (2, 2);
+        let key = "flow::twice";
+        let mut cells = vec![(None, 0); rows * cols];
+        for row in 0..rows {
+            cells[row * cols + mapped_col(row, key, cols)] = (Some(key.to_string()), u64::MAX / 2);
+        }
+        assert_eq!(
+            cells.iter().filter(|(k, _)| k.is_some()).count(),
+            2,
+            "the two rows must place the key in distinct buckets"
+        );
+
+        let problem = Coco::<DefaultXxHasher>::deserialize_from_bytes(&craft(rows, cols, cells))
+            .expect_err("a duplicated key must be rejected")
+            .to_string();
+        assert!(problem.contains("repeats a key"), "got {problem}");
+    }
+
     /// A sketch whose declared geometry disagrees with its table must not emit
     /// bytes the decoder would refuse.
     #[test]
@@ -414,6 +507,39 @@ mod tests {
             empty.serialize_to_bytes().is_err(),
             "a zero-dimension geometry must not serialize"
         );
+    }
+
+    /// `Coco`'s table is public, so a caller can park a key in a bucket its row
+    /// does not hash it to, or hold one key in two buckets. Both must fail the
+    /// encode rather than emit bytes the decoder refuses.
+    #[test]
+    fn coco_rejects_serializing_a_hand_built_table() {
+        let key = "flow::misplaced";
+        let mut misplaced: Coco = Coco::init_with_size(2, 1);
+        let wrong = 1 - mapped_col(0, key, 2);
+        misplaced.table.as_mut_slice()[wrong] = CocoBucket {
+            full_key: Some(key.to_string()),
+            val: 11,
+        };
+        let problem = misplaced
+            .serialize_to_bytes()
+            .expect_err("a misplaced key must not serialize")
+            .to_string();
+        assert!(problem.contains("maps to column"), "got {problem}");
+
+        let (rows, cols) = (2, 2);
+        let mut twice: Coco = Coco::init_with_size(cols, rows);
+        for row in 0..rows {
+            twice.table.as_mut_slice()[row * cols + mapped_col(row, key, cols)] = CocoBucket {
+                full_key: Some(key.to_string()),
+                val: 7,
+            };
+        }
+        let problem = twice
+            .serialize_to_bytes()
+            .expect_err("a key in two buckets must not serialize")
+            .to_string();
+        assert!(problem.contains("repeats a key"), "got {problem}");
     }
 
     /// An unoccupied bucket is `nil`, not an empty string, so an inserted `""`

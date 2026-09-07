@@ -72,9 +72,8 @@ pub struct DdSketchDelta {
 ///
 /// The serde field order below IS the msgpack wire layout: `rmp_serde`'s
 /// compact encoding writes a fixed-order array, so this serializes to a
-/// 3-element array `[alpha, store_counts, store_offset]`. The DataPoint-level
-/// METRIC scalars (`count`/`sum`/`min`/`max`) that used to trail this struct
-/// were removed; the total count is recoverable by summing `store_counts`.
+/// 3-element array `[alpha, store_counts, store_offset]`. The total count is
+/// recoverable by summing `store_counts`.
 /// KEEP these three fields in this exact order so the bytes stay identical
 /// to the Go reference implementation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,7 +92,7 @@ impl DdSketch {
     /// Construct an empty sketch.
     pub fn new(alpha: f64) -> Self {
         assert!(
-            (0.0..1.0).contains(&alpha),
+            alpha > 0.0 && alpha < 1.0,
             "alpha must be in (0,1); alpha=0 makes ln(gamma)=0 and every guard degenerate"
         );
         Self {
@@ -113,9 +112,8 @@ impl DdSketch {
     }
 
     /// Total number of values added, recovered by summing the bucket
-    /// counts. The DataPoint-level `count` scalar was dropped from the
-    /// wire format, so this is the authoritative count for
-    /// quantile-rank computation.
+    /// counts. The wire format carries no `count` scalar, so this is the
+    /// authoritative count for quantile-rank computation.
     pub fn total_count(&self) -> u64 {
         self.store_counts
             .iter()
@@ -257,12 +255,6 @@ impl DdSketch {
             let arr_idx = (k - self.store_offset as i64) as usize;
             self.store_counts[arr_idx] = self.store_counts[arr_idx].saturating_add(*d_count);
         }
-        // The DataPoint-level METRIC scalars (count/sum/min/max) were
-        // removed from the wire state, so the delta's
-        // `d_count`/`d_sum`/`new_min`/`new_max` no longer have
-        // a target here — the bucket counts above carry all reconstructable
-        // state. The backend that owns the DDSketch delta tracks those
-        // aggregates separately.
         Ok(())
     }
 
@@ -500,18 +492,14 @@ impl DdSketch {
             cumulative = cumulative.saturating_add(c);
             if cumulative > target {
                 let k = self.store_offset as i64 + i as i64;
-                // Representative: lower edge γ^k scaled by (1+α) — matches the
-                // core DDSketch and DataDog's logarithmic_mapping.go. The old
-                // log-midpoint γ^(k+0.5) gave edge error √γ−1 > α, silently
-                // violating the α guarantee near a bucket edge.
                 return Some(gamma.powf(k as f64) * (1.0 + self.alpha));
             }
         }
         // Numerical edge case: if we fall off the end (e.g. q == 1.0 and
         // rounding lands past the final increment), estimate from the
-        // highest non-empty bucket. The DataPoint-level `max` scalar was
-        // removed from the wire; the representative is within DDSketch's
-        // α relative-accuracy bound of the true max.
+        // highest non-empty bucket. The wire format carries no `max`
+        // scalar; the representative is within DDSketch's α
+        // relative-accuracy bound of the true max.
         last_nonempty.map(|i| {
             let k = (self.store_offset as i64 + i as i64) as f64;
             gamma.powf(k) * (1.0 + self.alpha)
@@ -892,11 +880,6 @@ mod tests {
                 }
             }
         }
-        // The DataPoint-level scalars (count/sum/min/max) were dropped from
-        // the in-memory state. The delta's scalar fields are no longer
-        // consumed by `apply_delta` — only the bucket cells drive
-        // reconstitution — so populate them from bucket-derived
-        // quantities just to keep the struct shape.
         let d_count = current.total_count() as i64 - snapshot.total_count() as i64;
         DdSketchDelta {
             buckets: cells,

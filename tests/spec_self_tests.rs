@@ -90,7 +90,7 @@ fn marginal_failure_probabilities_match_the_hand_computed_tails() {
 
 /// Two same-direction bad rows really do break a four-row median.
 ///
-/// This is the concrete counter-example behind the threshold change: with
+/// This is the concrete counter-example to a `d/2 + 1` threshold: with
 /// `d = 4` the reported value is `(X_(2) + X_(3)) / 2`, so two bad rows on
 /// the same side put a bad value at position 3 and drag the average out of
 /// the band — while three good rows and one bad row cannot, because both

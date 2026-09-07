@@ -767,9 +767,6 @@ mod tests {
 
     #[test]
     fn estimate_does_not_clamp_i64_counts_above_i32_max() {
-        // Regression: the running minimum used to be seeded with `i32::MAX`,
-        // which clamped i64 estimates whenever every probed cell exceeded
-        // 2147483647, capping large counts at 2147483647.
         let mut sk = CountMin::<Vector2D<i64>, RegularPath>::with_dimensions(3, 64);
         let key = DataInput::Str("pkt_len");
         let count: i64 = 35_000_000_000; // ~35 billion, well past i32::MAX

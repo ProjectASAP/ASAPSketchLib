@@ -37,12 +37,12 @@ use serde::{Deserialize, Serialize};
 use crate::message_pack_format::envelope;
 use crate::message_pack_format::wire_key::WireBytes;
 use crate::sketches::countminsketch_topk::heap_wire::{
-    EMPTY_KEY_TYPE, heap_entries, key_type_of, rebuild_heap,
+    EMPTY_KEY_TYPE, check_distinct_keys, heap_entries, key_type_of, rebuild_heap,
 };
 use crate::sketches::countsketch_topk::l2hh_wire;
 use crate::{DefaultXxHasher, HHHeap, HashProfile, HeapItem, L2HH, Vector1D};
 
-use super::{UnivMon, UnivMonUpdateMode};
+use super::{MAX_LAYER_SIZE, UnivMon, UnivMonUpdateMode};
 
 /// UnivMon kind_id: family `0x10`, single algorithm variant `0x00`.
 const UNIVMON_KIND: &[u8] = &[0x10, 0x00];
@@ -136,6 +136,34 @@ pub(crate) fn update_mode_of(tag: u8) -> Result<UnivMonUpdateMode, RmpDecodeErro
     }
 }
 
+/// Checks a pyramid's layer count against [`MAX_LAYER_SIZE`], naming `sketch`
+/// in the error. Shared by both UnivMon kinds' encoders and decoders.
+pub(crate) fn check_layer_size(sketch: &str, layer_size: usize) -> Result<(), String> {
+    if layer_size > MAX_LAYER_SIZE {
+        return Err(format!(
+            "{sketch} layer_size {layer_size} exceeds MAX_LAYER_SIZE {MAX_LAYER_SIZE}"
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects a UnivMon shape the algorithm never has: `layer_size`,
+/// `sketch_row`, `sketch_col` and `heap_size` are each positive. The encoder
+/// and the decoder both call this, so the two doors cannot drift.
+pub(crate) fn check_univmon_dimensions(
+    layer_size: usize,
+    sketch_row: usize,
+    sketch_col: usize,
+    heap_size: usize,
+) -> Result<(), String> {
+    if layer_size == 0 || sketch_row == 0 || sketch_col == 0 || heap_size == 0 {
+        return Err(format!(
+            "UnivMon layer_size, sketch_row, sketch_col and heap_size must be non-zero: layer_size={layer_size}, sketch_row={sketch_row}, sketch_col={sketch_col}, heap_size={heap_size}"
+        ));
+    }
+    Ok(())
+}
+
 /// The layers' state in emitted order, ready to be packed.
 pub(crate) struct PyramidState<'a> {
     pub(crate) counts: Vec<i64>,
@@ -152,8 +180,8 @@ pub(crate) struct PyramidState<'a> {
 /// (descending count, ties by the total order over the key).
 ///
 /// Fails when a layer's geometry disagrees with the declared one, when a
-/// layer's seed index is not its position, or when the heaps hold more entries
-/// than `u32` can name.
+/// layer's seed index is not its position, when a layer's heap holds the same
+/// wire key twice, or when the heaps hold more entries than `u32` can name.
 pub(crate) fn pyramid_state<'a>(
     sketches: &'a Vector1D<L2HH>,
     heaps: &'a Vector1D<HHHeap>,
@@ -209,6 +237,8 @@ pub(crate) fn pyramid_state<'a>(
         state.counts.extend_from_slice(counts);
         state.l2.extend_from_slice(l2);
         let entries = heap_entries(&heaps[layer]);
+        check_distinct_keys(entries.iter().map(|(key, _)| *key))
+            .map_err(|problem| RmpEncodeError::Syntax(format!("{problem} (layer {layer})")))?;
         state
             .heap_lens
             .push(u32::try_from(entries.len()).map_err(|_| {
@@ -527,10 +557,20 @@ impl UnivMon {
     /// (kind_id `0x10 0x00`). The metadata is derived from
     /// [`DefaultXxHasher`]'s [`HashProfile`], the hasher UnivMon is built on.
     ///
-    /// Fails when a layer's geometry or seed index disagrees with the declared
-    /// pyramid, when the heaps' keys mix `HeapItem` variants or hold a 128-bit
-    /// key, or when a structural parameter overflows its `u32` metadata field.
+    /// Fails when a structural parameter is zero, when a layer's geometry or
+    /// seed index disagrees with the declared pyramid, when a layer's heap
+    /// holds one wire key twice, when the heaps' keys mix `HeapItem` variants
+    /// or hold a 128-bit key, or when a structural parameter overflows its
+    /// `u32` metadata field.
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
+        check_univmon_dimensions(
+            self.layer_size,
+            self.sketch_row,
+            self.sketch_col,
+            self.heap_size,
+        )
+        .map_err(RmpEncodeError::Syntax)?;
+        check_layer_size("UnivMon", self.layer_size).map_err(RmpEncodeError::Syntax)?;
         let geometry = vec![(self.sketch_row, self.sketch_col); self.layer_size];
         let state = pyramid_state(
             &self.l2_sketch_layers,
@@ -595,11 +635,9 @@ impl UnivMon {
             meta.sketch_col as usize,
             meta.heap_size as usize,
         );
-        if layer_size == 0 || heap_size == 0 {
-            return Err(RmpDecodeError::Uncategorized(format!(
-                "UnivMon layer_size and heap_size must be non-zero: layer_size={layer_size}, heap_size={heap_size}"
-            )));
-        }
+        check_univmon_dimensions(layer_size, sketch_row, sketch_col, heap_size)
+            .map_err(RmpDecodeError::Uncategorized)?;
+        check_layer_size("UnivMon", layer_size).map_err(RmpDecodeError::Uncategorized)?;
         let decoded = decode_pyramid(&meta.key_type, payload)?;
         // The declared layer count is measured against the accumulators the
         // payload actually carries before the geometry is built from it.
@@ -629,6 +667,7 @@ impl UnivMon {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sketch_framework::univmon::MAX_LAYER_SIZE;
     use crate::{
         CANONICAL_HASH_SEED, DataInput, MATRIX_MAX_ROWS, RegularPath, SketchHasher, Vector2D,
     };
@@ -937,6 +976,7 @@ mod tests {
         let cases = [
             shaped(u32::MAX, 2, 16, 4),
             shaped(3, 2, 0, 4),
+            shaped(3, 0, 16, 4),
             shaped(0, 2, 16, 4),
             shaped(3, 2, 16, 0),
             shaped(3, MATRIX_MAX_ROWS as u32, 4096, 4),
@@ -947,6 +987,21 @@ mod tests {
                 UnivMon::deserialize_from_bytes(&crafted(&meta, &payload)).is_err(),
                 "a crafted shape must be rejected, not decoded"
             );
+        }
+
+        // A zero dimension against an empty payload: the accumulator check
+        // alone passes (0 rows over any layer count names 0 accumulators), so
+        // the dimensions must be refused before the geometry is sized.
+        let mut empty = payload_of::<String>(&encoded);
+        empty.counts.clear();
+        empty.l2.clear();
+        empty.keys.clear();
+        empty.heap_counts.clear();
+        for meta in [shaped(u32::MAX, 0, 16, 4), shaped(3, 0, 0, 4)] {
+            let problem = UnivMon::deserialize_from_bytes(&crafted(&meta, &empty))
+                .expect_err("a zero dimension must be rejected, not sized from")
+                .to_string();
+            assert!(problem.contains("must be non-zero"), "got {problem}");
         }
 
         // Parallel arrays and per-layer runs must agree with the declared
@@ -1007,6 +1062,87 @@ mod tests {
             "a 128-bit key is not a wire type"
         );
     }
+    /// A layer's heap can seat one key twice — `update` compares residents with
+    /// `HeapItem`'s equality and `NaN != NaN`, so a second `NaN` takes its own
+    /// seat — and `rebuild_heap` refuses that payload. The encoder runs the
+    /// same `check_distinct_keys` per layer, so the pyramid never emits it.
+    #[test]
+    fn univmon_refuses_to_serialize_a_layer_holding_a_key_twice() {
+        let mut nans = UnivMon::init_univmon(4, 2, 16, 3);
+        nans.hh_layers[1].update(&DataInput::F64(f64::NAN), 5);
+        nans.hh_layers[1].update(&DataInput::F64(f64::NAN), 4);
+        assert_eq!(nans.hh_layers[1].len(), 2, "the two NaNs did not both seat");
+        let problem = nans
+            .serialize_to_bytes()
+            .expect_err("a layer holding one key twice must not serialize")
+            .to_string();
+        assert!(
+            problem.contains("the same key appears twice"),
+            "got {problem}"
+        );
+        assert!(problem.contains("layer 1"), "got {problem}");
+
+        // Two layers each holding the same key is not a duplicate: the check is
+        // per layer, as the heaps are.
+        let mut shared = UnivMon::init_univmon(4, 2, 16, 3);
+        shared.hh_layers[0].update(&DataInput::U64(7), 5);
+        shared.hh_layers[1].update(&DataInput::U64(7), 5);
+        let encoded = shared.serialize_to_bytes().expect("serialize");
+        assert!(UnivMon::deserialize_from_bytes(&encoded).is_ok());
+    }
+
+    /// The dimensions are public fields, so a caller can zero one after
+    /// construction (the constructor asserts them positive). The decoder
+    /// refuses a zero dimension, so the encoder must too. Each case below is
+    /// built by writing the public field directly.
+    #[test]
+    fn univmon_refuses_to_serialize_a_zero_dimension() {
+        for zero in ["layer_size", "sketch_row", "sketch_col", "heap_size"] {
+            let mut um = UnivMon::init_univmon(4, 2, 16, 3);
+            match zero {
+                "layer_size" => um.layer_size = 0,
+                "sketch_row" => um.sketch_row = 0,
+                "sketch_col" => um.sketch_col = 0,
+                _ => um.heap_size = 0,
+            }
+            let problem = match um.serialize_to_bytes() {
+                Ok(_) => panic!("a zero {zero} must not serialize"),
+                Err(err) => err.to_string(),
+            };
+            assert!(problem.contains("must be non-zero"), "got {problem}");
+        }
+    }
+
+    /// The layer finder shifts a 64-bit hash by up to `layer_size - 1`, so
+    /// [`MAX_LAYER_SIZE`] layers is the ceiling: the boundary round-trips and a
+    /// deeper pyramid is refused at the decode door.
+    #[test]
+    fn univmon_rejects_layers_past_the_shift_bound() {
+        let deepest = UnivMon::init_univmon(4, 2, 16, MAX_LAYER_SIZE);
+        let encoded = deepest.serialize_to_bytes().expect("serialize");
+        assert!(UnivMon::deserialize_from_bytes(&encoded).is_ok());
+
+        let layers = MAX_LAYER_SIZE + 1;
+        let mut meta = metadata_of(&encoded);
+        meta.layer_size = layers as u32;
+        let (rows, cols) = (meta.sketch_row as usize, meta.sketch_col as usize);
+        let mut payload: PyramidPayload<u64> = payload_of(&encoded);
+        payload.counts = vec![0; rows * cols * layers];
+        payload.l2 = vec![0; rows * layers];
+        payload.heap_lens = vec![0; layers];
+        payload.candidate_complete = vec![true; layers];
+        let problem = UnivMon::deserialize_from_bytes(&crafted(&meta, &payload))
+            .expect_err("a pyramid past the shift bound must be rejected")
+            .to_string();
+        assert!(problem.contains("MAX_LAYER_SIZE"), "got {problem}");
+    }
+
+    #[test]
+    #[should_panic(expected = "at most MAX_LAYER_SIZE")]
+    fn univmon_refuses_constructing_past_the_shift_bound() {
+        UnivMon::init_univmon(4, 2, 16, MAX_LAYER_SIZE + 1);
+    }
+
     /// Fail closed on an unexpected metadata key, and on a missing required
     /// one.
     #[test]

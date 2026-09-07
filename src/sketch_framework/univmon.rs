@@ -83,6 +83,11 @@ impl Default for UnivMon {
     }
 }
 
+/// Layers one pyramid may hold. [`bottom_layer_for_hash`] and the query
+/// recurrences shift a 64-bit key hash right by up to `layer_size - 1`, so a
+/// deeper pyramid would shift past the hash's width.
+pub const MAX_LAYER_SIZE: usize = 64;
+
 /// Deepest pyramid layer the given key hash reaches.
 #[inline(always)]
 pub fn bottom_layer_for_hash(hash: u64, layer_size: usize) -> usize {
@@ -117,6 +122,10 @@ impl UnivMon {
         assert!(sketch_row > 0, "sketch row count must be positive");
         assert!(sketch_col > 0, "sketch column count must be positive");
         assert!(layer_size > 0, "layer count must be positive");
+        assert!(
+            layer_size <= MAX_LAYER_SIZE,
+            "layer count must be at most MAX_LAYER_SIZE {MAX_LAYER_SIZE}"
+        );
         let sk_vec: Vec<L2HH> = (0..layer_size)
             .map(|i| {
                 L2HH::COUNT(CountL2HH::with_dimensions_and_seed(
@@ -337,8 +346,6 @@ impl UnivMon {
                 let input = heap_item_to_sketch_input(&item.key);
                 let count = self.l2_sketch_layers[i].estimate(&input) as i64;
                 if count > threshold {
-                    // let hash = (hash64_seeded(CANONICAL_HASH_SEED, &item.key) >> (i+1)) & 1;
-                    // let hash = (hash64_seeded(CANONICAL_HASH_SEED, &DataInput::Str(&item.key)) >> (i + 1)) & 1;
                     let hash = (hash_item64_seeded(BOTTOM_LAYER_FINDER, &item.key) >> (i + 1)) & 1;
                     let coe = 1.0 - 2.0 * (hash as f64);
                     tmp += coe * g(count as f64);
@@ -596,21 +603,13 @@ mod tests {
         );
     }
 
-    // fn bottom_layer_for(um: &UnivMon, key: &str) -> usize {
-    //     let hash = hash64_seeded(BOTTOM_LAYER_FINDER, &DataInput::Str(key));
-    //     um.find_bottom_layer_num(hash, um.layer)
-    // }
-
     #[test]
     fn update_populates_bucket_size_and_heavy_hitters() {
         // processing a single hot key should record its weight in the heavy hitter layers
         let mut um = UnivMon::init_univmon(16, 3, 32, 4);
         let key = "alpha";
 
-        // let bottom = bottom_layer_for(&um, key);
-
         for _ in 0..40 {
-            // um.univmon_processing(key, 1, bottom);
             um.insert(&DataInput::Str(key), 1);
         }
 
@@ -645,15 +644,10 @@ mod tests {
         let key_left = "left";
         let key_right = "right";
 
-        // let bottom_left = bottom_layer_for(&left, key_left);
-        // let bottom_right = bottom_layer_for(&right, key_right);
-
         for _ in 0..25 {
-            // left.univmon_processing(key_left, 1, bottom_left);
             left.insert(&DataInput::Str(key_left), 1);
         }
         for _ in 0..30 {
-            // right.univmon_processing(key_right, 1, bottom_right);
             right.insert(&DataInput::Str(key_right), 1);
         }
 
@@ -661,7 +655,6 @@ mod tests {
 
         let left_heap = left.heap_at_layer(00);
         let right_heap = right.heap_at_layer(0);
-        // let right_heap = right.heap_at_layer(00);
         let idx_left = left_heap
             .find_heap_item(&HeapItem::String(key_left.to_owned()))
             .expect("left key present");
@@ -686,7 +679,6 @@ mod tests {
             "right in left is: {}",
             left_heap.heap()[idx_right_in_left].count
         );
-        // assert!(left.hh_layers[0].heap()[idx_right].count > 0);
     }
 
     #[test]
@@ -820,8 +812,6 @@ mod tests {
 
         for i in 0..20 {
             let key = format!("flow_{i}");
-            // let bottom = bottom_layer_for(&um, &key);
-            // um.univmon_processing(&key, 10, bottom);
             um.insert(&DataInput::String(key), 1);
         }
 
@@ -841,8 +831,6 @@ mod tests {
         let expected_total = 450;
 
         for (key, count) in &flows {
-            // let bottom = bottom_layer_for(&um, key);
-            // um.univmon_processing(key, *count, bottom);
             um.insert(&DataInput::Str(key), *count);
         }
 
@@ -878,9 +866,6 @@ mod tests {
 
         let mut um = UnivMon::init_univmon(100, 3, 2048, 16);
         for case in cases {
-            // let h = hash64_seeded(BOTTOM_LAYER_FINDER, &DataInput::Str(&case.0));
-            // let bln = um.find_bottom_layer_num(h, 16);
-            // um.univmon_processing(&case.0, case.1, bln);
             um.insert(&DataInput::String(case.0), case.1);
         }
 
@@ -914,9 +899,6 @@ mod tests {
                 total_count += val_f;
 
                 // Update Sketch
-                // let hash = hash64_seeded(BOTTOM_LAYER_FINDER, &DataInput::Str(&key));
-                // let bln = um.find_bottom_layer_num(hash, 10);
-                // um.univmon_processing(&key, val, bln);
                 um.insert(&DataInput::String(key), val);
             }
         }

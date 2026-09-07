@@ -21,11 +21,11 @@ capacity. A weighted `insert_many` lands further along the bucket list and walks
 it to reach its destination, one step per bucket it passes, so only the unit
 path is constant-work.
 
-Both lists are arenas of indices rather than pointers. `counters` is allocated
-once up to `capacity` and reused in place — an eviction overwrites the victim's
-slot — and `buckets` recycles through a free list. The key index is keyed by an
-xxh3 digest and hashes it through `DigestBuildHasher` rather than a second
-time.
+Both lists are arenas of indices rather than pointers. Counter slots are
+allocated once up to `capacity` and reused in place — an eviction overwrites
+the victim's slot — and buckets recycle through a free list. The key index is
+keyed by a 64-bit digest, hashed through `DigestBuildHasher` rather than a
+second time.
 
 ## Constructors
 
@@ -94,7 +94,7 @@ error)` in non-increasing count order.
 ## Merge
 
 ```rust
-fn merge_from(&mut self, other: &Self)
+fn merge(&mut self, other: &Self)
 ```
 
 Counts for a shared key add. A key held by only one side takes the other's
@@ -103,8 +103,8 @@ other side can say about it. The union is then trimmed back to `capacity`, and
 the merged ceiling rises to at least the sum of the two `min_count`s — a key
 both sides dropped can have reached that much between them.
 
-The union is ordered by count and broken out of ties by digest and then by key,
-so merging the same two summaries always yields the same survivors.
+The union is ordered by count and broken out of ties by key, the order the
+wire emits, so merging the same two summaries always yields the same survivors.
 
 This is **not** equivalent to running one summary over the concatenated streams:
 a key both sides evicted cannot be recovered. `merge_equivalence_battery` does
@@ -132,7 +132,7 @@ A summary travels as `capacity`, `total`, the unmonitored ceiling, and one
 the key index all follow from the triples and are rebuilt on load, so no arena
 index reaches the wire and no crafted state can point one out of bounds or into
 a loop. `capacity` and the key type are ASAPv1 metadata; the payload is
-`[keys, counts, errors, total, floor]`.
+`[keys, counts, errors, total, discarded_max]`.
 
 Keys are `HeapItem`s, so the key type is a runtime property: the metadata's
 `key_type` names the **exact** variant (`"i32"` stays `"i32"`, never widened to

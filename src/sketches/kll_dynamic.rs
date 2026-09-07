@@ -357,11 +357,6 @@ impl<T: NumericalValue> KLLDynamic<T> {
     /// items, then re-run the same randomized halve-and-promote compaction
     /// ordinary inserts use), adapted to `KLLDynamic`'s growable (rather
     /// than fixed-capacity) backing storage.
-    ///
-    /// The previous implementation replayed *every* item of `other` —
-    /// across all of its levels — through `push_value`, i.e. at weight 1,
-    /// silently discarding the level weight of everything `other` had
-    /// retained above level 0 (the same class of bug as `KLL::merge`).
     pub fn merge(&mut self, other: &KLLDynamic<T>) {
         if other.items.is_empty() {
             return; // `other` is empty: nothing to merge.
@@ -748,19 +743,6 @@ mod tests {
         );
     }
 
-    // Merge-weight regression, KLLDynamic variant: merging a KLL(k=200)
-    // over 1..=1000 into an empty sketch used to
-    // rescale N down to `other`'s retained-item count and drift the
-    // median, because the old `merge` replayed every retained item
-    // through `push_value` at weight 1 regardless of which level it was
-    // retained at. Merging into an empty target is a pure structural
-    // no-op (interleaving with nothing) with the fix, so `dst.count()`
-    // must come out EXACTLY equal to `src.count()` — no further
-    // compaction is triggered since `other`'s levels already each satisfy
-    // their own capacity. (`count()` itself is only approximately N even
-    // for plain inserts, per KLL's randomized-halving rounding — see
-    // `generic_kll_dynamic_i64_sanity` above — so we compare src vs. dst,
-    // not against a literal 1000.)
     #[test]
     fn merge_into_empty_target_preserves_weight_issue_68_repro() {
         let mut src = KLLDynamic::<f64>::init_kll(SKETCH_K);
@@ -860,10 +842,9 @@ mod tests {
         );
     }
 
-    // Deterministic regression: `merge` assumed level h (h >= 1) is always
-    // a single sorted run in both operands. That holds for `KLL`
-    // (fixed-capacity), whose `compact`
-    // maintains it as a standing invariant via merge-promotion — but
+    // Deterministic regression: level h (h >= 1) is not always a single
+    // sorted run in both operands. It is for `KLL` (fixed-capacity), whose
+    // `compact` maintains it as a standing invariant via merge-promotion — but
     // `KLLDynamic::compact` re-sorts a level's *entire* contents from
     // scratch on every call instead, so a level that received a
     // promotion since its last compaction can be a concatenation of
@@ -878,7 +859,7 @@ mod tests {
     // order), small enough to stay well under capacity so level 1 is
     // never itself compacted during the merge — the output then reflects
     // the construction phase's ordering assumption directly, with no
-    // randomized (`Coin`) compaction able to mask the bug, keeping this
+    // randomized (`Coin`) compaction able to mask the failure, keeping this
     // test deterministic.
     #[test]
     fn merge_handles_operand_level_that_is_not_a_single_sorted_run() {

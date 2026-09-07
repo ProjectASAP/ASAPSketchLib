@@ -5,14 +5,14 @@
 //! constant, the `key_type` mapping, and the `serialize_to_bytes` /
 //! `deserialize_from_bytes` impls) while the algorithm lives in the parent
 //! module file. Being a descendant module, it reads the summary's private
-//! `counters` / `buckets` / `total` / `floor` fields and reuses the private
+//! `monitored` / `buckets` / `total` / `discarded_max` fields and reuses the private
 //! `rebuild` entry point directly, without widening any field visibility. See
 //! `docs/asapv1_wire_format.md` §3.5.
 //!
 //! Space-Saving is one algorithm — a single kind_id `0x18 0x00`. Its structural
 //! parameters are the counter `capacity` and the `key_type`, both in the
 //! metadata, so the payload is the answer triples split into parallel arrays
-//! plus the two running scalars: `[keys, counts, errors, total, floor]`. The
+//! plus the two running scalars: `[keys, counts, errors, total, discarded_max]`. The
 //! bucket list, the counter arena and the key index are all derived and are
 //! rebuilt on load, so no arena index reaches the wire.
 //!
@@ -29,15 +29,17 @@
 //! types, so a summary holding one refuses to serialize — as does one whose
 //! monitored keys mix variants, `String` and `Bytes` included. A `Bytes` key is
 //! written as msgpack `bin` through `WireBytes` and read back from `bin` alone,
-//! so any byte string survives whether or not it is UTF-8 and a `str`-keyed
-//! payload relabelled `"bytes"` is refused.
+//! so any byte string survives whether or not it is UTF-8; a `String` key goes
+//! through `WireString` and is read back from `str` alone. Neither family
+//! decodes as the other, so a `str`-keyed payload relabelled `"bytes"` and a
+//! UTF-8 `bin`-keyed payload relabelled `"string"` are both refused.
 //!
 //! ## Emitted order (byte-stable round trips)
 //!
 //! `entries()` order follows the counter arena and `top_k` order follows the
 //! bucket walk, neither of which survives a rebuild. The payload is therefore
 //! **order-defined**: descending count, ties broken by the crate's `key_order`
-//! total order over [`HeapItem`] (the same one `merge_from` uses). Two summaries
+//! total order over [`HeapItem`] (the same one `merge` uses). Two summaries
 //! holding the same triples emit the same bytes whatever order they were seated
 //! in, and re-serializing a decoded summary reproduces its bytes exactly.
 
@@ -45,7 +47,7 @@ use rmp_serde::{decode::Error as RmpDecodeError, encode::Error as RmpEncodeError
 use serde::{Deserialize, Serialize};
 
 use crate::message_pack_format::envelope;
-use crate::message_pack_format::wire_key::WireBytes;
+use crate::message_pack_format::wire_key::{WireBytes, WireString};
 use crate::{HashProfile, HeapItem, SketchHasher};
 
 use super::{SpaceSaving, SpaceSavingState, key_order};
@@ -119,9 +121,9 @@ fn space_saving_metadata<H: HashProfile>(capacity: u32, key_type: &str) -> Space
 }
 
 /// Space-Saving payload (ASAPv1 §3.5), a msgpack **array** (`to_vec`,
-/// positional): `[keys, counts, errors, total, floor]`. The three arrays are
+/// positional): `[keys, counts, errors, total, discarded_max]`. The three arrays are
 /// parallel and equal-length; `keys`'s element type is fixed by the metadata
-/// `key_type`. `total` is the recorded weight, `floor` the largest count known
+/// `key_type`. `total` is the recorded weight, `discarded_max` the largest count known
 /// to have left the summary.
 #[derive(Debug, Serialize, Deserialize)]
 struct SpaceSavingPayload<K> {
@@ -129,7 +131,7 @@ struct SpaceSavingPayload<K> {
     counts: Vec<u64>,
     errors: Vec<u64>,
     total: u64,
-    floor: u64,
+    discarded_max: u64,
 }
 
 /// The `key_type` the payload will be written in, taken from the first key in
@@ -159,7 +161,7 @@ fn encode_payload(
     key_type: &str,
     entries: &[(&HeapItem, u64, u64)],
     total: u64,
-    floor: u64,
+    discarded_max: u64,
 ) -> Result<Vec<u8>, RmpEncodeError> {
     let counts: Vec<u64> = entries.iter().map(|entry| entry.1).collect();
     let errors: Vec<u64> = entries.iter().map(|entry| entry.2).collect();
@@ -178,7 +180,7 @@ fn encode_payload(
                 counts,
                 errors,
                 total,
-                floor,
+                discarded_max,
             })
         }};
     }
@@ -200,7 +202,7 @@ fn encode_payload(
             let mut keys = Vec::with_capacity(entries.len());
             for (key, _, _) in entries {
                 match key {
-                    HeapItem::String(value) => keys.push(value.clone()),
+                    HeapItem::String(value) => keys.push(WireString(value.clone())),
                     _ => return Err(mixed_variant_error(key_type, key)),
                 }
             }
@@ -209,7 +211,7 @@ fn encode_payload(
                 counts,
                 errors,
                 total,
-                floor,
+                discarded_max,
             })
         }
         "bytes" => {
@@ -225,7 +227,7 @@ fn encode_payload(
                 counts,
                 errors,
                 total,
-                floor,
+                discarded_max,
             })
         }
         other => Err(RmpEncodeError::Syntax(format!(
@@ -255,12 +257,12 @@ fn decode_payload(
                 decoded.counts,
                 decoded.errors,
                 decoded.total,
-                decoded.floor,
+                decoded.discarded_max,
             )
         }};
     }
 
-    let (keys, counts, errors, total, floor) = match key_type {
+    let (keys, counts, errors, total, discarded_max) = match key_type {
         "i8" => unpack!(I8, i8),
         "i16" => unpack!(I16, i16),
         "i32" => unpack!(I32, i32),
@@ -273,7 +275,20 @@ fn decode_payload(
         "usize" => unpack!(USIZE, usize),
         "f32" => unpack!(F32, f32),
         "f64" => unpack!(F64, f64),
-        "string" => unpack!(String, String),
+        "string" => {
+            let decoded: SpaceSavingPayload<WireString> = from_slice(payload)?;
+            (
+                decoded
+                    .keys
+                    .into_iter()
+                    .map(|key| HeapItem::String(key.into_string()))
+                    .collect::<Vec<HeapItem>>(),
+                decoded.counts,
+                decoded.errors,
+                decoded.total,
+                decoded.discarded_max,
+            )
+        }
         "bytes" => {
             let decoded: SpaceSavingPayload<WireBytes> = from_slice(payload)?;
             (
@@ -285,7 +300,7 @@ fn decode_payload(
                 decoded.counts,
                 decoded.errors,
                 decoded.total,
-                decoded.floor,
+                decoded.discarded_max,
             )
         }
         other => {
@@ -307,7 +322,7 @@ fn decode_payload(
     Ok(SpaceSavingState {
         capacity,
         total,
-        floor,
+        discarded_max,
         entries: keys
             .into_iter()
             .zip(counts)
@@ -338,7 +353,7 @@ impl<H: SketchHasher + HashProfile> SpaceSaving<H> {
         let entries = self.wire_entries();
         let key_type = wire_key_type(&entries)?;
         let metadata = rmp_serde::to_vec_named(&space_saving_metadata::<H>(capacity, key_type))?;
-        let payload = encode_payload(key_type, &entries, self.total, self.floor)?;
+        let payload = encode_payload(key_type, &entries, self.total, self.discarded_max)?;
         Ok(envelope::encode(SPACE_SAVING_KIND, &metadata, &payload))
     }
 
@@ -373,7 +388,7 @@ impl<H: SketchHasher + HashProfile> SpaceSaving<H> {
     /// stable across a round trip.
     fn wire_entries(&self) -> Vec<(&HeapItem, u64, u64)> {
         let mut entries: Vec<(&HeapItem, u64, u64)> = self
-            .counters
+            .monitored
             .iter()
             .map(|counter| {
                 (
@@ -495,7 +510,7 @@ mod tests {
         );
     }
 
-    /// The ceiling a merge leaves behind lives only in `floor`, which is not
+    /// The ceiling a merge leaves behind lives only in `discarded_max`, which is not
     /// derivable from the triples: a payload carrying only the triples would
     /// decode to `min_count == 0` here.
     #[test]
@@ -508,7 +523,7 @@ mod tests {
         for _ in 0..20 {
             right.insert(&DataInput::I64(8));
         }
-        left.merge_from(&right);
+        left.merge(&right);
 
         assert!(left.len() < left.capacity(), "the merge left room to spare");
         assert!(left.min_count() >= 10, "the merge did not raise a ceiling");
@@ -671,14 +686,14 @@ mod tests {
         let seated = SpaceSaving::<DefaultXxHasher>::rebuild(SpaceSavingState {
             capacity: 4,
             total: 28,
-            floor: 0,
+            discarded_max: 0,
             entries,
         })
         .expect("rebuild");
         let reseated = SpaceSaving::<DefaultXxHasher>::rebuild(SpaceSavingState {
             capacity: 4,
             total: 28,
-            floor: 0,
+            discarded_max: 0,
             entries: reversed,
         })
         .expect("rebuild");
@@ -742,6 +757,13 @@ mod tests {
         let raw_bytes = raw.serialize_to_bytes().expect("serialize");
         let (_, _, raw_payload) = envelope::split(&raw_bytes).expect("split");
 
+        // Bytes that ARE valid UTF-8: relabelled "string" they would decode
+        // into `HeapItem::String` keys unless the string decode refuses `bin`.
+        let mut utf8: SpaceSaving = SpaceSaving::with_capacity(4);
+        utf8.insert(&DataInput::Bytes(b"alpha"));
+        let utf8_bytes = utf8.serialize_to_bytes().expect("serialize");
+        let (_, _, utf8_payload) = envelope::split(&utf8_bytes).expect("split");
+
         for (claimed, payload) in [
             ("u64", string_payload),
             ("string", number_payload),
@@ -749,6 +771,7 @@ mod tests {
             ("bytes", string_payload),
             ("u64", raw_payload),
             ("string", raw_payload),
+            ("string", utf8_payload),
         ] {
             let metadata =
                 rmp_serde::to_vec_named(&space_saving_metadata::<DefaultXxHasher>(4, claimed))
@@ -875,7 +898,7 @@ mod tests {
         counts: Vec<u64>,
         errors: Vec<u64>,
         total: u64,
-        floor: u64,
+        discarded_max: u64,
     ) -> Vec<u8> {
         let metadata =
             rmp_serde::to_vec_named(&space_saving_metadata::<DefaultXxHasher>(capacity, "u64"))
@@ -885,7 +908,7 @@ mod tests {
             counts,
             errors,
             total,
-            floor,
+            discarded_max,
         })
         .expect("payload");
         envelope::encode(SPACE_SAVING_KIND, &metadata, &payload)
@@ -902,7 +925,7 @@ mod tests {
                 counts: vec![1],
                 errors: vec![0],
                 total: 1,
-                floor: 0,
+                discarded_max: 0,
             })
             .expect("payload");
             (metadata, payload)
@@ -974,7 +997,7 @@ mod tests {
         let summary = SpaceSaving::<DefaultXxHasher>::rebuild(SpaceSavingState {
             capacity: 1 << 40,
             total: 3,
-            floor: 0,
+            discarded_max: 0,
             entries: vec![(HeapItem::U64(1), 3, 0)],
         })
         .expect("a sparse state");
@@ -1000,7 +1023,11 @@ mod tests {
         assert_eq!(decoded.capacity(), u32::MAX as usize);
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded.estimate(&DataInput::U64(7)), 9);
-        assert_eq!(decoded.min_count(), 0, "a sparse summary has no floor");
+        assert_eq!(
+            decoded.min_count(),
+            0,
+            "a sparse summary has no discarded_max"
+        );
         assert_eq!(decoded.top_k(8).len(), 2);
     }
 }

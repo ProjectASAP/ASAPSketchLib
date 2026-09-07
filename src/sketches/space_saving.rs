@@ -17,7 +17,7 @@
 //! bucket list and walks it to reach its destination, one step per bucket it
 //! passes.
 //!
-//! Both lists are arenas of indices rather than pointers: `counters` is
+//! Both lists are arenas of indices rather than pointers: `monitored` is
 //! allocated once up to `capacity` and reused in place, and `buckets` recycles
 //! through a free list. Only the `(key, count, error)` triples reach the wire;
 //! the arenas and the key index are rebuilt from them on load.
@@ -40,7 +40,7 @@ const NIL: usize = usize::MAX;
 /// Counters in a default sketch.
 pub const SPACE_SAVING_DEFAULT_CAPACITY: usize = 1024;
 
-/// Counter positions sharing one digest. Two monitored keys colliding on a
+/// Positions of the monitored keys sharing one digest. Two monitored keys colliding on a
 /// 64-bit digest is rare enough that the inline pair is effectively never
 /// spilled.
 type Slot = SmallVec<[usize; 2]>;
@@ -49,7 +49,7 @@ type Index = HashMap<u64, Slot, DigestBuildHasher>;
 
 /// One monitored key.
 #[derive(Clone, Debug)]
-struct Counter {
+struct MonitoredKey {
     key: HeapItem,
     digest: u64,
     error: u64,
@@ -71,7 +71,7 @@ struct Bucket {
 #[derive(Clone, Debug)]
 pub struct SpaceSaving<H: SketchHasher = DefaultXxHasher> {
     capacity: usize,
-    counters: Vec<Counter>,
+    monitored: Vec<MonitoredKey>,
     buckets: Vec<Bucket>,
     bucket_free: Vec<usize>,
     bucket_head: usize,
@@ -80,7 +80,7 @@ pub struct SpaceSaving<H: SketchHasher = DefaultXxHasher> {
     total: u64,
     /// Largest count known to have left the summary, so the ceiling on any key
     /// that is no longer monitored.
-    floor: u64,
+    discarded_max: u64,
     _hasher: PhantomData<H>,
 }
 
@@ -96,14 +96,14 @@ impl<H: SketchHasher> SpaceSaving<H> {
         let capacity = capacity.max(1);
         Self {
             capacity,
-            counters: Vec::with_capacity(capacity),
+            monitored: Vec::with_capacity(capacity),
             buckets: Vec::new(),
             bucket_free: Vec::new(),
             bucket_head: NIL,
             bucket_tail: NIL,
             index: Index::with_capacity_and_hasher(capacity, DigestBuildHasher::default()),
             total: 0,
-            floor: 0,
+            discarded_max: 0,
             _hasher: PhantomData,
         }
     }
@@ -117,13 +117,13 @@ impl<H: SketchHasher> SpaceSaving<H> {
     /// Keys currently monitored.
     #[inline(always)]
     pub fn len(&self) -> usize {
-        self.counters.len()
+        self.monitored.len()
     }
 
     /// True while nothing has been recorded.
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.counters.is_empty()
+        self.monitored.is_empty()
     }
 
     /// Total weight recorded, monitored or displaced.
@@ -140,24 +140,24 @@ impl<H: SketchHasher> SpaceSaving<H> {
     /// nothing.
     #[inline(always)]
     pub fn min_count(&self) -> u64 {
-        let lowest = if self.counters.len() == self.capacity && self.bucket_head != NIL {
+        let lowest = if self.monitored.len() == self.capacity && self.bucket_head != NIL {
             self.buckets[self.bucket_head].count
         } else {
             0
         };
-        self.floor.max(lowest)
+        self.discarded_max.max(lowest)
     }
 
     /// Drops every counter.
     pub fn clear(&mut self) {
-        self.counters.clear();
+        self.monitored.clear();
         self.buckets.clear();
         self.bucket_free.clear();
         self.bucket_head = NIL;
         self.bucket_tail = NIL;
         self.index.clear();
         self.total = 0;
-        self.floor = 0;
+        self.discarded_max = 0;
     }
 
     /// Records one occurrence of `value`.
@@ -184,25 +184,25 @@ impl<H: SketchHasher> SpaceSaving<H> {
             return;
         }
 
-        if self.counters.len() < self.capacity {
-            let seated = self.floor.saturating_add(count);
-            let floor = self.floor;
-            self.seat(digest, input_to_owned(value), seated, floor);
+        if self.monitored.len() < self.capacity {
+            let seated = self.discarded_max.saturating_add(count);
+            let discarded_max = self.discarded_max;
+            self.seat(digest, input_to_owned(value), seated, discarded_max);
             return;
         }
 
         let victim = self.buckets[self.bucket_head].head;
         let lowest = self.buckets[self.bucket_head].count;
         debug_assert!(
-            self.floor <= lowest,
+            self.discarded_max <= lowest,
             "the ceiling {} sits above the lowest live count {lowest}",
-            self.floor
+            self.discarded_max
         );
-        self.floor = lowest;
-        self.unindex(self.counters[victim].digest, victim);
-        self.counters[victim].key = input_to_owned(value);
-        self.counters[victim].digest = digest;
-        self.counters[victim].error = lowest;
+        self.discarded_max = lowest;
+        self.unindex(self.monitored[victim].digest, victim);
+        self.monitored[victim].key = input_to_owned(value);
+        self.monitored[victim].digest = digest;
+        self.monitored[victim].error = lowest;
         self.index.entry(digest).or_default().push(victim);
         self.raise(victim, count);
     }
@@ -223,7 +223,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
     pub fn estimate(&self, value: &DataInput) -> u64 {
         let digest = H::hash64_seeded(0, value);
         match self.find(digest, value) {
-            Some(cid) => self.buckets[self.counters[cid].bucket].count,
+            Some(cid) => self.buckets[self.monitored[cid].bucket].count,
             None => 0,
         }
     }
@@ -236,7 +236,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
     pub fn upper_bound(&self, value: &DataInput) -> u64 {
         let digest = H::hash64_seeded(0, value);
         match self.find(digest, value) {
-            Some(cid) => self.buckets[self.counters[cid].bucket].count,
+            Some(cid) => self.buckets[self.monitored[cid].bucket].count,
             None => self.min_count(),
         }
     }
@@ -247,7 +247,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
     pub fn error(&self, value: &DataInput) -> u64 {
         let digest = H::hash64_seeded(0, value);
         match self.find(digest, value) {
-            Some(cid) => self.counters[cid].error,
+            Some(cid) => self.monitored[cid].error,
             None => self.min_count(),
         }
     }
@@ -258,8 +258,8 @@ impl<H: SketchHasher> SpaceSaving<H> {
         let digest = H::hash64_seeded(0, value);
         match self.find(digest, value) {
             Some(cid) => {
-                let count = self.buckets[self.counters[cid].bucket].count;
-                count.saturating_sub(self.counters[cid].error) > self.min_count()
+                let count = self.buckets[self.monitored[cid].bucket].count;
+                count.saturating_sub(self.monitored[cid].error) > self.min_count()
             }
             None => false,
         }
@@ -268,18 +268,18 @@ impl<H: SketchHasher> SpaceSaving<H> {
     /// The `k` monitored keys with the largest counts, highest first, as
     /// `(key, count, error)`.
     pub fn top_k(&self, k: usize) -> Vec<(HeapItem, u64, u64)> {
-        let mut out = Vec::with_capacity(k.min(self.counters.len()));
+        let mut out = Vec::with_capacity(k.min(self.monitored.len()));
         let mut bid = self.bucket_tail;
         while bid != NIL && out.len() < k {
             let count = self.buckets[bid].count;
             let mut cid = self.buckets[bid].head;
             while cid != NIL && out.len() < k {
                 out.push((
-                    self.counters[cid].key.clone(),
+                    self.monitored[cid].key.clone(),
                     count,
-                    self.counters[cid].error,
+                    self.monitored[cid].error,
                 ));
-                cid = self.counters[cid].next;
+                cid = self.monitored[cid].next;
             }
             bid = self.buckets[bid].prev;
         }
@@ -288,7 +288,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
 
     /// Every monitored key as `(key, count, error)`, in no particular order.
     pub fn entries(&self) -> Vec<(HeapItem, u64, u64)> {
-        self.counters
+        self.monitored
             .iter()
             .map(|c| (c.key.clone(), self.buckets[c.bucket].count, c.error))
             .collect()
@@ -305,13 +305,13 @@ impl<H: SketchHasher> SpaceSaving<H> {
     /// The `min_count` a one-sided key picks up is added weight that the stream
     /// never carried, so the merged counts sum to more than [`Self::total`] and
     /// an estimate divided by the total is no longer a frequency.
-    pub fn merge_from(&mut self, other: &Self) {
+    pub fn merge(&mut self, other: &Self) {
         let mine_min = self.min_count();
         let theirs_min = other.min_count();
 
         let mut merged: HashMap<u64, SmallVec<[MergeEntry; 2]>, DigestBuildHasher> =
             HashMap::default();
-        for c in &self.counters {
+        for c in &self.monitored {
             merged.entry(c.digest).or_default().push(MergeEntry {
                 key: c.key.clone(),
                 digest: c.digest,
@@ -320,7 +320,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
                 paired: false,
             });
         }
-        for c in &other.counters {
+        for c in &other.monitored {
             let count = other.buckets[c.bucket].count;
             let slot = merged.entry(c.digest).or_default();
             match slot.iter_mut().find(|entry| entry.key == c.key) {
@@ -349,20 +349,19 @@ impl<H: SketchHasher> SpaceSaving<H> {
         flat.sort_unstable_by(|a, b| {
             b.count
                 .cmp(&a.count)
-                .then_with(|| a.digest.cmp(&b.digest))
                 .then_with(|| key_order(&a.key).cmp(&key_order(&b.key)))
         });
 
-        let mut floor = mine_min.saturating_add(theirs_min);
+        let mut discarded_max = mine_min.saturating_add(theirs_min);
         if flat.len() > self.capacity {
-            floor = floor.max(flat[self.capacity].count);
+            discarded_max = discarded_max.max(flat[self.capacity].count);
             flat.truncate(self.capacity);
         }
 
         let total = self.total.saturating_add(other.total);
         self.clear();
         self.total = total;
-        self.floor = floor;
+        self.discarded_max = discarded_max;
         for entry in flat {
             self.seat(entry.digest, entry.key, entry.count, entry.error);
         }
@@ -374,7 +373,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
         self.index.get(&digest).and_then(|ids| {
             ids.iter()
                 .copied()
-                .find(|cid| self.counters[*cid].key == *value)
+                .find(|cid| self.monitored[*cid].key == *value)
         })
     }
 
@@ -382,7 +381,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
         self.index.get(&digest).and_then(|ids| {
             ids.iter()
                 .copied()
-                .find(|cid| self.counters[*cid].key == *key)
+                .find(|cid| self.monitored[*cid].key == *key)
         })
     }
 
@@ -397,8 +396,8 @@ impl<H: SketchHasher> SpaceSaving<H> {
 
     /// Takes a free counter for `key` at `count` with `error`.
     fn seat(&mut self, digest: u64, key: HeapItem, count: u64, error: u64) {
-        let cid = self.counters.len();
-        self.counters.push(Counter {
+        let cid = self.monitored.len();
+        self.monitored.push(MonitoredKey {
             key,
             digest,
             error,
@@ -413,7 +412,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
 
     /// Moves `cid` up by `count`, creating the destination bucket if needed.
     fn raise(&mut self, cid: usize, count: u64) {
-        let from = self.counters[cid].bucket;
+        let from = self.monitored[cid].bucket;
         let target_count = self.buckets[from].count.saturating_add(count);
         if target_count == self.buckets[from].count {
             return;
@@ -475,30 +474,30 @@ impl<H: SketchHasher> SpaceSaving<H> {
 
     fn attach(&mut self, cid: usize, bid: usize) {
         let head = self.buckets[bid].head;
-        self.counters[cid].prev = NIL;
-        self.counters[cid].next = head;
-        self.counters[cid].bucket = bid;
+        self.monitored[cid].prev = NIL;
+        self.monitored[cid].next = head;
+        self.monitored[cid].bucket = bid;
         if head != NIL {
-            self.counters[head].prev = cid;
+            self.monitored[head].prev = cid;
         }
         self.buckets[bid].head = cid;
     }
 
     fn detach(&mut self, cid: usize) {
-        let bid = self.counters[cid].bucket;
-        let prev = self.counters[cid].prev;
-        let next = self.counters[cid].next;
+        let bid = self.monitored[cid].bucket;
+        let prev = self.monitored[cid].prev;
+        let next = self.monitored[cid].next;
         if prev != NIL {
-            self.counters[prev].next = next;
+            self.monitored[prev].next = next;
         } else {
             self.buckets[bid].head = next;
         }
         if next != NIL {
-            self.counters[next].prev = prev;
+            self.monitored[next].prev = prev;
         }
-        self.counters[cid].prev = NIL;
-        self.counters[cid].next = NIL;
-        self.counters[cid].bucket = NIL;
+        self.monitored[cid].prev = NIL;
+        self.monitored[cid].next = NIL;
+        self.monitored[cid].bucket = NIL;
         if self.buckets[bid].head == NIL {
             self.drop_bucket(bid);
         }
@@ -533,8 +532,7 @@ struct MergeEntry {
     paired: bool,
 }
 
-/// A total order over keys, breaking the merge ties that counts and digests
-/// leave open.
+/// A total order over keys, breaking the ties that counts leave open.
 fn key_order(key: &HeapItem) -> (u8, u128, &[u8]) {
     match key {
         HeapItem::I8(v) => (0, *v as i128 as u128, b""),
@@ -562,7 +560,7 @@ fn key_order(key: &HeapItem) -> (u8, u128, &[u8]) {
 struct SpaceSavingRef<'a> {
     capacity: usize,
     total: u64,
-    floor: u64,
+    discarded_max: u64,
     entries: Vec<(&'a HeapItem, u64, u64)>,
 }
 
@@ -570,7 +568,7 @@ struct SpaceSavingRef<'a> {
 struct SpaceSavingState {
     capacity: usize,
     total: u64,
-    floor: u64,
+    discarded_max: u64,
     entries: Vec<(HeapItem, u64, u64)>,
 }
 
@@ -579,9 +577,9 @@ impl<H: SketchHasher> Serialize for SpaceSaving<H> {
         SpaceSavingRef {
             capacity: self.capacity,
             total: self.total,
-            floor: self.floor,
+            discarded_max: self.discarded_max,
             entries: self
-                .counters
+                .monitored
                 .iter()
                 .map(|c| (&c.key, self.buckets[c.bucket].count, c.error))
                 .collect(),
@@ -629,14 +627,14 @@ impl<H: SketchHasher> SpaceSaving<H> {
 
         let mut summary = Self {
             capacity: state.capacity,
-            counters: Vec::with_capacity(entries.len()),
+            monitored: Vec::with_capacity(entries.len()),
             buckets: Vec::new(),
             bucket_free: Vec::new(),
             bucket_head: NIL,
             bucket_tail: NIL,
             index: Index::with_capacity_and_hasher(entries.len(), DigestBuildHasher::default()),
             total: state.total,
-            floor: state.floor,
+            discarded_max: state.discarded_max,
             _hasher: PhantomData,
         };
         for (key, count, error) in entries {
@@ -648,19 +646,19 @@ impl<H: SketchHasher> SpaceSaving<H> {
         }
 
         let smallest = summary
-            .counters
+            .monitored
             .iter()
             .map(|c| summary.buckets[c.bucket].count)
             .min()
             .unwrap_or(0);
-        if summary.floor > smallest {
+        if summary.discarded_max > smallest {
             return Err(format!(
                 "space-saving carries a ceiling of {} above its lowest count of {smallest}",
-                summary.floor
+                summary.discarded_max
             ));
         }
         let recorded = summary
-            .counters
+            .monitored
             .iter()
             .map(|c| summary.buckets[c.bucket].count.saturating_sub(c.error))
             .fold(0u64, u64::saturating_add);
@@ -679,14 +677,14 @@ impl<H: SketchHasher> SpaceSaving<H> {
     /// Checks every Stream-Summary invariant: both directions of both linked
     /// lists, strict count ordering, arena bookkeeping and index agreement.
     fn validate(&self) -> Result<(), String> {
-        if self.counters.len() > self.capacity {
+        if self.monitored.len() > self.capacity {
             return Err(format!(
                 "{} counters over a capacity of {}",
-                self.counters.len(),
+                self.monitored.len(),
                 self.capacity
             ));
         }
-        if self.counters.is_empty() != (self.bucket_head == NIL) {
+        if self.monitored.is_empty() != (self.bucket_head == NIL) {
             return Err("the bucket list disagrees with counter residency".to_string());
         }
 
@@ -737,20 +735,20 @@ impl<H: SketchHasher> SpaceSaving<H> {
             return Err("the bucket list reads differently in each direction".to_string());
         }
 
-        let mut seen = vec![false; self.counters.len()];
+        let mut seen = vec![false; self.monitored.len()];
         for bid in &live {
             let count = self.buckets[*bid].count;
             let mut chain: Vec<usize> = Vec::new();
             let mut previous = NIL;
             let mut cid = self.buckets[*bid].head;
             while cid != NIL {
-                if cid >= self.counters.len() {
+                if cid >= self.monitored.len() {
                     return Err(format!("counter {cid} is outside the arena"));
                 }
                 if seen[cid] {
                     return Err(format!("counter {cid} is reached twice"));
                 }
-                let counter = &self.counters[cid];
+                let counter = &self.monitored[cid];
                 if counter.prev != previous {
                     return Err(format!("counter {cid} does not point back at {previous}"));
                 }
@@ -776,7 +774,7 @@ impl<H: SketchHasher> SpaceSaving<H> {
                     return Err(format!("bucket {bid}'s counter list cycles backwards"));
                 }
                 backwards.push(cid);
-                cid = self.counters[cid].prev;
+                cid = self.monitored[cid].prev;
             }
             backwards.reverse();
             if backwards != chain {
@@ -813,19 +811,19 @@ impl<H: SketchHasher> SpaceSaving<H> {
             ));
         }
 
-        let mut indexed = vec![false; self.counters.len()];
+        let mut indexed = vec![false; self.monitored.len()];
         for (digest, slot) in &self.index {
             if slot.is_empty() {
                 return Err(format!("digest {digest} indexes nothing"));
             }
             for cid in slot {
-                if *cid >= self.counters.len() {
+                if *cid >= self.monitored.len() {
                     return Err(format!("digest {digest} indexes counter {cid}"));
                 }
                 if indexed[*cid] {
                     return Err(format!("counter {cid} is indexed twice"));
                 }
-                if self.counters[*cid].digest != *digest {
+                if self.monitored[*cid].digest != *digest {
                     return Err(format!("counter {cid} is filed under the wrong digest"));
                 }
                 indexed[*cid] = true;
@@ -1027,7 +1025,7 @@ mod tests {
         right.insert_many(&DataInput::I64(3), 100);
         right.insert_many(&DataInput::I64(4), 50);
 
-        left.merge_from(&right);
+        left.merge(&right);
 
         left.validate().expect("after a saturating merge");
         assert_eq!(left.len(), 2);
@@ -1048,7 +1046,7 @@ mod tests {
         source.insert_many(&DataInput::I64(dropped), ceiling - 1);
         source.insert(&DataInput::I64(held));
         let mut summary: SpaceSaving = SpaceSaving::with_capacity(capacity);
-        summary.merge_from(&source);
+        summary.merge(&source);
         assert_eq!(summary.min_count(), ceiling, "the fixture ceiling");
         summary
     }
@@ -1087,7 +1085,7 @@ mod tests {
     fn a_merge_saturates_a_shared_keys_count() {
         let (mut left, right) = a_saturated_overlap();
 
-        left.merge_from(&right);
+        left.merge(&right);
 
         left.validate().expect("after a saturating merge");
         assert_eq!(left.len(), 1);
@@ -1104,7 +1102,7 @@ mod tests {
     fn a_merge_saturates_a_shared_keys_error() {
         let (mut left, right) = a_saturated_overlap();
 
-        left.merge_from(&right);
+        left.merge(&right);
 
         left.validate().expect("after a saturating merge");
         assert_eq!(
@@ -1128,7 +1126,7 @@ mod tests {
         let mut right: SpaceSaving = SpaceSaving::with_capacity(4);
         right.insert_many(&DataInput::I64(3), 7);
 
-        left.merge_from(&right);
+        left.merge(&right);
 
         left.validate().expect("after a saturating merge");
         assert_eq!(
@@ -1148,7 +1146,7 @@ mod tests {
         left.insert_many(&DataInput::I64(3), 7);
         let right = ceilinged(4, u64::MAX - 3, 8, 9);
 
-        left.merge_from(&right);
+        left.merge(&right);
 
         left.validate().expect("after a saturating merge");
         assert_eq!(
@@ -1167,7 +1165,7 @@ mod tests {
         let mut left = ceilinged(4, u64::MAX - 3, 8, 9);
         let right = ceilinged(4, 10, 5, 6);
 
-        left.merge_from(&right);
+        left.merge(&right);
 
         left.validate().expect("after a saturating merge");
         assert_eq!(left.min_count(), u64::MAX, "the merged ceiling wrapped");
@@ -1179,7 +1177,7 @@ mod tests {
         );
     }
 
-    /// The ceiling a merge leaves behind lives only in `floor`; an under-full
+    /// The ceiling a merge leaves behind lives only in `discarded_max`; an under-full
     /// summary reads it from no counter, so a serde round trip that dropped it
     /// would answer below the truth.
     #[test]
@@ -1192,7 +1190,7 @@ mod tests {
         for _ in 0..20 {
             right.insert(&DataInput::I64(8));
         }
-        left.merge_from(&right);
+        left.merge(&right);
         assert!(left.len() < left.capacity(), "the merge left room to spare");
         assert_eq!(left.min_count(), 30);
 
@@ -1288,7 +1286,7 @@ mod tests {
             right.insert(&DataInput::I64(8));
         }
 
-        left.merge_from(&right);
+        left.merge(&right);
 
         left.validate()
             .expect("after merging into an empty summary");
@@ -1303,6 +1301,85 @@ mod tests {
         assert!(
             !left.is_guaranteed(&DataInput::I64(8)),
             "nothing outranks a ceiling it does not clear"
+        );
+    }
+
+    /// A count tie straddling the capacity boundary is cut by `key_order`
+    /// alone, so a truncating merge keeps the keys the encoder emits first and
+    /// the digests do not choose the survivors.
+    #[test]
+    fn a_truncating_merge_keeps_the_keys_the_encoder_emits_first() {
+        fn left_side() -> SpaceSaving {
+            let mut left: SpaceSaving = SpaceSaving::with_capacity(4);
+            left.insert_many(&DataInput::I64(1), 9);
+            for key in [10i64, 20, 30] {
+                left.insert_many(&DataInput::I64(key), 3);
+            }
+            left
+        }
+        fn right_side() -> SpaceSaving {
+            let mut right: SpaceSaving = SpaceSaving::with_capacity(3);
+            for key in [40i64, 50, 60] {
+                right.insert_many(&DataInput::I64(key), 2);
+            }
+            right
+        }
+        fn keys_of(summary: &SpaceSaving) -> Vec<i64> {
+            summary
+                .entries()
+                .iter()
+                .map(|(key, _, _)| match key {
+                    HeapItem::I64(v) => *v,
+                    other => panic!("unexpected key form {other:?}"),
+                })
+                .collect()
+        }
+        fn sorted_keys(summary: &SpaceSaving) -> Vec<i64> {
+            let mut keys = keys_of(summary);
+            keys.sort_unstable();
+            keys
+        }
+
+        let mut merged = left_side();
+        merged.merge(&right_side());
+        merged.validate().expect("after a truncating merge");
+        let mut swapped = right_side();
+        swapped.merge(&left_side());
+        swapped.validate().expect("after the swapped merge");
+
+        for key in [10i64, 20, 30, 40, 50, 60] {
+            assert_eq!(
+                merged.upper_bound(&DataInput::I64(key)),
+                5,
+                "key {key} did not join the tie at the capacity boundary"
+            );
+        }
+        assert_eq!(
+            sorted_keys(&merged),
+            vec![1, 10, 20, 30],
+            "the tie was cut somewhere other than the key order"
+        );
+        assert_eq!(
+            sorted_keys(&swapped),
+            vec![1, 10, 20],
+            "a narrower cut of the same tie did not follow the key order"
+        );
+        for dropped in [40i64, 50, 60] {
+            assert!(
+                key_order(&HeapItem::I64(30)) < key_order(&HeapItem::I64(dropped)),
+                "key {dropped} was dropped although it sorts before the last survivor"
+            );
+        }
+
+        let bytes = merged
+            .serialize_to_bytes()
+            .expect("serialize the survivors");
+        let emitted: SpaceSaving =
+            SpaceSaving::deserialize_from_bytes(&bytes).expect("deserialize the survivors");
+        assert_eq!(
+            keys_of(&emitted),
+            vec![1, 10, 20, 30],
+            "the encoder emits an order the merge did not keep"
         );
     }
 
@@ -1324,9 +1401,9 @@ mod tests {
             right.insert(&DataInput::I64(10));
         }
 
-        left.merge_from(&middle);
+        left.merge(&middle);
         left.validate().expect("after the first merge");
-        left.merge_from(&right);
+        left.merge(&right);
         left.validate().expect("after the second merge");
 
         assert!(left.len() < left.capacity(), "the chain left room to spare");
@@ -1350,7 +1427,7 @@ mod tests {
         for _ in 0..30 {
             right.insert(&DataInput::I64(8));
         }
-        left.merge_from(&right);
+        left.merge(&right);
 
         let ceiling = left.min_count();
         left.insert(&DataInput::I64(7));
@@ -1393,9 +1470,9 @@ mod tests {
             let (right, right_truth) = fuzzed(2, 80, 700, seed ^ 0xabcd);
             let (third, third_truth) = fuzzed(capacity + 5, 70, 500, seed ^ 0x1234);
 
-            left.merge_from(&right);
+            left.merge(&right);
             left.validate().expect("after the first merge");
-            left.merge_from(&third);
+            left.merge(&third);
             left.validate().expect("after the second merge");
 
             for (key, count) in right_truth.iter().chain(third_truth.iter()) {
@@ -1441,7 +1518,7 @@ mod tests {
         let over_capacity = SpaceSavingState {
             capacity: 1,
             total: 4,
-            floor: 0,
+            discarded_max: 0,
             entries: vec![(HeapItem::I64(1), 2, 0), (HeapItem::I64(2), 2, 0)],
         };
         let cases = [
@@ -1449,7 +1526,7 @@ mod tests {
                 SpaceSavingState {
                     capacity: 0,
                     total: 0,
-                    floor: 0,
+                    discarded_max: 0,
                     entries: Vec::new(),
                 },
                 "capacity is zero",
@@ -1459,7 +1536,7 @@ mod tests {
                 SpaceSavingState {
                     capacity: 4,
                     total: 1,
-                    floor: 0,
+                    discarded_max: 0,
                     entries: vec![(HeapItem::I64(1), 0, 0)],
                 },
                 "at zero",
@@ -1468,7 +1545,7 @@ mod tests {
                 SpaceSavingState {
                     capacity: 4,
                     total: 1,
-                    floor: 0,
+                    discarded_max: 0,
                     entries: vec![(HeapItem::I64(1), 3, 4)],
                 },
                 "error of 4",
@@ -1477,7 +1554,7 @@ mod tests {
                 SpaceSavingState {
                     capacity: 4,
                     total: 2,
-                    floor: 0,
+                    discarded_max: 0,
                     entries: vec![(HeapItem::I64(1), 2, 0), (HeapItem::I64(1), 1, 0)],
                 },
                 "same key twice",
@@ -1486,7 +1563,7 @@ mod tests {
                 SpaceSavingState {
                     capacity: 4,
                     total: 3,
-                    floor: u64::MAX,
+                    discarded_max: u64::MAX,
                     entries: vec![(HeapItem::I64(1), 3, 0)],
                 },
                 "ceiling of 18446744073709551615 above its lowest count of 3",
@@ -1495,7 +1572,7 @@ mod tests {
                 SpaceSavingState {
                     capacity: 4,
                     total: 0,
-                    floor: 0,
+                    discarded_max: 0,
                     entries: vec![(HeapItem::I64(1), 9, 0)],
                 },
                 "total of 0 under the 9",
@@ -1516,7 +1593,7 @@ mod tests {
         let state = SpaceSavingState {
             capacity: 1 << 40,
             total: 3,
-            floor: 0,
+            discarded_max: 0,
             entries: vec![(HeapItem::I64(1), 3, 0)],
         };
         let summary = SpaceSaving::<DefaultXxHasher>::rebuild(state).expect("a sparse state");
@@ -1613,7 +1690,7 @@ mod tests {
         right.insert_many(&DataInput::Bytes(RAW), 2);
         right.insert_many(&DataInput::Bytes(&[0x02]), 7);
 
-        left.merge_from(&right);
+        left.merge(&right);
 
         left.validate().expect("after a byte-key merge");
         assert_eq!(left.len(), 3);
@@ -1750,7 +1827,7 @@ mod collisions {
         right.insert_many(&DataInput::I64(10), 2);
         right.insert_many(&DataInput::I64(30), 7);
 
-        left.merge_from(&right);
+        left.merge(&right);
 
         left.validate().expect("after a colliding merge");
         assert_eq!(left.len(), 3);
@@ -1774,11 +1851,11 @@ mod collisions {
                 right.insert(&DataInput::I64(key));
             }
             if swap {
-                right.merge_from(&left);
+                right.merge(&left);
                 right.validate().expect("after a colliding merge");
                 keys_of(&right)
             } else {
-                left.merge_from(&right);
+                left.merge(&right);
                 left.validate().expect("after a colliding merge");
                 keys_of(&left)
             }
@@ -1810,7 +1887,7 @@ mod collisions {
         let repeated = SpaceSavingState {
             capacity: 4,
             total: 9,
-            floor: 0,
+            discarded_max: 0,
             entries: vec![(HeapItem::I64(10), 5, 0), (HeapItem::I64(10), 4, 0)],
         };
         let problem = Colliding::rebuild(repeated).expect_err("a repeated key");

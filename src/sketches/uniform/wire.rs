@@ -60,7 +60,7 @@ fn us_metadata(sample_rate: f64) -> UsMetadata {
     }
 }
 
-/// UniformSampling payload (ASAPv1 §3.8), a msgpack **array** (`to_vec`,
+/// UniformSampling payload (ASAPv1 §3.13), a msgpack **array** (`to_vec`,
 /// positional): `[priorities, values, total_seen, rng_state]`.
 ///
 /// `priorities` and `values` are parallel and equal-length; the number of

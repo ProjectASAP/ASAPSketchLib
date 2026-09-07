@@ -14,12 +14,13 @@
 //! metadata, so the payload itself is just `[counts]` (a 1-element array
 //! mirroring Count-Min's).
 //!
-//! Wire counter types are `i32` and `i64`. Count Sketch counters must be signed
-//! and negatable ([`CountSketchCounter`] requires `Neg` + `From<i32>`), so
-//! Count-Min's `f64` has no counterpart here, and `i128` has no msgpack integer
-//! form. `i32` is carried at its own width rather than widened, because a
-//! nested Count Sketch — the `Vector2D<i32>` counters `HydraCounter` and
-//! `EHSketchList` hold — must decode back into the type it was stored as.
+//! Wire counter types are `i32` and `i64` — the two [`CsWireCounter`] is
+//! implemented for. Count-Min's `f64` has no counterpart here because
+//! [`CountSketchCounter`] is implemented only for `i32`, `i64` and `i128`, so
+//! `f64` is not a Count Sketch counter at all; `i128` is a counter but has no
+//! msgpack integer form. `i32` is carried at its own width rather than widened,
+//! because a nested Count Sketch — the `Vector2D<i32>` counters `HydraCounter`
+//! and `EHSketchList` hold — must decode back into the type it was stored as.
 //!
 //! [`CountSketchCounter`]: crate::sketches::countsketch::CountSketchCounter
 
@@ -139,6 +140,13 @@ where
         let rows = self.counts.rows();
         let cols = self.counts.cols();
         let counts = self.counts.as_slice();
+        // The decoder refuses a zero dimension, so the encoder must too: with
+        // `rows == 0` the length check below passes trivially (`0 == 0*cols`).
+        if rows == 0 || cols == 0 {
+            return Err(RmpEncodeError::Syntax(format!(
+                "ASAPv1 Count Sketch envelope: dimensions must be non-zero: rows={rows}, cols={cols}"
+            )));
+        }
         check_matrix_rows("Count Sketch", rows)
             .map_err(|e| RmpEncodeError::Syntax(format!("ASAPv1 Count Sketch envelope: {e}")))?;
         if counts.len() != rows.saturating_mul(cols) {
@@ -148,9 +156,14 @@ where
                 rows.saturating_mul(cols)
             )));
         }
+        let cols_u32 = u32::try_from(cols).map_err(|_| {
+            RmpEncodeError::Syntax(format!(
+                "ASAPv1 Count Sketch envelope: cols {cols} exceeds u32"
+            ))
+        })?;
         let metadata = rmp_serde::to_vec_named(&cs_metadata::<H>(
             rows as u32,
-            cols as u32,
+            cols_u32,
             T::COUNTER_TYPE,
             Mode::MODE,
         ))?;
@@ -439,6 +452,21 @@ mod tests {
             sketch.serialize_to_bytes().is_err(),
             "a matrix whose cell count disagrees with its dimensions must not serialize"
         );
+    }
+
+    /// A `rows == 0` matrix satisfies the length check trivially (`0 == 0*cols`)
+    /// but is refused on decode, so serializing it must fail rather than emit
+    /// bytes the format would not read back.
+    #[test]
+    fn count_sketch_rejects_serializing_zero_rows() {
+        let sketch =
+            Count::<Vector2D<i64>, RegularPath>::from_storage(Vector2D::from_fn(0, 4, |_, _| 0i64));
+        assert_eq!(sketch.rows(), 0);
+        let problem = sketch
+            .serialize_to_bytes()
+            .expect_err("a zero-row matrix must not serialize")
+            .to_string();
+        assert!(problem.contains("non-zero"), "got {problem}");
     }
 
     /// Fail closed on an unexpected metadata key (mirrors the CMS/HLL tests).

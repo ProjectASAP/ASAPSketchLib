@@ -19,9 +19,6 @@ fn main() {
     for v in &values {
         sketch.update(v);
     }
-    // Batch path (exactly equivalent, empty is a no-op):
-    // let mut sketch = KLL::<i64>::init_kll(200);
-    // sketch.bulk_update(&values);
 
     // Build the CDF once after all insertions; subsequent queries are O(log n).
     let cdf: Cdf = sketch.cdf();

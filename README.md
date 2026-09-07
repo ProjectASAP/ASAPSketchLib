@@ -20,9 +20,9 @@ A Rust library for **streaming data sketches** — compact data structures that 
 | Frequency estimation | `CountMin`, `Count` | Fast approximate counts for high-volume keys | Estimates how often each key appears in a stream | `df.group_by("key").agg(pl.len())` |
 | Heavy hitters / frequent items | `SpaceSaving`, `CMSHeap`, `CSHeap` | The top-k keys and their counts under a fixed memory budget | Tracks the most frequent keys of a stream, each with a per-key error bound | `df["key"].value_counts().top_k(10, by="count")` |
 | Approximate set membership | `Bloom` | Cheap "have I seen this key?" checks at a chosen false-positive rate | Answers membership with no false negatives and a bounded false-positive rate | `df["key"].is_in(seen)` — exact, but stores every key |
-| Cardinality estimation | `HyperLogLog` (`Classic`, `ErtlMLE`, `HIP`) | Approximate distinct counts with bounded memory | Estimates the number of unique elements | `df["col"].n_unique()` |
+| Cardinality estimation | `HyperLogLog`, `HyperLogLogHIP` | Approximate distinct counts with bounded memory | Estimates the number of unique elements | `df["col"].n_unique()` |
 | Quantiles / distribution | `KLL`, `DDSketch`, `UnivMonQ` (experimental) | Percentiles alone, or percentiles sharing state with universal frequency metrics | Approximates arbitrary quantiles (e.g. p50, p99) of a value distribution | `df["col"].quantile(0.99)` |
-| Subpopulation queries | `Hydra` | Hierarchical / filtered sketch queries | Answers sketch queries over arbitrary subpopulations without maintaining per-group sketches | No direct equivalent — requires per-group aggregation |
+| Subpopulation queries | `Hydra` | Filtered sketch queries | Answers sketch queries over arbitrary subpopulations without maintaining per-group sketches | No direct equivalent — requires per-group aggregation |
 | Universal monitoring | `UnivMon` | G-sum queries (L1/L2 norms, cardinality, entropy) | Estimates a broad class of streaming statistics in a single pass | No direct equivalent — requires custom multi-pass pipelines |
 | Universal monitoring + quantiles | `UnivMonQ` (experimental) | One mergeable structure for frequencies, F0/F2/compatible g-sums, entropy, heavy hitters, ranks, and quantiles | Extends a terminal-stratum UnivMon core with an adaptively assisted occurrence sample | No direct equivalent — requires multiple aggregations |
 | Update acceleration | `NitroBatch` | Batch-accelerated sketch updates | Speeds up sketch insertions by batching updates | No direct equivalent |
@@ -41,7 +41,7 @@ cargo add asap_sketchlib
 
 ```toml
 [dependencies]
-asap_sketchlib = "0.2"
+asap_sketchlib = "0.3"
 ```
 
 API docs are hosted on [docs.rs](https://docs.rs/asap_sketchlib).
@@ -188,7 +188,7 @@ Benchmark methodology, tuning notes, and performance details (including cache-fr
 | Doc | Contents |
 | --- | --- |
 | [APIs Index](./docs/apis.md) | Per-sketch API reference with status and error guarantees |
-| [Advanced Use Cases](./docs/advanced_use_cases.md) | Hierarchical queries, windowed sketching, multi-sketch coordination |
+| [Advanced Use Cases](./docs/advanced_use_cases.md) | Subpopulation queries, windowed sketching, multi-sketch coordination |
 | [Docs Index](./docs/index.md) | Full documentation index |
 
 If you are evaluating the crate for production use, start with the API index first. It calls out which APIs are stable today and which are still feature-gated or experimental.

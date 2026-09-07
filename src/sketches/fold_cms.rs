@@ -1060,9 +1060,74 @@ mod tests {
 
         let flat = fold.to_flat_counters();
         let std_flat = standard.as_storage().as_slice();
+        assert_eq!(
+            flat.len(),
+            std_flat.len(),
+            "the flattened counters must cover the whole rows x cols matrix"
+        );
         for (i, (f, s)) in flat.iter().zip(std_flat.iter()).enumerate() {
             assert_eq!(*f, *s, "flat counter mismatch at [{i}]: fold={f}, std={s}");
         }
+    }
+
+    // -- Serde round trip ---------------------------------------------------
+
+    /// The derived serde form is the only serialization FoldCMS has, so the
+    /// round trip has to carry the whole sketch: the folded cells with their
+    /// permanent `full_col` tags, the geometry the unfold path reads, and the
+    /// heavy-hitter heap (whose index is rebuilt on load rather than carried).
+    #[test]
+    fn serde_round_trip_keeps_the_cells_the_geometry_and_the_heap() {
+        let rows = 3;
+        let full_cols = 4096;
+        let fold_level = 4;
+        let top_k = 16;
+
+        let mut sk: FoldCMS = FoldCMS::new(rows, full_cols, fold_level, top_k);
+        let stream = sample_zipf_u64(2_000, 1.2, 20_000, 0x5EED_C45C);
+        for &value in &stream {
+            sk.insert(&DataInput::U64(value), 1);
+        }
+        assert!(
+            sk.collided_cells() > 0,
+            "the fixture should exercise collided cells, not just Single ones"
+        );
+
+        let bytes = rmp_serde::to_vec(&sk).expect("encode");
+        let restored: FoldCMS = rmp_serde::from_slice(&bytes).expect("decode");
+
+        assert_eq!(restored.rows(), sk.rows());
+        assert_eq!(restored.fold_cols(), sk.fold_cols());
+        assert_eq!(restored.full_cols(), sk.full_cols());
+        assert_eq!(restored.fold_level(), sk.fold_level());
+        assert_eq!(restored.total_entries(), sk.total_entries());
+        assert_eq!(restored.collided_cells(), sk.collided_cells());
+        assert_eq!(restored.to_flat_counters(), sk.to_flat_counters());
+
+        for value in 0..2_000u64 {
+            let key = DataInput::U64(value);
+            assert_eq!(
+                restored.query(&key),
+                sk.query(&key),
+                "estimate for {value} moved across the round trip"
+            );
+        }
+
+        let before = sk.heap().heap();
+        let after = restored.heap().heap();
+        assert_eq!(after.len(), before.len(), "heap size moved");
+        assert_eq!(after.len(), top_k, "the fixture should fill the heap");
+        for (a, b) in after.iter().zip(before.iter()) {
+            assert_eq!(a.key, b.key, "heap order moved across the round trip");
+            assert_eq!(a.count, b.count, "heap count moved across the round trip");
+        }
+        // The heap's key index is `#[serde(skip)]` and rebuilt on load, so a
+        // lookup has to work on the decoded side too.
+        let resident = before[0].key.clone();
+        assert!(
+            restored.heap().find_heap_item(&resident).is_some(),
+            "the rebuilt heap index cannot find its own resident"
+        );
     }
 
     // -- Memory efficiency --------------------------------------------------
@@ -1352,7 +1417,6 @@ mod tests {
         let cols = 256;
         let fold_level = 4;
 
-        // let mut sk: FoldCMS = FoldCMS::new(rows, cols, fold_level, 10);
         let mut sk = FoldCMS::<DefaultXxHasher>::new(rows, cols, fold_level, 10);
         for i in 0..40 {
             sk.insert(&DataInput::U64(i), (i + 1) as i64);

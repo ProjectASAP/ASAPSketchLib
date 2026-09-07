@@ -4,10 +4,7 @@ This document explains how the end-to-end testing harness is designed and how
 to use it when adding or changing a sketch. The short version, in two parts:
 
 1. **Every public instance is driven by seeded synthetic data and compared
-   against exactly-known ground truth.** Which instances those are, and which
-   test covers each, is enumerated in
-   [`docs/e2e_coverage_matrix.md`](./e2e_coverage_matrix.md) — that document,
-   not this one, is the authority on what is and is not covered.
+   against exactly-known ground truth.**
 2. **Every approximate answer is judged against its own family's bound.** The
    conformance batteries are a shared floor for capabilities a sketch has in
    common with others; they are not where a family's guarantee is asserted.
@@ -19,7 +16,6 @@ is a battery pass on its own.
 
 Related reading:
 
-- [`docs/e2e_coverage_matrix.md`](./e2e_coverage_matrix.md) — instance → test → bound
 - [`tests/README.md`](../tests/README.md) — quick onboarding recipe
 - [`tests/common/specs.rs`](../tests/common/specs.rs) — the error-model specs
 - [`tests/common/conformance.rs`](../tests/common/conformance.rs) — the capability kit
@@ -59,8 +55,7 @@ Tightening the bounds to the ones each family actually promises surfaced more:
 a missing `ELASTIC` arm in `EHSketchList::merge` that silently discarded every
 bucket merge in an exponential histogram, HLL Classic's accuracy cliff at the
 linear-counting switchover, and a structural coupling in `EHUnivOptimized` that
-makes its sketch-tier cardinality unrecoverable. See the findings section of
-the coverage matrix.
+makes its sketch-tier cardinality unrecoverable.
 
 ## Architecture
 
@@ -152,15 +147,10 @@ answers `sorted[ceil(q·n) − 1]` while the portable `DdSketch::quantile` answe
 `sorted[floor(q·(n−1))]`, so `DdRankConvention` carries the choice and each is
 scored on the question it actually answers.
 
-### Six statuses, not two
-
-The coverage matrix labels every row `theorem`, `asymptotic model`, `empirical`,
-`structural`, `regression`, or `gap`. Two of those distinctions are easy to
-lose:
+Two distinctions are easy to lose:
 
 - an **exactly derived standard deviation** is not a tail bound. `z · σ` for HLL
-  or KMV becomes a failure probability only under a normal approximation, so
-  those rows are `asymptotic model`;
+  or KMV becomes a failure probability only under a normal approximation;
 - an **empirical fit imported from another implementation** is not a theorem.
   KLL's `ε(k)` is DataSketches' characterization constant, so its tests are
   named `..._characterization`, never `..._theorem`.
@@ -218,11 +208,10 @@ What does split is a suite held together by something other than its subject.
 `e2e_experimental.rs` groups sketches by cargo feature; Space-Saving, CocoSketch
 and the Elastic sketch sit in `e2e_heavy_hitters.rs` instead, organised by what
 they are: heavy-hitter sketches, which answer *which flows are big* from a flow
-key kept beside every counter. The `experimental` gate rides on the two sketches
-that need it, not on the suite, so the default-feature run still gets
-Space-Saving. `e2e_octo.rs` holds the multi-threaded Octo variants of Coco and
-Elastic, in its own `heavy_hitters` module, beside the rest of the promotion
-protocol.
+key kept beside every counter. None of the three is feature-gated, so the
+default-feature run gets all of them. `e2e_octo.rs` holds the multi-threaded
+Octo variants of Coco and Elastic, in its own `heavy_hitters` module, beside
+the rest of the promotion protocol.
 
 ## Onboarding a new sketch
 

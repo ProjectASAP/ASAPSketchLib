@@ -121,6 +121,33 @@ fn validated_hll_payload<'a, H: HashProfile>(
     Ok(payload)
 }
 
+/// Rejects a register bin holding a rank no insert could have produced. A
+/// register holds a rank of at most `REGISTER_BITS + 1`, so a byte above that
+/// bound is an impossible state. Both directions call this, so the encode and
+/// decode predicates cannot drift.
+fn check_register_range<Registers: HllRegisterStorage>(registers: &[u8]) -> Result<(), String> {
+    let max_rank = (Registers::REGISTER_BITS + 1) as u8;
+    match registers.iter().find(|&&rank| rank > max_rank) {
+        Some(&rank) => Err(format!(
+            "HLL register value {rank} exceeds the maximum rank {max_rank} at precision {}",
+            Registers::PRECISION
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The register bin to serialize, or an error when the sketch holds a rank no
+/// insert could have produced — such a sketch has no encoding rather than bytes
+/// its own decoder would refuse.
+fn registers_to_bytes<Registers: HllRegisterStorage>(
+    registers: &Registers,
+) -> Result<Vec<u8>, RmpEncodeError> {
+    let registers = registers.as_slice();
+    check_register_range::<Registers>(registers)
+        .map_err(|problem| RmpEncodeError::Syntax(format!("ASAPv1 HLL envelope: {problem}")))?;
+    Ok(registers.to_vec())
+}
+
 /// Rebuild register storage from the payload's register bin.
 fn registers_from_bytes<Registers: HllRegisterStorage>(
     registers: &[u8],
@@ -132,6 +159,7 @@ fn registers_from_bytes<Registers: HllRegisterStorage>(
             Registers::NUM_REGISTERS
         )));
     }
+    check_register_range::<Registers>(registers).map_err(RmpDecodeError::Uncategorized)?;
     let mut out = Registers::default();
     out.as_mut_slice().copy_from_slice(registers);
     Ok(out)
@@ -146,15 +174,17 @@ impl<Variant, Registers: HllRegisterStorage, H: SketchHasher>
     /// Serializes the sketch into an ASAPv1 MessagePack envelope. The metadata is
     /// derived from the hasher's [`HashProfile`], so it truthfully describes how
     /// the sketch was hashed.
+    ///
+    /// A register above the maximum rank for this precision is an error rather
+    /// than bytes that would be refused on decode.
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError>
     where
         Variant: HllWireVariant,
         H: HashProfile,
     {
+        let registers = registers_to_bytes(&self.registers)?;
         let metadata = rmp_serde::to_vec_named(&hll_metadata::<H>(Registers::PRECISION as u32))?;
-        let payload = rmp_serde::to_vec(&HllPayloadPlain {
-            registers: self.registers.as_slice().to_vec(),
-        })?;
+        let payload = rmp_serde::to_vec(&HllPayloadPlain { registers })?;
         Ok(envelope::encode(Variant::WIRE_KIND_ID, &metadata, &payload))
     }
 
@@ -180,11 +210,15 @@ impl<Variant, Registers: HllRegisterStorage, H: SketchHasher>
 // Wire serialization for the HIP estimator.
 impl<Registers: HllRegisterStorage> HyperLogLogHIPImpl<Registers> {
     /// Serializes the sketch into an ASAPv1 MessagePack envelope.
+    ///
+    /// A register above the maximum rank for this precision is an error rather
+    /// than bytes that would be refused on decode.
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
+        let registers = registers_to_bytes(&self.registers)?;
         let metadata =
             rmp_serde::to_vec_named(&standard_hll_metadata(Registers::PRECISION as u32))?;
         let payload = rmp_serde::to_vec(&HllPayloadHip {
-            registers: self.registers.as_slice().to_vec(),
+            registers,
             hip_kxq0: self.kxq0,
             hip_kxq1: self.kxq1,
             hip_est: self.est,
@@ -214,7 +248,7 @@ impl<Registers: HllRegisterStorage> HyperLogLogHIPImpl<Registers> {
 mod tests {
     use super::*;
     use crate::sketches::hll::{HyperLogLog, HyperLogLogHIP, HyperLogLogHIPP12, HyperLogLogP12};
-    use crate::structures::fixed_structure::HllBucketListP14;
+    use crate::structures::fixed_structure::{HllBucketListP12, HllBucketListP14};
     use crate::{DataInput, HllBucketList};
 
     const ERROR_TOLERANCE: f64 = 0.02;
@@ -587,6 +621,149 @@ mod tests {
         assert!(
             HyperLogLog::<Classic>::deserialize_from_bytes(&bytes).is_err(),
             "P12 bytes must be rejected by a P14 decoder"
+        );
+    }
+
+    /// Builds a well-framed envelope around a crafted register bin.
+    fn crafted_plain(kind_id: &[u8], precision: u32, registers: Vec<u8>) -> Vec<u8> {
+        let metadata = rmp_serde::to_vec_named(&standard_hll_metadata(precision)).expect("meta");
+        let payload = rmp_serde::to_vec(&HllPayloadPlain { registers }).expect("payload");
+        envelope::encode(kind_id, &metadata, &payload)
+    }
+
+    /// A register holds the largest rank hashed into it, and a rank is
+    /// `leading_zeros(...) + 1` over the `64 - precision` bits left after the
+    /// index bits are shifted out — at most `64 - precision + 1`. A crafted bin
+    /// carrying a larger byte is refused, for every variant and precision: it
+    /// would inflate the Classic estimate, and index past the Ertl histogram or
+    /// the HIP shift.
+    #[test]
+    fn hll_rejects_out_of_range_register_values() {
+        const P14_MAX: u8 = (HllBucketListP14::REGISTER_BITS + 1) as u8; // 51
+        const P12_MAX: u8 = (HllBucketListP12::REGISTER_BITS + 1) as u8; // 53
+
+        let bin = |len: usize, rank: u8| {
+            let mut registers = vec![0u8; len];
+            registers[7] = rank;
+            registers
+        };
+        let p14 = HllBucketListP14::NUM_REGISTERS;
+        let p12 = HllBucketListP12::NUM_REGISTERS;
+
+        // The bound itself decodes, one past it does not — for both estimators
+        // sharing the plain payload, and at a second precision.
+        let ok = crafted_plain(HLL_KIND_CLASSIC, 14, bin(p14, P14_MAX));
+        assert!(HyperLogLog::<Classic>::deserialize_from_bytes(&ok).is_ok());
+        let ok = crafted_plain(HLL_KIND_ERTL_MLE, 12, bin(p12, P12_MAX));
+        assert!(HyperLogLogP12::<ErtlMLE>::deserialize_from_bytes(&ok).is_ok());
+
+        let over = crafted_plain(HLL_KIND_CLASSIC, 14, bin(p14, P14_MAX + 1));
+        let problem = HyperLogLog::<Classic>::deserialize_from_bytes(&over)
+            .expect_err("a register past the maximum rank must be rejected")
+            .to_string();
+        assert!(
+            problem.contains("exceeds the maximum rank 51"),
+            "got {problem}"
+        );
+
+        let over = crafted_plain(HLL_KIND_ERTL_MLE, 14, bin(p14, u8::MAX));
+        assert!(
+            HyperLogLog::<ErtlMLE>::deserialize_from_bytes(&over).is_err(),
+            "a register past the Ertl histogram must be rejected"
+        );
+
+        let over = crafted_plain(HLL_KIND_ERTL_MLE, 12, bin(p12, P12_MAX + 1));
+        let problem = HyperLogLogP12::<ErtlMLE>::deserialize_from_bytes(&over)
+            .expect_err("a register past the maximum rank must be rejected")
+            .to_string();
+        assert!(
+            problem.contains("exceeds the maximum rank 53"),
+            "got {problem}"
+        );
+
+        // The HIP payload carries the same bin and is held to the same bound.
+        let metadata = rmp_serde::to_vec_named(&standard_hll_metadata(14)).expect("meta");
+        let payload = rmp_serde::to_vec(&HllPayloadHip {
+            registers: bin(p14, P14_MAX + 1),
+            hip_kxq0: p14 as f64,
+            hip_kxq1: 0.0,
+            hip_est: 0.0,
+        })
+        .expect("payload");
+        let over = envelope::encode(HLL_KIND_HIP, &metadata, &payload);
+        let problem = HyperLogLogHIP::deserialize_from_bytes(&over)
+            .expect_err("a register past the maximum rank must be rejected")
+            .to_string();
+        assert!(
+            problem.contains("exceeds the maximum rank 51"),
+            "got {problem}"
+        );
+    }
+
+    /// The encode path holds the same bound: `apply_delta` takes an arbitrary
+    /// value, so a sketch can be driven past the maximum rank in memory, and
+    /// such a sketch has no encoding rather than bytes its own decoder refuses.
+    #[test]
+    fn hll_refuses_to_serialize_an_out_of_range_register() {
+        use crate::octo_delta::HllDelta;
+        const P14_MAX: u8 = (HllBucketListP14::REGISTER_BITS + 1) as u8; // 51
+
+        let mut classic = HyperLogLog::<Classic>::default();
+        classic.apply_delta(HllDelta {
+            pos: 7,
+            value: P14_MAX,
+        });
+        assert!(
+            classic.serialize_to_bytes().is_ok(),
+            "the bound itself must still serialize"
+        );
+        classic.apply_delta(HllDelta {
+            pos: 7,
+            value: P14_MAX + 1,
+        });
+        let problem = classic
+            .serialize_to_bytes()
+            .expect_err("a register past the maximum rank must not serialize")
+            .to_string();
+        assert!(
+            problem.contains("exceeds the maximum rank 51"),
+            "got {problem}"
+        );
+
+        let mut ertl = HyperLogLog::<ErtlMLE>::default();
+        ertl.apply_delta(HllDelta {
+            pos: 7,
+            value: u8::MAX,
+        });
+        assert!(
+            ertl.serialize_to_bytes().is_err(),
+            "a register past the Ertl histogram must not serialize"
+        );
+
+        let mut p12 = HyperLogLogP12::<ErtlMLE>::default();
+        p12.apply_delta(HllDelta {
+            pos: 7,
+            value: (HllBucketListP12::REGISTER_BITS + 2) as u8,
+        });
+        let problem = p12
+            .serialize_to_bytes()
+            .expect_err("a register past the maximum rank must not serialize")
+            .to_string();
+        assert!(
+            problem.contains("exceeds the maximum rank 53"),
+            "got {problem}"
+        );
+
+        // HIP carries the same bin and is held to the same bound.
+        let mut hip = HyperLogLogHIP::default();
+        hip.registers.as_mut_slice()[7] = P14_MAX + 1;
+        let problem = hip
+            .serialize_to_bytes()
+            .expect_err("a register past the maximum rank must not serialize")
+            .to_string();
+        assert!(
+            problem.contains("exceeds the maximum rank 51"),
+            "got {problem}"
         );
     }
 

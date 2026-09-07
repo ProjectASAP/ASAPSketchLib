@@ -1,13 +1,11 @@
-//! Portable MessagePack wire format shared with `sketchlib-go`.
+//! Older per-sketch MessagePack wire types, being retired.
 //!
-//! Every type that crosses the wire is described here in a per-algorithm
-//! submodule whose filename mirrors the corresponding file in
-//! `sketchlib-go`. Both representations are kept byte-compatible at the
-//! envelope level even though the in-language struct shapes differ.
-//!
-//! Touching anything in this module is a protocol change: the Go side
-//! must be kept in lock-step, and the cross-language golden-byte tests
-//! must continue to pass.
+//! Each per-algorithm submodule holds one sketch's pre-envelope wire type.
+//! These carry a cross-language contract of their own, on goldens apart
+//! from ASAPv1's `asapv1_golden/`: HLL, Count-Min, Count Sketch and KLL pin
+//! byte parity against Go's serializers, KLL in both directions; DDSketch's
+//! golden is a Rust self-pin, not yet reconciled. New code uses ASAPv1:
+//! prefer a sketch's own `serialize_to_bytes`; do not add callers here.
 
 pub mod countminsketch;
 pub mod countminsketch_topk;

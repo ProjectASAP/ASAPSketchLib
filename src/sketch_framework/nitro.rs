@@ -322,7 +322,6 @@ impl<S: NitroTarget> NitroBatch<S> {
         self.sampling_rate
     }
 
-    // #[inline]
     #[inline(always)]
     /// The integer part of the weight one admitted update carries.
     ///
@@ -379,7 +378,6 @@ impl<S: NitroTarget> NitroBatch<S> {
         floor as u64 + u64::from(u < frac)
     }
 
-    // #[inline]
     #[inline(always)]
     fn is_full_sampling(&self) -> bool {
         (self.sampling_rate - 1.0).abs() <= f64::EPSILON

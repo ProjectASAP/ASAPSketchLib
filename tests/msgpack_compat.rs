@@ -210,8 +210,7 @@ fn hydra_kll_wire_shape() {
 
 // ===== golden-bytes placeholders: an ignored, uncovered gap =====
 //
-// The five tests below are **empty and ignored**. They verify nothing today and
-// are counted as a gap in `docs/e2e_coverage_matrix.md`, not as coverage.
+// The five tests below are **empty and ignored**. They verify nothing today.
 //
 // What they need is a msgpack payload produced by `sketchlib-go` and checked in
 // under `tests/fixtures/msgpack/`. That fixture cannot be generated here: this
