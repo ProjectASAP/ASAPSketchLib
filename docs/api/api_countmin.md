@@ -25,15 +25,15 @@ fn insert(&mut self, value: &DataInput)
 fn insert_many(&mut self, value: &DataInput, many: S::Counter)
 fn bulk_insert(&mut self, values: &[DataInput])
 fn bulk_insert_many(&mut self, values: &[(DataInput, S::Counter)])
-fn fast_insert_with_hash_value(&mut self, hashed_val: &S::HashValueType)
-fn fast_insert_many_with_hash_value(&mut self, hashed_val: &S::HashValueType, many: S::Counter)
+fn fast_insert_with_hash_value(&mut self, hashed_val: &H::HashType)
+fn fast_insert_many_with_hash_value(&mut self, hashed_val: &H::HashType, many: S::Counter)
 ```
 
 ## Query
 
 ```rust
 fn estimate(&self, value: &DataInput) -> S::Counter
-fn fast_estimate_with_hash(&self, hashed_val: &S::HashValueType) -> S::Counter
+fn fast_estimate_with_hash(&self, hashed_val: &H::HashType) -> S::Counter
 fn rows(&self) -> usize
 fn cols(&self) -> usize
 fn as_storage(&self) -> &S

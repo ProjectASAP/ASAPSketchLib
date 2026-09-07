@@ -506,7 +506,7 @@ Two summaries have no encoding and **fail to serialize** rather than being coerc
 
 **Empty summary.** A summary that monitors nothing has no variant to report. It emits `key_type = "u64"` with three empty arrays, so an empty summary has exactly one encoding rather than one per producer.
 
-**Emitted order (cross-language contract).** The payload is **order-defined**: entries are written in **descending `count`**, ties broken by a **total order over the key** (variant tag first, then the value — the same order `merge` uses to break its own ties, so a merge and an encode agree). This is required, not cosmetic: `entries()` order follows the counter arena and `top_k` order follows the bucket walk, and neither survives a rebuild, so an unordered payload would re-serialize to different bytes than it decoded from. With the order pinned, two summaries holding the same triples emit the same bytes whatever order they were seated in, and re-serializing a decoded summary reproduces its bytes exactly.
+**Emitted order (cross-language contract).** The payload is **order-defined**: entries are written in **descending `count`**, ties broken by a **total order over the key** (variant tag first, then the value). This is required, not cosmetic: `entries()` order follows the counter arena and `top_k` order follows the bucket walk, and neither survives a rebuild, so an unordered payload would re-serialize to different bytes than it decoded from. With the order pinned, two summaries holding the same triples emit the same bytes whatever order they were seated in, and re-serializing a decoded summary reproduces its bytes exactly.
 
 **Decode rules.** Fail **closed** on each, with an error and never a panic:
 
@@ -774,7 +774,7 @@ Coco carries the hash-spec group — it hashes, and a consumer must reproduce th
 
 **Bucket values are never negative.** Mass is `u64` and only ever grows by `+= v`, so every `values[i]` goes in the msgpack **uint** family at minimal width per Section 4. Coco has nothing like Count Sketch's signed cells.
 
-**Wire-eligible geometries.** `rows >= 1` and `cols >= 1`. `cols == 0` is not representable at all — `Vector2D` derives its column mask through `cols.ilog2()`, which panics on zero — and a table with no arrays records nothing. Both are rejected on **both** sides. There is no power-of-two constraint on `cols`, since Coco folds with `% w` rather than a mask, and no upper bound on `rows`: a table with more arrays than there are seeds has arrays that wrap onto duplicate seeds, but its state still round-trips exactly, so it stays wire-eligible.
+**Wire-eligible geometries.** `1 <= rows <= 20` (`MATRIX_MAX_ROWS`, §3.2) and `cols >= 1`. `cols == 0` is not representable at all — `Vector2D` derives its column mask through `cols.ilog2()`, which panics on zero — and a table with no arrays records nothing. Each is rejected on **both** sides. There is no power-of-two constraint on `cols`, since Coco folds with `% w` rather than a mask.
 
 **Decode rules.** Fail **closed** on each, with an error and never a panic:
 
@@ -1008,8 +1008,8 @@ The `kind_id` is carried rather than a name, because Section 1's registry is alr
 | `0x04 0x00` | Count Sketch | `CS(Count<Vector2D<i32>, FastPath>)` | always |
 | `0x05 0x00` | DDSketch | `DDS(DDSketch)` | always |
 | `0x06 0x00` | KLL compact | `KLL(KLL)` | always |
-| `0x0b 0x00` | Elastic | `ELASTIC(Elastic)` | `experimental` |
-| `0x0c 0x00` | Coco | `COCO(Coco)` | `experimental` |
+| `0x0b 0x00` | Elastic | `ELASTIC(Elastic)` | always |
+| `0x0c 0x00` | Coco | `COCO(Coco)` | always |
 | `0x0d 0x00` | UniformSampling | `UNIFORM(UniformSampling)` | `experimental` |
 | `0x10 0x00` | UnivMon | `UNIVMON(UnivMon)` | always |
 | `0x19 0x00` | CountL2HH | `COUNTL2HH(CountL2HH)` | always |
@@ -1019,8 +1019,8 @@ The `kind_id` is carried rather than a name, because Section 1's registry is alr
 **Feature-gating contract (cross-language; Go must honour it).**
 
 1. The nested-id namespace is **fixed and identical in every build**. All ten ids dispatch whether or not the `experimental` feature is on. An id is registry bytes, never an enum ordinal and never a discriminant, so no id's meaning can shift because a variant is compiled out.
-2. A decoder built **without** `experimental` that meets `0x0b 0x00`, `0x0c 0x00` or `0x0d 0x00` **fails closed**, before the blocks are assembled into anything, with an error naming the variant (`Elastic`, `Coco`, `UniformSampling`) **and** the feature. It never misparses, skips, substitutes another variant, or falls through the unknown-id path.
-3. An encoder built **without** `experimental` can never emit those three ids: the enum arms do not exist.
+2. A decoder built **without** `experimental` that meets `0x0d 0x00` **fails closed**, before the blocks are assembled into anything, with an error naming the variant (`UniformSampling`) **and** the feature. It never misparses, skips, substitutes another variant, or falls through the unknown-id path.
+3. An encoder built **without** `experimental` can never emit that id: the enum arm does not exist.
 4. An id outside the ten is rejected as unknown.
 5. The id-to-name lookup exists for **error messages only**. Encoding and decoding both dispatch on the bytes; the name influences neither.
 

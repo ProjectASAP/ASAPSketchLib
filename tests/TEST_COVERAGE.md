@@ -941,12 +941,15 @@ Feature-gated behind `--features experimental`.
 ## e2e_membership
 
 - Bloom filter
-  - input: 20K distinct members inserted
+  - input: 20K distinct members, 200K disjoint probes per measured rate
   - configuration
     - both FastPath and RegularPath
-    - 7 rows, each row 65536 bits
+    - `with_capacity(20K, target)` for targets 0.1, 0.01, 0.001; explicit `with_dimensions` geometries for the hash layouts and the degenerate cases
+  - exact structure: no inserted member reads back absent, and a union equals the filter of the concatenated stream
   - error bound:
-    - false positive rate: 0.0087% at 20K members with cols=65536, rows=7
+    - measured false positive rate within five binomial standard errors of `predicted_fpp`, and at or under the target
+    - `estimated_fpp` within 0.75-1.25x of the measured rate
+  - sizing, the default geometry and the allocation ceiling are checked as exact geometries rather than rates
 
 
 ## e2e_nitro

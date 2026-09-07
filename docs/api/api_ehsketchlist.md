@@ -67,11 +67,11 @@ The ten nested kind_ids:
 | Variant | Nested kind_id | Registry name | Feature |
 | ------- | -------------- | ------------- | ------- |
 | `CM` | `0x02 0x00` | Count-Min | default |
-| `COCO` | `0x0c 0x00` | Coco | `experimental` |
+| `COCO` | `0x0c 0x00` | Coco | default |
 | `COUNTL2HH` | `0x19 0x00` | CountL2HH | default |
 | `CS` | `0x04 0x00` | Count Sketch | default |
 | `DDS` | `0x05 0x00` | DDSketch | default |
-| `ELASTIC` | `0x0b 0x00` | Elastic | `experimental` |
+| `ELASTIC` | `0x0b 0x00` | Elastic | default |
 | `HLL` | `0x01 0x02` | HLL Ertl-MLE | default |
 | `KLL` | `0x06 0x00` | KLL compact | default |
 | `UNIFORM` | `0x0d 0x00` | UniformSampling | `experimental` |
@@ -80,8 +80,8 @@ The ten nested kind_ids:
 Each id is pinned to one algorithm: `HLL` is Ertl-MLE, so `0x01 0x01` (Classic)
 and `0x01 0x03` (HIP) are rejected, and `KLL` is compact, so `0x06 0x01`
 (dynamic) is rejected. The dispatch is the same in every build: a decoder built
-without `experimental` rejects `0x0c 0x00`, `0x0b 0x00` and `0x0d 0x00` with an
-error naming the variant and the feature, and its encoder can never emit them.
+without `experimental` rejects `0x0d 0x00` with an error naming the variant and
+the feature, and its encoder can never emit it.
 An unrecognized kind_id is rejected. `EHSketchList` also derives serde.
 
 ## Examples

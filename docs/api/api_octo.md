@@ -38,7 +38,6 @@ pub struct DdDelta    { pub index: i32, pub value: u64 }
 pub struct KeyedCmDelta    { pub key: HeapItem, pub delta: CmDelta }
 pub struct KeyedCountDelta { pub key: HeapItem, pub delta: CountDelta }
 
-// experimental feature
 pub struct CocoDelta { pub key: String, pub value: u64 }
 pub enum ElasticDelta {
     Heavy { key: String, value: u32, eviction: bool },
@@ -283,7 +282,6 @@ pub struct CountWorkerSketch { /* Vec<i8> */ }
 pub struct DdWorkerSketch { /* HashMap<i32, u8> */ }
 pub struct L2hhWorkerSketch { /* Vec<i8>, one per UnivMon layer */ }
 
-// experimental feature
 pub struct CocoWorkerSketch { /* Vec<Option<String>> + Vec<u8> */ }
 pub struct ElasticWorkerSketch { /* heavy buckets + a CmWorkerSketch light layer */ }
 ```
@@ -413,8 +411,8 @@ and hashing there keeps the work off the dispatching thread.
 is geometric, so that is nearly always one or two.
 
 The shipped plans are `CmOctoPlan`, `CountOctoPlan`, `CmTopKOctoPlan`,
-`CountTopKOctoPlan`, `HllOctoPlan`, `DdOctoPlan`, `UnivMonOctoPlan` and,
-behind `experimental`, `CocoOctoPlan` and `ElasticOctoPlan`.
+`CountTopKOctoPlan`, `HllOctoPlan`, `DdOctoPlan`, `UnivMonOctoPlan`,
+`CocoOctoPlan` and `ElasticOctoPlan`.
 Each takes the same dimensions its worker did, plus an optional shared
 `OctoThreshold`:
 
@@ -499,11 +497,8 @@ pub fn run_octo<L, P>(
 | DDSketch | `DdOctoWorker` | `DdOctoAggregator` | `DdDelta` |
 | UnivMon | `UnivMonOctoWorker` | `UnivMonOctoAggregator` | `LayeredCountDelta` |
 | HyperLogLog | `HllOctoWorker` | `HllOctoAggregator` | `HllDelta` |
-| CocoSketch † | `CocoOctoWorker` | `CocoOctoAggregator` | `CocoDelta` |
-| Elastic † | `ElasticOctoWorker` | `ElasticOctoAggregator` | `ElasticDelta` |
-
-† requires the `experimental` feature, which is what gates `Coco` and
-`Elastic` themselves.
+| CocoSketch | `CocoOctoWorker` | `CocoOctoAggregator` | `CocoDelta` |
+| Elastic | `ElasticOctoWorker` | `ElasticOctoAggregator` | `ElasticDelta` |
 
 The `*TopK*` pairs hold the pipeline's only heavy-hitter heap, in the
 aggregator: each keyed delta updates the parent counter and then the

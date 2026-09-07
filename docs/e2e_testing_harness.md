@@ -218,11 +218,10 @@ What does split is a suite held together by something other than its subject.
 `e2e_experimental.rs` groups sketches by cargo feature; Space-Saving, CocoSketch
 and the Elastic sketch sit in `e2e_heavy_hitters.rs` instead, organised by what
 they are: heavy-hitter sketches, which answer *which flows are big* from a flow
-key kept beside every counter. The `experimental` gate rides on the two sketches
-that need it, not on the suite, so the default-feature run still gets
-Space-Saving. `e2e_octo.rs` holds the multi-threaded Octo variants of Coco and
-Elastic, in its own `heavy_hitters` module, beside the rest of the promotion
-protocol.
+key kept beside every counter. None of the three is feature-gated, so the
+default-feature run gets all of them. `e2e_octo.rs` holds the multi-threaded
+Octo variants of Coco and Elastic, in its own `heavy_hitters` module, beside
+the rest of the promotion protocol.
 
 ## Onboarding a new sketch
 
