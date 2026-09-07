@@ -49,7 +49,7 @@ This document provides a high-level overview of implemented and planned features
 
 **ExponentialHistogram** - Sliding window coordinator for mergeable sketches
 
-**TumblingWindow** - Non-overlapping windows with built-in support for the experimental UnivMon-Q sketch
+**TumblingWindow** - Non-overlapping windows over pooled mergeable sketches, with built-in support for FoldCMS, FoldCS, KLL and the experimental UnivMon-Q
 
 **EHUnivOptimized** - Hybrid two-tier ExponentialHistogram for UnivMon with sketch memory reuse (currently `Unstable`)
 

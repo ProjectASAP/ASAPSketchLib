@@ -286,7 +286,7 @@ The two tables below are the field-by-field detail of each group.
 | `input_encoding` | string | yes | `"projectasap.input.v1"` |
 | `seed_list` | `array<u64>` | **yes (inlined)** | the 20 seeds, carried inline so the bytes self-describe the hash |
 | `canonical_seed_index` | u32 | **per-sketch** | index into `seed_list` (`5`); HLL, KMV and Hydra's HLL counter use it |
-| `matrix_seed_index` | u32 | **per-sketch** | `0`; Count-Min, Count Sketch, CMSHeap, CSHeap, Elastic and Hydra's matrix counters use it |
+| `matrix_seed_index` | u32 | **per-sketch** | `0`; Count-Min, Count Sketch, CMSHeap, CSHeap, Bloom, Elastic and Hydra's matrix counters use it |
 
 These two are the only seed-index keys, because `HashProfile` declares exactly two seed-index constants — `CANONICAL_SEED_INDEX` and `MATRIX_SEED_INDEX` — and a sketch's key is derived from one of them.
 
@@ -431,6 +431,22 @@ Both KLL variants (the compact fixed-buffer `KLL` and the growable `KLLDynamic`)
 
 **Item order (cross-language contract).** `levels` / `items` use the **top-most-level-first** layout, byte-for-byte matching `sketchlib-go`'s `KLLState`: index `i` in `levels` maps to compactor level `num_levels - 1 - i`, and level 0's run is in **input order**. The compact `KLL` grows its buffer leftward and stores level 0 reverse-input, so its encoder reverses level 0 back to input order (and its decoder reverses it in); `KLLDynamic` already stores this layout natively. Within a level, order past the first compaction is not guaranteed byte-identical across the two Rust variants (or across languages), but the retained set and quantiles agree — see the caveat on `KLL::wire_items`.
 
+**Wire widths.** `levels` is `u32` on the wire, widened to `usize` in memory. The coin's `remaining_bits` is `u32` on the wire but `u8` in memory, so rule 8 below is what makes the narrowing safe; `state` and `bit_cache` are `u64` on both sides.
+
+**Decode rules** (all fail closed, per Section 1's decoder rules). Rules 1 to 10 are shared by both variants; rule 11 is compact-only:
+
+1. `kind_id` is `0x06 0x00` for the compact `KLL` and `0x06 0x01` for `KLLDynamic`; either id is rejected by the other type's decoder.
+2. The metadata must equal the target type's own, with `k` / `m` / `seed` echoed back since the sketch is sized from them — so `metadata_version` and `item_type` are what this check pins.
+3. `2 <= m <= k <= 26602` (`MAX_CACHEABLE_K`). Checked in the envelope split, **before** anything is sized: `k` and `m` are echoed, so rule 2 cannot pin them, and a crafted `k` near `u32::MAX` would drive `compute_max_capacity` into a multi-terabyte allocation. A legitimately serialized sketch is always in range because the constructor clamps to it.
+4. `len(levels) >= 2` — a decoded sketch has at least one level.
+5. `num_levels`, which is `len(levels) - 1`, is at most `61` (`MAX_LEVELS`).
+6. `levels[0] == 0`.
+7. `levels` is non-decreasing.
+8. `levels[last] == len(items)`.
+9. `coin.remaining_bits <= 64`.
+10. The per-level sizes must not overflow the weighted count. A layout can satisfy rules 4 to 8 and still park many items at a high compactor level, where each carries weight `2^h`; that overflows `count()` / `rank()` / `cdf()` at query time rather than at decode, so it is rejected here.
+11. Compact `KLL` only: `len(items) <= compute_max_capacity(k, m)`, checked **before** the buffer is allocated. `KLLDynamic` grows its buffer, so it has no such ceiling.
+
 ### 3.4: Bloom payload (`0x17 0x00`)
 
 `Bloom` is the *partitioned* filter: `rows` slices of `cols` bits over the same `rows x cols` grid Count-Min probes, one bit set per slice.
@@ -518,6 +534,10 @@ Two summaries have no encoding and **fail to serialize** rather than being coerc
 6. Every `counts[i] >= 1` (a counter at zero is not a state the algorithm reaches) and `errors[i] <= counts[i]`.
 7. No key appears twice.
 8. `capacity` **never sizes an allocation.** The counter arena and key index are sized from `len(keys)`, so a payload declaring `capacity = 2^32 - 1` with two counters costs two counters. A decoder must not preallocate from a declared size.
+9. `discarded_max <= min(counts)`. The ceiling records what left the summary, and the algorithm only ever evicts a *smallest* counter, so a ceiling above a count still held describes no reachable state — and it would make `upper_bound` read lower than the count beside it. The comparison uses `0` as the smallest count of an empty summary, so an empty summary carrying a non-zero `discarded_max` is rejected too.
+10. `sum(counts[i] - errors[i]) <= total`. Each counter's `count - error` is weight the summary claims to have actually recorded, so a `total` under that sum contradicts its own triples and would make every frequency the summary reports unbounded from below.
+
+Both are hard rejections, not repairs: a Go decoder must mirror them.
 
 `min_count`, the bucket list, the counter arena and the key index are then recomputed from the validated triples; nothing about them is trusted from the wire.
 
