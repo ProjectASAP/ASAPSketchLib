@@ -44,14 +44,14 @@ This is the canonical API entry point for `asap_sketchlib`.
   - Evaluation: [large synthetic comparison with UnivMon](./univmon_q_evaluation.md).
   - References: UnivMon (SIGCOMM 2016), Joltik (MobiCom 2020), and universal subset-norm sampling.
 - [NitroBatch](./api/api_nitrobatch.md) - `Ready`
-  - Reference: NitroSketch paper. [https://dl.acm.org/doi/10.1145/3341302.3342076](https://dl.acm.org/doi/10.1145/3341302.3342076)
+  - Reference: Liu et al., "NitroSketch: Robust and General Sketch-based Monitoring in Software Switches," SIGCOMM 2019. [https://dl.acm.org/doi/10.1145/3341302.3342076](https://dl.acm.org/doi/10.1145/3341302.3342076)
 - [ExponentialHistogram](./api/api_exponential_histogram.md) - `Ready`
   - Reference: Datar, Gionis, Indyk & Motwani, "Maintaining Stream Statistics over Sliding Windows," SIAM J. Computing 2002. [https://dl.acm.org/doi/10.1137/S0097539701398363](https://dl.acm.org/doi/10.1137/S0097539701398363)
-  - Related implementation context: PromSketch paper. [https://dl.acm.org/doi/pdf/10.14778/3742728.3742732](https://dl.acm.org/doi/pdf/10.14778/3742728.3742732)
+  - Related implementation context: Zhu et al., "Approximation-First Timeseries Query At Scale," PVLDB 18(8). [https://dl.acm.org/doi/pdf/10.14778/3742728.3742732](https://dl.acm.org/doi/pdf/10.14778/3742728.3742732)
 - [EHSketchList](./api/api_ehsketchlist.md) - `Ready`
 - [EHUnivOptimized](./api/api_ehunivoptimized.md) - `Unstable`
 - [OctoSketch](./api/api_octo.md) - `Ready`
-  - Reference: OctoSketch paper. [https://www.usenix.org/conference/nsdi24/presentation/zhang-yinda](https://www.usenix.org/conference/nsdi24/presentation/zhang-yinda)
+  - Reference: Zhang, Chen & Liu, "OctoSketch: Enabling Real-Time, Continuous Network Monitoring over Multiple Cores," NSDI 2024. [https://www.usenix.org/conference/nsdi24/presentation/zhang-yinda](https://www.usenix.org/conference/nsdi24/presentation/zhang-yinda)
 
 ## Common Utility APIs
 

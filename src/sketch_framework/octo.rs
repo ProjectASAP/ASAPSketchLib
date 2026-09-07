@@ -3015,8 +3015,6 @@ mod worker_tests {
     #[test]
     #[should_panic(expected = "exceeds the 128-bit hash budget")]
     fn a_univmon_worker_refuses_a_geometry_that_outruns_the_hash() {
-        // 13 rows x 11 column bits = 143 > 128. Debug builds used to panic on
-        // the shift; release builds wrapped it and aliased row 12 onto row 1.
         L2hhWorkerSketch::new(13, 2048, 0);
     }
 
@@ -3033,9 +3031,6 @@ mod worker_tests {
 
     #[test]
     fn every_worker_reads_one_threshold_the_same_way() {
-        // The signed one-byte workers used to clamp to i8::MAX while the shared
-        // threshold and the full sketches clamped to 255, so a tau in 128..=255
-        // meant two different things in the same pipeline.
         let tau = 200u32;
         let key = DataInput::U64(9);
 
@@ -3538,9 +3533,6 @@ mod runtime_tests {
 
     #[test]
     fn an_inverted_control_band_is_normalised_rather_than_fatal() {
-        // OctoAdaptiveThreshold's fields are public and clamp panics on an
-        // inverted range. That panic used to land on the aggregator thread and
-        // surface on the caller's as an unrelated "worker receiver dropped".
         let settings = OctoAdaptiveThreshold {
             target_queue_len: 10,
             alpha: 0.25,

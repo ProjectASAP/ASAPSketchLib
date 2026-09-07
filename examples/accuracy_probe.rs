@@ -346,7 +346,6 @@ fn probe_countl2hh() {
     );
 
     // i64 overflow probe: two 3e9-count keys => true F2 = 1.8e19 > i64::MAX.
-    // Post-fix contract: saturates at i64::MAX instead of wrapping silently.
     let mut sk3 =
         CountL2HH::<asap_sketchlib::DefaultXxHasher>::with_dimensions_and_seed(4, 2048, 7);
     sk3.fast_insert_with_count(&DataInput::U32(1), 3_000_000_000);

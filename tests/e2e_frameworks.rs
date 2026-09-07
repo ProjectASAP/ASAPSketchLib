@@ -1553,15 +1553,6 @@ fn univmon_pyramid_weighted_metrics() {
     );
 }
 
-// ------------------------------------------------------------------- Nitro
-//
-// `NitroBatch` moved to `tests/e2e_composition.rs`. The version that lived
-// here built its batches with `NitroBatch::with_target`, which seeds the
-// sampling RNG from the OS — so its +-5% and +-10% bands were re-rolled on
-// every run and neither reproduced a failure nor derived from the estimator's
-// variance. The replacement uses the seeded constructor and the binomial
-// sampling band, across rates 1.0 / 0.5 / 0.1 / 0.01 and all three targets.
-
 // -------------------------------------------------- ExponentialHistogram
 
 #[test]
@@ -1640,14 +1631,6 @@ fn tumbling_foldcms_weighted_windows_exact_counts() {
     assert_eq!(post.query(&DataInput::Str("A")), 70);
     assert_eq!(post.query(&DataInput::Str("B")), 35);
 }
-
-// ------------------------------------------------------ HashSketchEnsemble
-//
-// `HashSketchEnsemble` moved to `tests/e2e_composition.rs`, where every member
-// variant (CountMinFast, CountFast, HllErtl, HllClassic, HllHip) is compared
-// against a standalone reference and held to its own family's bound. The
-// version that lived here covered two members with a hand-picked 3x upper
-// slack on the Count-Min cell.
 
 #[test]
 fn hydra_query_frequency_is_the_frequency_query_it_wraps() {

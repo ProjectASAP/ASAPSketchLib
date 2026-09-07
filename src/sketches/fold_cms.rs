@@ -1352,7 +1352,6 @@ mod tests {
         let cols = 256;
         let fold_level = 4;
 
-        // let mut sk: FoldCMS = FoldCMS::new(rows, cols, fold_level, 10);
         let mut sk = FoldCMS::<DefaultXxHasher>::new(rows, cols, fold_level, 10);
         for i in 0..40 {
             sk.insert(&DataInput::U64(i), (i + 1) as i64);

@@ -598,25 +598,6 @@ impl<T: NumericalValue> KLL<T> {
     /// over capacity, unlike a single `push_value`, which can only overshoot
     /// by one element, so unlike `compress_while_updating` this cascade can
     /// revisit the same level more than once.
-    ///
-    /// ### The bug this replaces
-    ///
-    /// The previous implementation was pure item-replay: it walked every
-    /// retained item of `other` (regardless of which level it lived at)
-    /// and re-inserted it via `push_value` — i.e. at weight 1. A retained
-    /// item at level `L` represents `2^L` original observations, so
-    /// replaying it at weight 1 silently collapsed `other`'s total ingested
-    /// weight down to just its *retained item count*. This was most
-    /// visible merging into an *empty* target: e.g. merging a KLL built
-    /// over `1..=1000` (`k=200`, which compacts most of its mass up to
-    /// levels ≥ 1) into a fresh sketch dropped the count from 1000 down to
-    /// roughly the ~350 items `other` had physically retained, and
-    /// skewed the median upward because the high-weight upper-level items
-    /// (which cover the full value range) were undercounted relative to
-    /// the low-weight level-0 leftovers. Interleaving level-by-level
-    /// (this implementation) has no such special case: merging into an
-    /// empty target is simply a no-op union at every level, so the
-    /// source's structure — and its weight — comes through exactly.
     pub fn merge(&mut self, other: &KLL<T>) {
         let other_start = other.levels[0];
         let other_end = other.levels[other.num_levels];
@@ -753,8 +734,6 @@ impl<T: NumericalValue> KLL<T> {
     /// If the sketch was constructed with an explicit seed (`init_with_seed` /
     /// `init_kll_with_seed`), the coin is re-seeded from that seed so determinism
     /// survives `clear()` (and therefore window rotation in stateful aggregators).
-    /// Otherwise the coin is re-seeded from the wall clock — the historical
-    /// behavior.
     pub fn clear(&mut self) {
         let mc = self.max_capacity;
         self.invalidate_cdf_cache();
@@ -1064,7 +1043,6 @@ impl Cdf {
 
     /// Returns the estimated value corresponding to quantile `p`.
     pub fn query(&self, p: f64) -> f64 {
-        // println!("{:?}", self.entries);
         if self.entries.is_empty() {
             return 0.0;
         }
@@ -1074,18 +1052,9 @@ impl Cdf {
                 .partial_cmp(&p)
                 .unwrap_or(std::cmp::Ordering::Less)
         }) {
-            Ok(idx) => {
-                // println!("idx: {idx}");
-                slice[idx].value
-            }
-            Err(idx) if idx == slice.len() => {
-                // println!("ERR1: idx: {idx}");
-                slice[slice.len() - 1].value
-            }
-            Err(idx) => {
-                // println!("ERR2: idx: {idx}");
-                slice[idx].value
-            }
+            Ok(idx) => slice[idx].value,
+            Err(idx) if idx == slice.len() => slice[slice.len() - 1].value,
+            Err(idx) => slice[idx].value,
         }
     }
 
@@ -1511,25 +1480,17 @@ mod tests {
         );
     }
 
-    // Merge-weight regression: merging a KLL(k=200) over 1..=1000 into an
-    // empty sketch used to drop N from 1000 to ~350 and drift the median
-    // from ~500 to ~700, because the old `merge` replayed
-    // every retained item through `update()` at weight 1 — discarding the
-    // level weight of every item retained above level 0.
-    //
     // Note on the count assertion: `count()` is only *approximately* N even
     // for a sketch built by plain `update()` calls with no merge involved —
     // odd-sized levels can resolve to `2*ceil(pop/2)` or `2*floor(pop/2)`
     // depending on the compaction coin, off by +/-1 per affected level (see
     // `generic_kll_i64_sanity` above, which already documents this and
-    // budgets a 5% tolerance). That's an inherent, pre-existing property of
-    // randomized-halving KLL and orthogonal to this bug. What the fix
-    // guarantees is that merging into an *empty* target is a pure
-    // structural no-op — `other`'s levels already each satisfy their own
-    // capacity, so folding them into an empty self triggers no further
+    // budgets a 5% tolerance). That's an inherent property of
+    // randomized-halving KLL. Merging into an *empty* target, though, is a
+    // pure structural no-op — `other`'s levels already each satisfy their
+    // own capacity, so folding them into an empty self triggers no further
     // compaction at all — so `dst.count()` must come out **exactly equal**
-    // to `src.count()`, whatever that value is, not rescaled down to
-    // src's *retained item count* the way the old buggy merge did.
+    // to `src.count()`, whatever that value is.
     #[test]
     fn merge_into_empty_target_preserves_weight_issue_68_repro() {
         let mut src = KLL::<f64>::init_kll(SKETCH_K);
@@ -1561,9 +1522,7 @@ mod tests {
         let median = dst.quantile(0.5);
         // True median of 1..=1000 is 500/500.5. KLL's guaranteed rank error
         // at k=200 is well under 5% of the domain for this small, orderly
-        // input; allow a generous +/-5% band (pre-fix this drifted to
-        // ~700, a 40% error, so this comfortably distinguishes fixed vs.
-        // buggy behavior).
+        // input; allow a generous +/-5% band.
         assert!(
             (475.0..=525.0).contains(&median),
             "merged median drifted outside tolerance: median={median} \

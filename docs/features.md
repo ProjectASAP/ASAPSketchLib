@@ -81,26 +81,6 @@ This document provides a high-level overview of implemented and planned features
 
 Insertion throughput measured on 10,000,000 Zipf-distributed `int64` values (s=1.1, support=100k), averaged over 10 seeded runs.
 
-#### Count-Min Sketch
-
-![CMS Insertion Throughput (5×2048)](./benchmark_plots/plots/cms/cms_throughput_insertion.png)
-
-![CMS Insertion Throughput (5×32768)](./benchmark_plots/plots/cms32k/cms32k_throughput_insertion.png)
-
-#### Count
-
-![Count Insertion Throughput (5×2048)](./benchmark_plots/plots/cs/cs_throughput_insertion.png)
-
-![Count Insertion Throughput (5×32768)](./benchmark_plots/plots/cs32k/cs32k_throughput_insertion.png)
-
-#### HyperLogLog
-
-![HLL Insertion Throughput](./benchmark_plots/plots/hll/hll_throughput_insertion.png)
-
-#### KLL
-
-![KLL Insertion Throughput](./benchmark_plots/plots/kll/kll_throughput_insertion.png)
-
 ### Testing
 
 - Current test coverage is documented in [tests.md](tests.md). Additional unit tests and strict correctness tests are in progress.

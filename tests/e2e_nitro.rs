@@ -213,8 +213,8 @@ fn batch_cached(rate: f64, seed: u64, f: usize) -> Vec<f64> {
 /// implemented only for the `Vector2D<i32>`-backed Count-Min and Count Sketch,
 /// and `CountMin::estimate` cannot be instantiated over a `u32` counter
 /// because it needs `Counter: From<i32>`. This does not invent one by
-/// re-deriving the fast-path hash — doing exactly that is how the Nitro
-/// estimator once shipped broken while its tests passed.
+/// re-deriving the fast-path hash — a test that re-derives it asserts its own
+/// arithmetic, not the estimator's.
 ///
 /// What *is* publicly observable, and is what Nitro controls, is the admitted
 /// mass: every admitted update writes its weight into one cell of every row,
@@ -748,14 +748,14 @@ fn a_serde_round_trip_after_every_update_reproduces_the_uninterrupted_run() {
 
 /// A payload written before `Nitro::rounding_state` existed must still decode.
 ///
-/// `rounding_state` was added as a trailing serialized field carrying
+/// `rounding_state` is a trailing serialized field carrying
 /// `#[serde(default)]`, so a map-encoded payload that simply lacks the key
 /// decodes with the default stream. This builds exactly that payload from a
-/// mirror of the old field layout — there is no other way to produce one once
-/// the field exists — and checks that the counters survive and the decoded
-/// sketch is usable.
+/// mirror of the field layout without it — there is no other way to produce
+/// one once the field exists — and checks that the counters survive and the
+/// decoded sketch is usable.
 ///
-/// `mask_bits` and `mask` are present because the old encoder wrote them;
+/// `mask_bits` and `mask` are present because such payloads carry them;
 /// `Vector2D`'s decoder recomputes both from `cols` and ignores what the
 /// payload says, so the values below only have to be well-formed.
 #[test]

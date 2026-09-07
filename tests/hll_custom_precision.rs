@@ -160,11 +160,10 @@ fn custom_precision_round_trips_through_serde() {
 }
 
 /// Regression: register storage must be allocated on the heap, never built as
-/// an `[u8; N]` value and copied into the box. Both operations below aborted
-/// with `fatal runtime error: stack overflow` in debug builds before that
-/// change -- test threads get a 2 MiB stack, and lg_k=22 is a 4 MiB array.
-/// Release builds happened to survive because the optimizer elided the
-/// temporary, which is exactly the profile dependence this pins down.
+/// an `[u8; N]` value and copied into the box. Test threads get a 2 MiB stack
+/// and lg_k=22 is a 4 MiB array, so a stack temporary overflows in debug
+/// builds while release builds may elide it -- exactly the profile dependence
+/// this pins down.
 #[test]
 fn large_precision_allocates_on_the_heap() {
     let sketch = HyperLogLogImpl::<Classic, HllBucketListP22>::new();

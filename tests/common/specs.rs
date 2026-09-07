@@ -41,7 +41,7 @@
 //! Where a guarantee has no closed form, or the public API cannot expose the
 //! dimension it quantifies over, the test says so and is named
 //! `*_stays_within_the_documented_empirical_band` rather than being dressed up
-//! as theory. See `docs/e2e_coverage_matrix.md` for which is which.
+//! as theory.
 
 #![allow(dead_code)]
 

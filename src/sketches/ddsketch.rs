@@ -47,12 +47,6 @@ impl Buckets {
         self.counts.is_empty()
     }
 
-    // not used in current version
-    // #[inline(always)]
-    // fn len(&self) -> usize {
-    //     self.counts.len()
-    // }
-
     #[inline(always)]
     fn range(&self) -> Option<(i32, i32)> {
         if self.counts.is_empty() {
@@ -331,7 +325,6 @@ impl DDSketch {
         let offset = self.store.offset;
 
         for (i, &c) in slice.iter().enumerate() {
-            // let c = slice[i];
             if c == 0 {
                 continue;
             }
@@ -402,11 +395,11 @@ impl DDSketch {
     /// mismatched mapping would reinterpret one sketch's bucket indices under
     /// the other's γ and silently corrupt every quantile.
     ///
-    /// This is a REAL runtime check, not a `debug_assert!` — the previous
-    /// assert was compiled out in release builds, so a release-mode
-    /// mismatched merge corrupted results with no signal at all. DataDog's
-    /// `MergeWith` and sketchlib-go's Go `Merge` both return an error here;
-    /// the portable `DdSketch::merge` in this same crate already does too.
+    /// This is a REAL runtime check, not a `debug_assert!`: a `debug_assert!`
+    /// compiles out in release builds, leaving a mismatched merge to corrupt
+    /// results with no signal at all. DataDog's `MergeWith` and sketchlib-go's
+    /// Go `Merge` both return an error here; the portable `DdSketch::merge` in
+    /// this same crate does too.
     pub fn merge(&mut self, other: &DDSketch) -> Result<(), String> {
         if (self.alpha - other.alpha).abs() >= 1e-12 || (self.gamma - other.gamma).abs() >= 1e-12 {
             return Err(format!(
@@ -452,9 +445,7 @@ impl DDSketch {
     /// Representative of bucket k: the lower bound γ^k scaled by (1+α), matching
     /// DataDog's logarithmic_mapping.go `Value = LowerBound(index) * (1 +
     /// RelativeAccuracy())`. This makes the relative error EXACTLY α at both
-    /// bucket edges — the log-midpoint γ^(k+0.5) used previously gave edge error
-    /// √γ−1 (≈ α + α²/2 > α), silently violating the advertised α-accuracy
-    /// guarantee near a bucket edge.
+    /// bucket edges, as the advertised α-accuracy guarantee requires.
     #[inline]
     fn bin_representative(&self, k: i32) -> f64 {
         self.lower_bound(k) * (1.0 + self.alpha)
@@ -623,8 +614,6 @@ mod tests {
 
     #[test]
     fn representative_within_alpha_at_bucket_edges() {
-        // Value(k) = gamma^k*(1+alpha) puts the relative error at EXACTLY alpha
-        // at both bucket edges — the old midpoint gamma^(k+0.5) exceeded alpha.
         for &alpha in &[0.001, 0.01, 0.05, 0.1] {
             let d = DDSketch::new(alpha);
             for &k in &[-100i32, -1, 0, 1, 7, 500] {
@@ -646,8 +635,6 @@ mod tests {
 
     #[test]
     fn merge_alpha_mismatch_is_a_real_runtime_error() {
-        // Was a debug_assert!, compiled out in release; now a real Result even
-        // in release builds.
         let mut a = DDSketch::new(0.01);
         let b = DDSketch::new(0.02);
         a.add(&5.0);

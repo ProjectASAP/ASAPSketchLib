@@ -1209,7 +1209,7 @@ Good direction (more compact, higher fidelity, less Rust-internal duplication), 
 2. **Golden byte-vector fixtures** checked into both repos; both languages decode and re-encode them byte-identically. These replace the `portable`-as-oracle round-trip test.
 3. **This registry**, mirrored, never independently allocated.
 
-Fixtures exist for six `kind_id`s — HLL's three estimators, Count-Min, Count Sketch and compact KLL — and `sketchlib-go` mirrors those. Every other kind this spec fixes has a payload here and **no fixture and no Go mirror**, so this document is the only contract for it; `asapv1_golden/README.md` lists the gap.
+Fixtures exist for six `kind_id`s — HLL's three estimators, Count-Min, Count Sketch and compact KLL — and `sketchlib-go` mirrors those. Every other kind here has a payload and **no fixture**, so this document is its only contract; `asapv1_golden/README.md` lists the gap. `portable` carries its own Go goldens.
 
 **Hash profile on the Go side.**
 Rust derives the hash spec from a generic `HashProfile` bound on the hasher type; Go has no generic hasher type, so there is nothing to derive from.

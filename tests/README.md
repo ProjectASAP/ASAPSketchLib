@@ -10,10 +10,6 @@ matching spec from `tests/common/specs.rs`. The batteries are a floor, not the
 guarantee: passing them says a sketch is not grossly broken, not that it meets
 its theorem.
 
-[`docs/e2e_coverage_matrix.md`](../docs/e2e_coverage_matrix.md) is the
-authority on which public instance is covered by which test, under which bound,
-and whether that bound is a theorem or a documented empirical band.
-
 ## Layout
 
 | Path | Purpose |
@@ -79,8 +75,6 @@ and whether that bound is a theorem or a documented empirical band.
 
 5. **Add deeper, sketch-specific checks** (merge semantics, windowing,
    serialization) as a test in the matching `e2e_*.rs` suite.
-
-6. **Add a row to `docs/e2e_coverage_matrix.md`.**
 
 ## Rules
 

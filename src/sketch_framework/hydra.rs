@@ -456,8 +456,6 @@ mod tests {
         let mut hydra = Hydra::with_schema(3, 64, ["city", "device", "country"], template)
             .expect("valid schema");
 
-        // A fixed schema requires uniform arity, so every row carries all three
-        // columns; what used to be a shorter key is now a wildcard at query time.
         let dataset = [
             (["nyc", "phone", "us"], "event_a"),
             (["nyc", "phone", "us"], "event_a"),
@@ -718,7 +716,6 @@ mod tests {
                 .expect("schema arity");
         }
 
-        // let query_value = DataInput::F64(35.0);
         let quantile = hydra
             .query_key(&[Some("metrics"), Some("latency")], &HydraQuery::Cdf(30.0))
             .expect("well-formed query");
@@ -892,8 +889,6 @@ mod tests {
         assert!(KeySchema::try_from(too_many).is_err());
     }
 
-    /// Before the fix, `update` hashed only the concatenated *values*, so every
-    /// column shared one subkey namespace. This pins each consequence of that.
     #[test]
     fn hydra_subkeys_are_labelled_by_column() {
         let value = DataInput::Str("pkt");

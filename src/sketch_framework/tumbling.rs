@@ -1241,9 +1241,6 @@ mod tests {
         let mut tw_a = make();
         let mut tw_b = make();
 
-        // Spanning many windows exercises close_active → pool.put →
-        // tumbling_clear → re-seed, which is where the unseeded path used to
-        // re-randomize the coin on every rotation.
         let values = sample_uniform_f64(0.0, 1_000_000.0, 20_000, 0x5EED_0001);
         for (i, &v) in values.iter().enumerate() {
             let t = i as u64;
@@ -1318,7 +1315,6 @@ mod tests {
             let start = w * samples_per_window;
             let end = start + samples_per_window;
             for (i, &value) in stream.iter().enumerate().take(end).skip(start) {
-                // let value = stream[i];
                 tw.insert(i as u64, &DataInput::U64(value), 1);
                 *window_truth.entry(value).or_insert(0) += 1;
             }
@@ -1433,7 +1429,6 @@ mod tests {
             let start = w * samples_per_window;
             let end = start + samples_per_window;
             for (i, &value) in stream.iter().enumerate().take(end).skip(start) {
-                // let value = stream[i];
                 tw.insert(i as u64, &DataInput::U64(value), 1);
                 *window_truth.entry(value).or_insert(0) += 1;
             }
@@ -1607,7 +1602,6 @@ mod tests {
             let start = w * samples_per_window;
             let end = start + samples_per_window;
             for (i, &value) in stream.iter().enumerate().take(end).skip(start) {
-                // let value = stream[i];
                 tw.insert(i as u64, &DataInput::U64(value), 1);
                 *window_truth.entry(value).or_insert(0) += 1;
             }

@@ -11,7 +11,7 @@
 //!
 //! Two sub-modules are the older path, being retired:
 //!
-//! - [`portable`] — per-sketch wire types predating the envelope.
+//! - [`portable`] — pre-envelope types with their own Go goldens.
 //! - [`native`] — thin shims over the sketches' `serialize_to_bytes` /
 //!   `deserialize_from_bytes`, each a pass-through to ASAPv1.
 //!
