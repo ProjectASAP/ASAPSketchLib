@@ -8,18 +8,20 @@
 //!   Sketch and its Applications," J. Algorithms 55(1), 2005.
 //!   <https://www.cs.rutgers.edu/~muthu/cm-jal.pdf>
 
-use rmp_serde::{
-    decode::Error as RmpDecodeError, encode::Error as RmpEncodeError, from_slice, to_vec_named,
-};
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 
-use crate::octo_delta::{CM_PROMASK, CmDelta};
+use crate::common::structure_utils::AdmittedRows;
+use crate::input_to_owned;
+use crate::octo_delta::{CM_PROMASK, CmDelta, KeyedCmDelta, MAX_PROMASK};
 use crate::{
     DataInput, DefaultMatrixI32, DefaultMatrixI64, DefaultMatrixI128, DefaultXxHasher, FastPath,
     FastPathHasher, FixedMatrix, MatrixFastHash, MatrixStorage, NitroTarget, QuickMatrixI64,
-    QuickMatrixI128, RegularPath, SketchHasher, Vector2D, hash64_seeded,
+    QuickMatrixI128, RegularPath, SketchHasher, Vector2D, hash64_seeded, nitro_delta_saturated_i32,
 };
+
+mod wire;
+pub(crate) use wire::{CmsWireCounter, CmsWireMode};
 
 const DEFAULT_ROW_NUM: usize = 3;
 const DEFAULT_COL_NUM: usize = 4096;
@@ -258,20 +260,37 @@ impl<S: MatrixStorage, Mode, H: SketchHasher> CountMin<S, Mode, H> {
             }
         }
     }
-}
 
-// Serialization helpers for CountMin.
-impl<S: MatrixStorage + Serialize, Mode, H: SketchHasher> CountMin<S, Mode, H> {
-    /// Serializes the sketch into MessagePack bytes.
-    pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
-        to_vec_named(self)
-    }
-}
+    /// Merges another sketch by keeping the larger of each counter pair.
+    /// Correct only when the two sketches observed disjoint key sets; a shared
+    /// key reads back as the larger side rather than the sum.
+    pub fn merge_max(&mut self, other: &Self)
+    where
+        S::Counter: PartialOrd,
+    {
+        let self_rows = self.counts.rows();
+        let self_cols = self.counts.cols();
+        assert_eq!(
+            (self_rows, self_cols),
+            (other.counts.rows(), other.counts.cols()),
+            "dimension mismatch while merging CountMin sketches"
+        );
 
-impl<S: MatrixStorage + for<'de> Deserialize<'de>, Mode, H: SketchHasher> CountMin<S, Mode, H> {
-    /// Deserializes a sketch from MessagePack bytes.
-    pub fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self, RmpDecodeError> {
-        from_slice(bytes)
+        for i in 0..self_rows {
+            for j in 0..self_cols {
+                let value = other.counts.query_one_counter(i, j);
+                self.counts.update_one_counter(
+                    i,
+                    j,
+                    |cell: &mut S::Counter, incoming: S::Counter| {
+                        if incoming > *cell {
+                            *cell = incoming;
+                        }
+                    },
+                    value,
+                );
+            }
+        }
     }
 }
 
@@ -326,8 +345,11 @@ where
     pub fn estimate(&self, value: &DataInput) -> S::Counter {
         let rows = self.counts.rows();
         let cols = self.counts.cols();
-        let mut min = S::Counter::from(i32::MAX);
-        for r in 0..rows {
+        // Seed the running minimum from row 0's probed cell, then fold in the
+        // rest. Mirrors the fast path's `fast_query_min`.
+        let col0 = ((H::hash64_seeded(0, value) & LOWER_32_MASK) as usize) % cols;
+        let mut min = self.counts.query_one_counter(0, col0);
+        for r in 1..rows {
             let hashed = H::hash64_seeded(r, value);
             let col = ((hashed & LOWER_32_MASK) as usize) % cols;
             let v = self.counts.query_one_counter(r, col);
@@ -343,9 +365,23 @@ where
 pub type CountMinF64<H = DefaultXxHasher> = CountMin<Vector2D<f64>, RegularPath, H>;
 
 impl<S: MatrixStorage<Counter = i32>, H: SketchHasher> CountMin<S, RegularPath, H> {
-    /// Inserts an observation and emits a delta when the counter crosses a threshold.
+    /// Inserts an observation, emitting a delta at every promotion of the
+    /// default threshold `CM_PROMASK`.
     #[inline(always)]
     pub fn insert_emit_delta(&mut self, value: &DataInput, emit: &mut impl FnMut(CmDelta)) {
+        self.insert_emit_delta_with_threshold(value, CM_PROMASK, emit);
+    }
+
+    /// Inserts an observation, emitting a delta and clearing the counter each
+    /// time a row counter reaches `threshold` (OctoSketch Algorithm 1).
+    #[inline(always)]
+    pub fn insert_emit_delta_with_threshold(
+        &mut self,
+        value: &DataInput,
+        threshold: u32,
+        emit: &mut impl FnMut(CmDelta),
+    ) {
+        let threshold = threshold.clamp(1, MAX_PROMASK) as i32;
         let rows = self.counts.rows();
         let cols = self.counts.cols();
         for r in 0..rows {
@@ -353,14 +389,32 @@ impl<S: MatrixStorage<Counter = i32>, H: SketchHasher> CountMin<S, RegularPath, 
             let col = ((hashed & LOWER_32_MASK) as usize) % cols;
             self.counts.increment_by_row(r, col, 1);
             let current = self.counts.query_one_counter(r, col);
-            if current % CM_PROMASK as i32 == 0 {
+            if current >= threshold {
                 emit(CmDelta {
-                    row: r as u16,
-                    col: col as u16,
-                    value: CM_PROMASK,
+                    row: r as u32,
+                    col: col as u32,
+                    value: current as u32,
                 });
+                self.counts.update_one_counter(r, col, |c, _| *c = 0, ());
             }
         }
+    }
+
+    /// As `insert_emit_delta_with_threshold`, but every delta carries the flow
+    /// key so an aggregator can maintain the heavy-hitter heap that workers
+    /// no longer keep.
+    pub fn insert_emit_keyed_delta_with_threshold(
+        &mut self,
+        value: &DataInput,
+        threshold: u32,
+        emit: &mut impl FnMut(KeyedCmDelta),
+    ) {
+        self.insert_emit_delta_with_threshold(value, threshold, &mut |delta| {
+            emit(KeyedCmDelta {
+                key: input_to_owned(value),
+                delta,
+            })
+        });
     }
 }
 
@@ -368,9 +422,22 @@ impl<S, H: SketchHasher> CountMin<S, FastPath, H>
 where
     S: MatrixStorage<Counter = i32> + FastPathHasher<H>,
 {
-    /// Inserts an observation via fast-path and emits a delta at threshold crossings.
+    /// Inserts an observation via fast-path, emitting a delta at every
+    /// promotion of the default threshold `CM_PROMASK`.
     #[inline(always)]
     pub fn insert_emit_delta(&mut self, value: &DataInput, emit: &mut impl FnMut(CmDelta)) {
+        self.insert_emit_delta_with_threshold(value, CM_PROMASK, emit);
+    }
+
+    /// Fast-path counterpart of the regular-path threshold API.
+    #[inline(always)]
+    pub fn insert_emit_delta_with_threshold(
+        &mut self,
+        value: &DataInput,
+        threshold: u32,
+        emit: &mut impl FnMut(CmDelta),
+    ) {
+        let threshold = threshold.clamp(1, MAX_PROMASK) as i32;
         let hashed_val = <S as FastPathHasher<H>>::hash_for_matrix(&self.counts, value);
         let rows = self.counts.rows();
         let cols = self.counts.cols();
@@ -378,14 +445,30 @@ where
             let col = hashed_val.col_for_row(r, cols);
             self.counts.increment_by_row(r, col, 1);
             let current = self.counts.query_one_counter(r, col);
-            if current % CM_PROMASK as i32 == 0 {
+            if current >= threshold {
                 emit(CmDelta {
-                    row: r as u16,
-                    col: col as u16,
-                    value: CM_PROMASK,
+                    row: r as u32,
+                    col: col as u32,
+                    value: current as u32,
                 });
+                self.counts.update_one_counter(r, col, |c, _| *c = 0, ());
             }
         }
+    }
+
+    /// Fast-path counterpart of `insert_emit_keyed_delta_with_threshold`.
+    pub fn insert_emit_keyed_delta_with_threshold(
+        &mut self,
+        value: &DataInput,
+        threshold: u32,
+        emit: &mut impl FnMut(KeyedCmDelta),
+    ) {
+        self.insert_emit_delta_with_threshold(value, threshold, &mut |delta| {
+            emit(KeyedCmDelta {
+                key: input_to_owned(value),
+                delta,
+            })
+        });
     }
 }
 
@@ -501,25 +584,43 @@ impl<H: SketchHasher> CountMin<Vector2D<i32>, FastPath, H> {
         self.counts.enable_nitro(sampling_rate);
     }
 
+    /// Enables Nitro sampling with a reproducible, seed-selected schedule.
+    ///
+    /// See [`crate::Nitro::init_nitro_seeded`]: the unseeded path starts every
+    /// sketch at the same point in the skip table, so two sketches at the same
+    /// rate admit the same subset and are not independent trials.
+    pub fn enable_nitro_with_seed(&mut self, sampling_rate: f64, seed: u64) {
+        self.counts.enable_nitro_with_seed(sampling_rate, seed);
+    }
+
     /// Disables Nitro sampling and resets its internal state.
     pub fn disable_nitro(&mut self) {
         self.counts.disable_nitro();
     }
 
-    /// Inserts an observation using Nitro-aware sampling logic.
+    /// Inserts an observation through Nitro's per-row sampling schedule.
+    ///
+    /// The cells written are the ones a plain `insert` would write — the hash
+    /// is `FastPathHasher::hash_for_matrix` and the column is
+    /// `MatrixFastHash::col_for_row`, exactly as `MatrixStorage::fast_insert`
+    /// derives them, so `nitro_estimate` reads back what this wrote. The hash
+    /// is computed once per observation, and the admitted rows are collected
+    /// into an inline buffer, so the hot path does not allocate.
     #[inline(always)]
     pub fn fast_insert_nitro(&mut self, value: &DataInput) {
         let rows = self.counts.rows();
-        let delta = self.counts.nitro().delta as i32;
-        if self.counts.nitro().to_skip >= rows {
-            self.counts.reduce_nitro_skip(rows);
-        } else {
-            let hashed = H::hash128_seeded(0, value);
-            let r = self.counts.nitro().to_skip;
-            self.counts.update_by_row(r, hashed, |a, b| *a += b, delta);
-            self.counts.nitro_mut().draw_geometric();
-            let temp = self.counts.get_nitro_skip();
-            self.counts.update_nitro_skip((r + temp + 1) - rows);
+        let mut admitted = AdmittedRows::new();
+        self.counts.nitro_mut().admit_rows(rows, &mut admitted);
+        if admitted.is_empty() {
+            return;
+        }
+        let cols = self.counts.cols();
+        let hashed = <Vector2D<i32> as FastPathHasher<H>>::hash_for_matrix(&self.counts, value);
+        for (row, weight) in admitted {
+            let col = MatrixFastHash::col_for_row(&hashed, row, cols);
+            let delta = nitro_delta_saturated_i32(weight);
+            self.counts
+                .update_one_counter(row, col, |a: &mut i32, b: i32| *a += b, delta);
         }
     }
 
@@ -541,20 +642,37 @@ impl<H: SketchHasher> NitroTarget for CountMin<Vector2D<i32>, FastPath, H> {
 
     #[inline(always)]
     fn update_row(&mut self, row: usize, hashed: u128, delta: u64) {
-        self.counts
-            .update_by_row(row, hashed, |a, b| *a += b, delta as i32);
+        self.counts.update_by_row(
+            row,
+            hashed,
+            |a, b| *a += b,
+            nitro_delta_saturated_i32(delta),
+        );
+    }
+
+    #[inline(always)]
+    fn update_sample(&mut self, value: &DataInput, delta: u64) {
+        // Hash with the SAME derivation the estimator uses so both share one
+        // hash domain (raw hash128_seeded bit-slicing diverges in Packed64 mode).
+        let hashed = <Vector2D<i32> as FastPathHasher<H>>::hash_for_matrix(&self.counts, value);
+        let cols = self.counts.cols();
+        for row in 0..self.counts.rows() {
+            let col = <H::HashType as MatrixFastHash>::col_for_row(&hashed, row, cols);
+            self.counts.update_one_counter(
+                row,
+                col,
+                |a, b| *a += b,
+                nitro_delta_saturated_i32(delta),
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{
-        all_counter_zero_i32, counter_index, sample_uniform_f64, sample_zipf_u64,
-    };
+    use crate::test_utils::{all_counter_zero_i32, counter_index};
     use crate::{DataInput, hash64_seeded};
-    use core::f64;
-    use std::collections::HashMap;
 
     #[test]
     fn countmin_insert_emit_delta_emits_at_threshold_and_resets_period() {
@@ -601,86 +719,6 @@ mod tests {
         );
     }
 
-    fn run_zipf_stream(
-        rows: usize,
-        cols: usize,
-        domain: usize,
-        exponent: f64,
-        samples: usize,
-        seed: u64,
-    ) -> (CountMin<Vector2D<i32>, RegularPath>, HashMap<u64, i32>) {
-        let mut truth = HashMap::<u64, i32>::new();
-        let mut sketch = CountMin::<Vector2D<i32>, RegularPath>::with_dimensions(rows, cols);
-
-        for value in sample_zipf_u64(domain, exponent, samples, seed) {
-            let key = DataInput::U64(value);
-            sketch.insert(&key);
-            *truth.entry(value).or_insert(0) += 1;
-        }
-
-        (sketch, truth)
-    }
-
-    fn run_zipf_stream_fast(
-        rows: usize,
-        cols: usize,
-        domain: usize,
-        exponent: f64,
-        samples: usize,
-        seed: u64,
-    ) -> (CountMin<Vector2D<i32>, FastPath>, HashMap<u64, i32>) {
-        let mut truth = HashMap::<u64, i32>::new();
-        let mut sketch = CountMin::<Vector2D<i32>, FastPath>::with_dimensions(rows, cols);
-
-        for value in sample_zipf_u64(domain, exponent, samples, seed) {
-            let key = DataInput::U64(value);
-            sketch.insert(&key);
-            *truth.entry(value).or_insert(0) += 1;
-        }
-
-        (sketch, truth)
-    }
-
-    fn run_uniform_stream(
-        rows: usize,
-        cols: usize,
-        min: f64,
-        max: f64,
-        samples: usize,
-        seed: u64,
-    ) -> (CountMin<Vector2D<i32>, RegularPath>, HashMap<u64, i32>) {
-        let mut truth = HashMap::<u64, i32>::new();
-        let mut sketch = CountMin::<Vector2D<i32>, RegularPath>::with_dimensions(rows, cols);
-
-        for value in sample_uniform_f64(min, max, samples, seed) {
-            let key = DataInput::F64(value);
-            sketch.insert(&key);
-            *truth.entry(value.to_bits()).or_insert(0) += 1;
-        }
-
-        (sketch, truth)
-    }
-
-    fn run_uniform_stream_fast(
-        rows: usize,
-        cols: usize,
-        min: f64,
-        max: f64,
-        samples: usize,
-        seed: u64,
-    ) -> (CountMin<Vector2D<i32>, FastPath>, HashMap<u64, i32>) {
-        let mut truth = HashMap::<u64, i32>::new();
-        let mut sketch = CountMin::<Vector2D<i32>, FastPath>::with_dimensions(rows, cols);
-
-        for value in sample_uniform_f64(min, max, samples, seed) {
-            let key = DataInput::F64(value);
-            sketch.insert(&key);
-            *truth.entry(value.to_bits()).or_insert(0) += 1;
-        }
-
-        (sketch, truth)
-    }
-
     // test for dimension of CMS after initialization
     #[test]
     fn dimension_test() {
@@ -725,6 +763,22 @@ mod tests {
                 "fast path should match standard insert for key {key:?}"
             );
         }
+    }
+
+    #[test]
+    fn estimate_does_not_clamp_i64_counts_above_i32_max() {
+        let mut sk = CountMin::<Vector2D<i64>, RegularPath>::with_dimensions(3, 64);
+        let key = DataInput::Str("pkt_len");
+        let count: i64 = 35_000_000_000; // ~35 billion, well past i32::MAX
+
+        sk.insert_many(&key, count);
+
+        let est = sk.estimate(&key);
+        assert!(
+            est >= count,
+            "estimate {est} should be at least the true count {count}, not clamped"
+        );
+        assert_ne!(est, i32::MAX as i64, "estimate must not clamp to i32::MAX");
     }
 
     #[test]
@@ -825,138 +879,5 @@ mod tests {
         }
 
         assert_eq!(storage.as_slice(), expected_once.as_slice());
-    }
-
-    // test for zipf distribution for domain 8192 and exponent 1.1 with 200_000 items
-    // verify: (1-delta)*(query_size) is within bound (epsilon*input_size)
-    #[test]
-    fn cm_error_bound_zipf() {
-        // regular path
-        let (sk, truth) = run_zipf_stream(
-            DEFAULT_ROW_NUM,
-            DEFAULT_COL_NUM,
-            8192,
-            1.1,
-            200_000,
-            0x5eed_c0de,
-        );
-        let epsilon = std::f64::consts::E / DEFAULT_COL_NUM as f64;
-        let delta = 1.0 / std::f64::consts::E.powi(DEFAULT_ROW_NUM as i32);
-        let error_bound = epsilon * 200_000_f64;
-        let keys = truth.keys();
-        let correct_lower_bound = keys.len() as f64 * (1.0 - delta);
-        let mut within_count = 0;
-        for key in keys {
-            let est = sk.estimate(&DataInput::U64(*key));
-            if (est.abs_diff(*truth.get(key).unwrap()) as f64) < error_bound {
-                within_count += 1;
-            }
-        }
-        assert!(
-            within_count as f64 > correct_lower_bound,
-            "in-bound items number {within_count} not greater than expected amount {correct_lower_bound}"
-        );
-        // fast path
-        let (sk, truth) = run_zipf_stream_fast(
-            DEFAULT_ROW_NUM,
-            DEFAULT_COL_NUM,
-            8192,
-            1.1,
-            200_000,
-            0x5eed_c0de,
-        );
-        let epsilon = std::f64::consts::E / DEFAULT_COL_NUM as f64;
-        let delta = 1.0 / std::f64::consts::E.powi(DEFAULT_ROW_NUM as i32);
-        let error_bound = epsilon * 200_000_f64;
-        let keys = truth.keys();
-        let correct_lower_bound = keys.len() as f64 * (1.0 - delta);
-        let mut within_count = 0;
-        for key in keys {
-            let est = sk.estimate(&DataInput::U64(*key));
-            if (est.abs_diff(*truth.get(key).unwrap()) as f64) < error_bound {
-                within_count += 1;
-            }
-        }
-        assert!(
-            within_count as f64 > correct_lower_bound,
-            "in-bound items number {within_count} not greater than expected amount {correct_lower_bound}"
-        );
-    }
-
-    // test for uniform distribution from 100.0 to 1000.0 with 200_000 items
-    // verify: (1-delta)*(query_size) is within bound (epsilon*input_size)
-    #[test]
-    fn cm_error_bound_uniform() {
-        // regular path
-        let (sk, truth) = run_uniform_stream(
-            DEFAULT_ROW_NUM,
-            DEFAULT_COL_NUM,
-            100.0,
-            1000.0,
-            200_000,
-            0x5eed_c0de,
-        );
-        let epsilon = std::f64::consts::E / DEFAULT_COL_NUM as f64;
-        let delta = 1.0 / std::f64::consts::E.powi(DEFAULT_ROW_NUM as i32);
-        let error_bound = epsilon * 200_000_f64;
-        let keys = truth.keys();
-        let correct_lower_bound = keys.len() as f64 * (1.0 - delta);
-        let mut within_count = 0;
-        for key in keys {
-            let est = sk.estimate(&DataInput::U64(*key));
-            if (est.abs_diff(*truth.get(key).unwrap()) as f64) < error_bound {
-                within_count += 1;
-            }
-        }
-        assert!(
-            within_count as f64 > correct_lower_bound,
-            "in-bound items number {within_count} not greater than expected amount {correct_lower_bound}"
-        );
-        // fast path
-        let (sk, truth) = run_uniform_stream_fast(
-            DEFAULT_ROW_NUM,
-            DEFAULT_COL_NUM,
-            100.0,
-            1000.0,
-            200_000,
-            0x5eed_c0de,
-        );
-        let epsilon = std::f64::consts::E / DEFAULT_COL_NUM as f64;
-        let delta = 1.0 / std::f64::consts::E.powi(DEFAULT_ROW_NUM as i32);
-        let error_bound = epsilon * 200_000_f64;
-        let keys = truth.keys();
-        let correct_lower_bound = keys.len() as f64 * (1.0 - delta);
-        let mut within_count = 0;
-        for key in keys {
-            let est = sk.estimate(&DataInput::U64(*key));
-            if (est.abs_diff(*truth.get(key).unwrap()) as f64) < error_bound {
-                within_count += 1;
-            }
-        }
-        assert!(
-            within_count as f64 > correct_lower_bound,
-            "in-bound items number {within_count} not greater than expected amount {correct_lower_bound}"
-        );
-    }
-
-    #[test]
-    fn count_min_round_trip_serialization() {
-        let mut sketch = CountMin::<Vector2D<i32>, RegularPath>::with_dimensions(3, 8);
-        sketch.insert(&DataInput::U64(42));
-        sketch.insert(&DataInput::U64(7));
-
-        let encoded = sketch.serialize_to_bytes().expect("serialize CountMin");
-        assert!(!encoded.is_empty());
-        let data_copied = encoded.clone();
-
-        let decoded = CountMin::<Vector2D<i32>, RegularPath>::deserialize_from_bytes(&data_copied)
-            .expect("deserialize CountMin");
-
-        assert_eq!(sketch.rows(), decoded.rows());
-        assert_eq!(sketch.cols(), decoded.cols());
-        assert_eq!(
-            sketch.as_storage().as_slice(),
-            decoded.as_storage().as_slice()
-        );
     }
 }

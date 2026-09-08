@@ -7,6 +7,8 @@ use super::super::sketches::*;
 use super::UnivMon;
 use crate::sketches::countsketch_topk::CountL2HH;
 
+pub(crate) mod wire;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 /// Norm choices used by EH merge policies.
 pub enum SketchNorm {
@@ -21,7 +23,7 @@ pub enum SketchNorm {
 pub enum EHSketchList {
     /// Count-Min sketch.
     CM(CountMin<Vector2D<i32>, FastPath>),
-    #[cfg(feature = "experimental")]
+    /// CocoSketch.
     COCO(Coco),
     /// CountL2HH sketch.
     COUNTL2HH(CountL2HH),
@@ -29,7 +31,7 @@ pub enum EHSketchList {
     CS(Count<Vector2D<i32>, FastPath>),
     /// DDSketch.
     DDS(DDSketch),
-    #[cfg(feature = "experimental")]
+    /// Elastic sketch.
     ELASTIC(Elastic),
     /// HyperLogLog.
     HLL(HyperLogLog<ErtlMLE>),
@@ -48,14 +50,14 @@ impl EHSketchList {
         match self {
             EHSketchList::COUNTL2HH(_) | EHSketchList::UNIVMON(_) => norm == SketchNorm::L2,
             EHSketchList::CM(_)
+            | EHSketchList::COCO(_)
             | EHSketchList::CS(_)
             | EHSketchList::DDS(_)
+            | EHSketchList::ELASTIC(_)
             | EHSketchList::HLL(_)
             | EHSketchList::KLL(_) => norm == SketchNorm::L1,
             #[cfg(feature = "experimental")]
-            EHSketchList::COCO(_) | EHSketchList::ELASTIC(_) | EHSketchList::UNIFORM(_) => {
-                norm == SketchNorm::L1
-            }
+            EHSketchList::UNIFORM(_) => norm == SketchNorm::L1,
         }
     }
 
@@ -74,7 +76,6 @@ impl EHSketchList {
     pub fn insert(&mut self, val: &DataInput) {
         match self {
             EHSketchList::CM(sketch) => sketch.insert(val),
-            #[cfg(feature = "experimental")]
             EHSketchList::COCO(sketch) => match val {
                 DataInput::Str(s) => sketch.insert(s, 1),
                 DataInput::String(s) => sketch.insert(s.as_str(), 1),
@@ -85,7 +86,6 @@ impl EHSketchList {
             EHSketchList::DDS(sketch) => {
                 let _ = sketch.add_input(val);
             }
-            #[cfg(feature = "experimental")]
             EHSketchList::ELASTIC(sketch) => match val {
                 DataInput::String(s) => sketch.insert(s.to_string()),
                 DataInput::I32(i) => sketch.insert(i.to_string()),
@@ -127,7 +127,6 @@ impl EHSketchList {
                 s.merge(o);
                 Ok(())
             }
-            #[cfg(feature = "experimental")]
             (EHSketchList::COCO(s), EHSketchList::COCO(o)) => {
                 s.merge(o);
                 Ok(())
@@ -140,7 +139,10 @@ impl EHSketchList {
                 s.merge(o);
                 Ok(())
             }
-            (EHSketchList::DDS(s), EHSketchList::DDS(o)) => {
+            (EHSketchList::DDS(s), EHSketchList::DDS(o)) => s
+                .merge(o)
+                .map_err(|_| "Cannot merge DDSketches with different index mappings"),
+            (EHSketchList::ELASTIC(s), EHSketchList::ELASTIC(o)) => {
                 s.merge(o);
                 Ok(())
             }
@@ -166,11 +168,9 @@ impl EHSketchList {
     pub fn query(&self, key: &DataInput) -> Result<f64, &'static str> {
         match (self, key) {
             (EHSketchList::CM(count_min), _) => Ok(count_min.estimate(key) as f64),
-            #[cfg(feature = "experimental")]
-            (EHSketchList::COCO(coco), DataInput::Str(s)) => Ok(coco.clone().estimate(s) as f64),
-            #[cfg(feature = "experimental")]
+            (EHSketchList::COCO(coco), DataInput::Str(s)) => Ok(coco.estimate_key(s) as f64),
             (EHSketchList::COCO(coco), DataInput::String(s)) => {
-                Ok(coco.clone().estimate(s.as_str()) as f64)
+                Ok(coco.estimate_key(s.as_str()) as f64)
             }
             (EHSketchList::COUNTL2HH(count_univ), _) => Ok(count_univ.fast_get_est(key)),
             (EHSketchList::CS(count_sketch), _) => Ok(count_sketch.estimate(key)),
@@ -204,9 +204,8 @@ impl EHSketchList {
                 "max" => dd.max().ok_or("DDSketch has no samples"),
                 _ => Err("Unsupported command for DDSketch"),
             },
-            #[cfg(feature = "experimental")]
             (EHSketchList::ELASTIC(elastic), DataInput::String(s)) => {
-                Ok(elastic.clone().query(s.clone()) as f64)
+                Ok(elastic.query(s.clone()) as f64)
             }
             (EHSketchList::HLL(hll_df_modified), _) => Ok(hll_df_modified.estimate() as f64),
             (EHSketchList::KLL(kll), DataInput::I32(i)) => Ok(kll.quantile(*i as f64)),
@@ -265,12 +264,10 @@ impl EHSketchList {
     pub fn sketch_type(&self) -> &'static str {
         match self {
             EHSketchList::CM(_) => "CountMin",
-            #[cfg(feature = "experimental")]
             EHSketchList::COCO(_) => "Coco",
             EHSketchList::COUNTL2HH(_) => "CountL2HH",
             EHSketchList::CS(_) => "CountSketch",
             EHSketchList::DDS(_) => "DDSketch",
-            #[cfg(feature = "experimental")]
             EHSketchList::ELASTIC(_) => "Elastic",
             EHSketchList::HLL(_) => "HLL",
             EHSketchList::KLL(_) => "KLL",
@@ -327,6 +324,33 @@ mod tests {
 
         let q50 = dd.query(&DataInput::F64(0.5)).expect("query DDSketch q50");
         assert!((10.0..=30.0).contains(&q50), "unexpected q50 {q50}");
+    }
+
+    /// `EHSketchList` derives its serde form from the variants it holds, so a
+    /// round trip of a nested DDSketch must carry the sketch's whole state.
+    #[test]
+    fn nested_ddsketch_survives_a_serde_round_trip() {
+        let mut dd = EHSketchList::DDS(DDSketch::new(0.01));
+        for v in [10.0f64, 20.0, 30.0, 40.0] {
+            dd.insert(&DataInput::F64(v));
+        }
+        let before = match &dd {
+            EHSketchList::DDS(inner) => (inner.get_count(), inner.sum(), inner.min(), inner.max()),
+            _ => panic!("expected the DDSketch variant"),
+        };
+
+        let bytes = rmp_serde::to_vec(&dd).expect("encode");
+        let restored: EHSketchList = rmp_serde::from_slice(&bytes).expect("decode");
+        let after = match &restored {
+            EHSketchList::DDS(inner) => (inner.get_count(), inner.sum(), inner.min(), inner.max()),
+            _ => panic!("expected the DDSketch variant"),
+        };
+        assert_eq!(after, before, "the nested sketch lost its running state");
+
+        let q50 = restored
+            .query(&DataInput::F64(0.5))
+            .expect("query the restored DDSketch");
+        assert!((10.0..=40.0).contains(&q50), "unexpected q50 {q50}");
     }
 
     #[test]

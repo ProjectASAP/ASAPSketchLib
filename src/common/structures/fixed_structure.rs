@@ -1,8 +1,7 @@
 //! A fixed integer matrix.
 //! Size fixed at compile time and heap-backed via Box.
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::ops::{Index, IndexMut, Range};
+use serde::{Deserialize, Serialize};
 
 /// Quick-start row count for fixed matrix aliases.
 pub const QUICKSTART_ROW_NUM: usize = 5;
@@ -16,6 +15,14 @@ pub const DEFAULT_ROW_NUM: usize = 3;
 pub const DEFAULT_COL_NUM: usize = 4096;
 
 /// Register storage interface used by HyperLogLog implementations.
+///
+/// Implementations must keep the constants consistent:
+/// `NUM_REGISTERS == 1 << PRECISION`, `REGISTER_BITS == 64 - PRECISION`, and
+/// `P_MASK == NUM_REGISTERS - 1`, with `PRECISION >= 1`. The estimators rely
+/// on these relations (a register rank never exceeds `REGISTER_BITS + 1`), so
+/// an inconsistent hand-written impl silently produces wrong estimates.
+/// [`impl_hll_bucket_list!`](crate::impl_hll_bucket_list) enforces them at
+/// compile time.
 pub trait HllRegisterStorage:
     Clone + std::fmt::Debug + Default + Serialize + for<'de> Deserialize<'de>
 {
@@ -46,13 +53,49 @@ pub trait HllRegisterStorage:
     }
 }
 
+#[macro_export]
+/// Generates a fixed-size HLL register storage type for a given precision.
+///
+/// Use this to instantiate a precision the crate does not ship a type for
+/// (the built-ins are [`HllBucketListP12`], [`HllBucketListP14`], and
+/// [`HllBucketListP16`]). The generated type implements
+/// [`HllRegisterStorage`], so it plugs straight into `HyperLogLogImpl` and
+/// `HyperLogLogHIPImpl` and keeps the same monomorphized fast path.
+///
+/// `num_registers` must be exactly `1 << precision`, and `precision` must be
+/// at least 1; both are checked at compile time. The register index is
+/// `(hash >> REGISTER_BITS) & P_MASK`, so a mismatched pair would address only
+/// `1 << precision` registers while dividing by `num_registers`, silently
+/// biasing every estimate.
+///
+/// ```
+/// use asap_sketchlib::sketches::hll::HyperLogLogImpl;
+/// use asap_sketchlib::{Classic, DataInput};
+///
+/// asap_sketchlib::impl_hll_bucket_list!(HllBucketListP18, 18, 1_usize << 18);
+///
+/// let mut hll = HyperLogLogImpl::<Classic, HllBucketListP18>::new();
+/// hll.insert(&DataInput::Str("hello"));
+/// assert_eq!(HllBucketListP18::NUM_REGISTERS, 1 << 18);
+/// ```
 macro_rules! impl_hll_bucket_list {
     ($name:ident, $precision:literal, $num_registers:expr) => {
-        #[derive(Clone, Debug)]
+        const _: () = {
+            ::std::assert!(
+                $num_registers == 1_usize << $precision,
+                "impl_hll_bucket_list!: num_registers must equal 1 << precision",
+            );
+            ::std::assert!(
+                $precision >= 1,
+                "impl_hll_bucket_list!: precision must be at least 1",
+            );
+        };
+
+        #[derive(::std::clone::Clone, ::std::fmt::Debug)]
         /// Fixed-size HLL register storage.
         pub struct $name {
             /// Backing register array.
-            pub registers: Box<[u8; $num_registers]>,
+            pub registers: ::std::boxed::Box<[u8; $num_registers]>,
         }
 
         impl $name {
@@ -66,37 +109,98 @@ macro_rules! impl_hll_bucket_list {
             pub const P_MASK: u64 = ($num_registers as u64) - 1;
         }
 
-        impl Default for $name {
-            fn default() -> Self {
-                Self {
-                    registers: Box::new([0_u8; $num_registers]),
+        impl $name {
+            /// Allocates a zeroed register array directly on the heap.
+            ///
+            /// `Box::new([0_u8; N])` would build the array as a stack value
+            /// first and copy it into the box; release builds elide that
+            /// temporary, but debug builds do not and overflow the stack at
+            /// larger precisions. Going through a boxed slice never
+            /// materializes an `[u8; N]` value, so stack use is constant in
+            /// every profile.
+            fn zeroed_registers() -> ::std::boxed::Box<[u8; $num_registers]> {
+                let registers: ::std::boxed::Box<[u8]> =
+                    ::std::vec![0_u8; $num_registers].into_boxed_slice();
+                match <::std::boxed::Box<[u8; $num_registers]> as ::std::convert::TryFrom<
+                    ::std::boxed::Box<[u8]>,
+                >>::try_from(registers)
+                {
+                    Ok(registers) => registers,
+                    Err(_) => ::std::unreachable!("boxed slice length is the register count"),
                 }
             }
         }
 
-        impl Serialize for $name {
-            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: Serializer,
-            {
-                serde_big_array::BigArray::serialize(&*self.registers, serializer)
+        impl ::std::default::Default for $name {
+            fn default() -> Self {
+                Self {
+                    registers: Self::zeroed_registers(),
+                }
             }
         }
 
-        impl<'de> Deserialize<'de> for $name {
-            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        impl $crate::__private::serde::Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> ::std::result::Result<S::Ok, S::Error>
             where
-                D: Deserializer<'de>,
+                S: $crate::__private::serde::Serializer,
             {
-                let data: [u8; $num_registers] =
-                    serde_big_array::BigArray::deserialize(deserializer)?;
-                Ok(Self {
-                    registers: Box::new(data),
-                })
+                $crate::__private::serde_big_array::BigArray::serialize(
+                    &*self.registers,
+                    serializer,
+                )
             }
         }
 
-        impl Index<usize> for $name {
+        impl<'de> $crate::__private::serde::Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> ::std::result::Result<Self, D::Error>
+            where
+                D: $crate::__private::serde::Deserializer<'de>,
+            {
+                // Fills a heap-allocated array element by element. The
+                // encoding is the same fixed-length sequence `BigArray`
+                // writes, but decoding never builds an `[u8; N]` on the
+                // stack -- see `zeroed_registers`.
+                struct RegisterVisitor;
+
+                impl<'de> $crate::__private::serde::de::Visitor<'de> for RegisterVisitor {
+                    type Value = $name;
+
+                    fn expecting(
+                        &self,
+                        formatter: &mut ::std::fmt::Formatter,
+                    ) -> ::std::fmt::Result {
+                        ::std::write!(formatter, "an array of {} bytes", $num_registers)
+                    }
+
+                    fn visit_seq<A>(
+                        self,
+                        mut seq: A,
+                    ) -> ::std::result::Result<Self::Value, A::Error>
+                    where
+                        A: $crate::__private::serde::de::SeqAccess<'de>,
+                    {
+                        let mut out = <$name as ::std::default::Default>::default();
+                        for i in 0..$num_registers {
+                            match seq.next_element::<u8>()? {
+                                Some(byte) => out.registers[i] = byte,
+                                None => {
+                                    return Err(
+                                        <A::Error as $crate::__private::serde::de::Error>::invalid_length(
+                                            i, &self,
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        Ok(out)
+                    }
+                }
+
+                deserializer.deserialize_tuple($num_registers, RegisterVisitor)
+            }
+        }
+
+        impl ::std::ops::Index<usize> for $name {
             type Output = u8;
 
             fn index(&self, index: usize) -> &Self::Output {
@@ -105,39 +209,39 @@ macro_rules! impl_hll_bucket_list {
             }
         }
 
-        impl IndexMut<usize> for $name {
+        impl ::std::ops::IndexMut<usize> for $name {
             fn index_mut(&mut self, index: usize) -> &mut Self::Output {
                 debug_assert!(index < $num_registers, "index out of bounds");
                 &mut self.registers[index]
             }
         }
 
-        impl Index<Range<usize>> for $name {
+        impl ::std::ops::Index<::std::ops::Range<usize>> for $name {
             type Output = [u8];
 
-            fn index(&self, range: Range<usize>) -> &Self::Output {
+            fn index(&self, range: ::std::ops::Range<usize>) -> &Self::Output {
                 debug_assert!(range.end <= $num_registers, "range end out of bounds");
                 &self.registers[range]
             }
         }
 
-        impl IndexMut<Range<usize>> for $name {
-            fn index_mut(&mut self, range: Range<usize>) -> &mut Self::Output {
+        impl ::std::ops::IndexMut<::std::ops::Range<usize>> for $name {
+            fn index_mut(&mut self, range: ::std::ops::Range<usize>) -> &mut Self::Output {
                 debug_assert!(range.end <= $num_registers, "range end out of bounds");
                 &mut self.registers[range]
             }
         }
 
-        impl<'a> IntoIterator for &'a $name {
+        impl<'a> ::std::iter::IntoIterator for &'a $name {
             type Item = &'a u8;
-            type IntoIter = std::slice::Iter<'a, u8>;
+            type IntoIter = ::std::slice::Iter<'a, u8>;
 
             fn into_iter(self) -> Self::IntoIter {
                 self.registers.iter()
             }
         }
 
-        impl HllRegisterStorage for $name {
+        impl $crate::HllRegisterStorage for $name {
             const PRECISION: usize = Self::PRECISION;
             const REGISTER_BITS: usize = Self::REGISTER_BITS;
             const NUM_REGISTERS: usize = Self::NUM_REGISTERS;

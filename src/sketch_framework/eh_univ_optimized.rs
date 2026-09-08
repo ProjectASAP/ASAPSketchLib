@@ -290,7 +290,6 @@ impl EHUnivOptimized {
                 let other = self.um_buckets.remove(i + 1);
                 let bucket = &mut self.um_buckets[i];
                 bucket.sketch.merge(&other.sketch);
-                bucket.sketch.bucket_size += other.sketch.bucket_size;
                 bucket.bucket_size += other.bucket_size;
                 bucket.max_time = bucket.max_time.max(other.max_time);
                 bucket.min_time = bucket.min_time.min(other.min_time);
@@ -387,7 +386,6 @@ impl EHUnivOptimized {
             let mut merged = self.um_buckets[from_bucket].sketch.clone();
             for i in (from_bucket + 1)..=to_bucket {
                 merged.merge(&self.um_buckets[i].sketch);
-                merged.bucket_size += self.um_buckets[i].sketch.bucket_size;
             }
             Some(EHUnivQueryResult::Sketch(merged))
         } else if from_bucket >= s_count {
@@ -415,7 +413,6 @@ impl EHUnivOptimized {
             );
             for i in from_bucket..s_count {
                 merged.merge(&self.um_buckets[i].sketch);
-                merged.bucket_size += self.um_buckets[i].sketch.bucket_size;
             }
 
             // Merge qualifying map buckets into a temporary map

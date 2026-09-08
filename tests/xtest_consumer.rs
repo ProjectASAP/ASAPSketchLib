@@ -62,7 +62,7 @@ fn cross_language_proto() {
 
     let cm_state = match env.sketch_state {
         Some(sketch_envelope::SketchState::CountMin(ref s)) => s.clone(),
-        other => panic!("expected CountMin sketch_state, got {:?}", other),
+        other => panic!("expected CountMin sketch_state, got {other:?}"),
     };
 
     println!(
@@ -96,10 +96,7 @@ fn cross_language_proto() {
     let hot_key = b"item:42" as &[u8];
     let hot_hash = xxh3_64_seeded(SEED_0, hot_key);
 
-    println!(
-        "[CountMin] Step 3/3 — Point query 'item:42' (hash=0x{:016x})",
-        hot_hash
-    );
+    println!("[CountMin] Step 3/3 — Point query 'item:42' (hash=0x{hot_hash:016x})");
 
     let bits_per_row = col_bits(cols);
     let mask = (cols as u64) - 1;
@@ -112,12 +109,9 @@ fn cross_language_proto() {
             min_freq = v;
         }
     }
-    println!(
-        "[CountMin]   min frequency estimate = {:.0} (expect ≥ 101)",
-        min_freq
-    );
+    println!("[CountMin]   min frequency estimate = {min_freq:.0} (expect ≥ 101)");
     if min_freq < 101.0 {
-        eprintln!("[CountMin] FAIL: frequency {:.0} < 101", min_freq);
+        eprintln!("[CountMin] FAIL: frequency {min_freq:.0} < 101");
         all_ok = false;
     } else {
         println!("[CountMin]   PASS");
@@ -139,7 +133,7 @@ fn cross_language_proto() {
 
     let kll_state = match env.sketch_state {
         Some(sketch_envelope::SketchState::Kll(ref s)) => s.clone(),
-        other => panic!("expected KLL sketch_state, got {:?}", other),
+        other => panic!("expected KLL sketch_state, got {other:?}"),
     };
 
     println!(
@@ -154,17 +148,14 @@ fn cross_language_proto() {
     let kll = KllFromProto::from_state(&kll_state);
     let p50 = kll.quantile(0.50);
     let p99 = kll.quantile(0.99);
-    println!(
-        "[KLL] Step 3/3 — p50 ≈ {:.1} (expect ~5000)  p99 ≈ {:.1} (expect ~9900)",
-        p50, p99
-    );
+    println!("[KLL] Step 3/3 — p50 ≈ {p50:.1} (expect ~5000)  p99 ≈ {p99:.1} (expect ~9900)");
 
     let p50_ok = (p50 - 5000.0).abs() / 5000.0 < 0.05;
     let p99_ok = (p99 - 9900.0).abs() / 9900.0 < 0.05;
     if p50_ok && p99_ok {
         println!("[KLL]   PASS");
     } else {
-        eprintln!("[KLL] FAIL: p50={:.1} p99={:.1}", p50, p99);
+        eprintln!("[KLL] FAIL: p50={p50:.1} p99={p99:.1}");
         all_ok = false;
     }
 
@@ -184,11 +175,10 @@ fn cross_language_proto() {
 
     let dd_state = match env.sketch_state {
         Some(sketch_envelope::SketchState::Ddsketch(ref s)) => s.clone(),
-        other => panic!("expected DDSketch sketch_state, got {:?}", other),
+        other => panic!("expected DDSketch sketch_state, got {other:?}"),
     };
 
-    // `count` was dropped from the wire (ProjectASAP/sketchlib-go#243);
-    // recover it by summing the bucket counts.
+    // `count` is not on the wire; recover it by summing the bucket counts.
     let dd_total_count: u64 = dd_state.store_counts.iter().copied().sum();
     println!(
         "[DDSketch]   alpha={:.4} count={} buckets={} offset={}",
@@ -216,7 +206,7 @@ fn cross_language_proto() {
     if p50_ok && p99_ok {
         println!("[DDSketch]   PASS");
     } else {
-        eprintln!("[DDSketch] FAIL: p50={:?} p99={:?}", p50_dd, p99_dd);
+        eprintln!("[DDSketch] FAIL: p50={p50_dd:?} p99={p99_dd:?}");
         all_ok = false;
     }
 
@@ -236,7 +226,7 @@ fn cross_language_proto() {
 
     let hll_state = match env.sketch_state {
         Some(sketch_envelope::SketchState::Hll(ref s)) => s.clone(),
-        other => panic!("expected HLL sketch_state, got {:?}", other),
+        other => panic!("expected HLL sketch_state, got {other:?}"),
     };
 
     println!(
@@ -247,14 +237,11 @@ fn cross_language_proto() {
     );
 
     let hll_card = hll_ertl_mle_estimate(&hll_state);
-    println!(
-        "[HLL] Step 3/3 — cardinality ≈ {} (expect ~50000)",
-        hll_card
-    );
+    println!("[HLL] Step 3/3 — cardinality ≈ {hll_card} (expect ~50000)");
     if (40_000..=65_000).contains(&hll_card) {
         println!("[HLL]   PASS");
     } else {
-        eprintln!("[HLL] FAIL: cardinality {} not in [40000, 65000]", hll_card);
+        eprintln!("[HLL] FAIL: cardinality {hll_card} not in [40000, 65000]");
         all_ok = false;
     }
 
@@ -274,7 +261,7 @@ fn cross_language_proto() {
 
     let cs_state = match env.sketch_state {
         Some(sketch_envelope::SketchState::CountSketch(ref s)) => s.clone(),
-        other => panic!("expected CountSketch sketch_state, got {:?}", other),
+        other => panic!("expected CountSketch sketch_state, got {other:?}"),
     };
 
     println!(
@@ -288,14 +275,11 @@ fn cross_language_proto() {
     // Go hash: common.Hash64([]byte("cs:hot")) = xxh3_64_seeded(seedList[0], b"cs:hot")
     let cs_hot_hash = xxh3_64_seeded(SEED_0, b"cs:hot");
     let cs_est = count_sketch_query_float(&cs_state, cs_hot_hash);
-    println!(
-        "[CountSketch] Step 3/3 — 'cs:hot' est = {:.0} (expect ≥ 200)",
-        cs_est
-    );
+    println!("[CountSketch] Step 3/3 — 'cs:hot' est = {cs_est:.0} (expect ≥ 200)");
     if cs_est >= 200.0 {
         println!("[CountSketch]   PASS");
     } else {
-        eprintln!("[CountSketch] FAIL: estimate {:.0} < 200", cs_est);
+        eprintln!("[CountSketch] FAIL: estimate {cs_est:.0} < 200");
         all_ok = false;
     }
 
@@ -315,7 +299,7 @@ fn cross_language_proto() {
 
     let coco_state = match env.sketch_state {
         Some(sketch_envelope::SketchState::Coco(ref s)) => s.clone(),
-        other => panic!("expected CocoSketch sketch_state, got {:?}", other),
+        other => panic!("expected CocoSketch sketch_state, got {other:?}"),
     };
 
     println!(
@@ -330,14 +314,11 @@ fn cross_language_proto() {
     // DeriveIndex(hash, row, width): col = (hash >> (row * maskBitsForWidth(width))) & (width-1)
     let coco_hash = xxh3_64_seeded(SEED_0, b"coco:hot");
     let coco_est = coco_estimate(&coco_state, coco_hash);
-    println!(
-        "[CocoSketch] Step 3/3 — 'coco:hot' est = {} (expect ≥ 500)",
-        coco_est
-    );
+    println!("[CocoSketch] Step 3/3 — 'coco:hot' est = {coco_est} (expect ≥ 500)");
     if coco_est >= 500 {
         println!("[CocoSketch]   PASS");
     } else {
-        eprintln!("[CocoSketch] FAIL: estimate {} < 500", coco_est);
+        eprintln!("[CocoSketch] FAIL: estimate {coco_est} < 500");
         all_ok = false;
     }
 
@@ -357,7 +338,7 @@ fn cross_language_proto() {
 
     let elastic_state = match env.sketch_state {
         Some(sketch_envelope::SketchState::Elastic(ref s)) => s.clone(),
-        other => panic!("expected ElasticSketch sketch_state, got {:?}", other),
+        other => panic!("expected ElasticSketch sketch_state, got {other:?}"),
     };
 
     println!(
@@ -371,14 +352,11 @@ fn cross_language_proto() {
     // Go uses CanonicalHashSeed = seedList[5] = 0x6a09e667
     let elephant_hash = xxh3_64_seeded(SEED_5, b"elephant");
     let elephant_est = elastic_query(&elastic_state, "elephant", elephant_hash);
-    println!(
-        "[ElasticSketch] Step 3/3 — 'elephant' est = {} (expect ≥ 900)",
-        elephant_est
-    );
+    println!("[ElasticSketch] Step 3/3 — 'elephant' est = {elephant_est} (expect ≥ 900)");
     if elephant_est >= 900 {
         println!("[ElasticSketch]   PASS");
     } else {
-        eprintln!("[ElasticSketch] FAIL: estimate {} < 900", elephant_est);
+        eprintln!("[ElasticSketch] FAIL: estimate {elephant_est} < 900");
         all_ok = false;
     }
 
@@ -398,7 +376,7 @@ fn cross_language_proto() {
 
     let um_state = match env.sketch_state {
         Some(sketch_envelope::SketchState::Univmon(ref s)) => s.clone(),
-        other => panic!("expected UnivMon sketch_state, got {:?}", other),
+        other => panic!("expected UnivMon sketch_state, got {other:?}"),
     };
 
     println!(
@@ -409,17 +387,11 @@ fn cross_language_proto() {
     let um_card = univmon_cardinality(&um_state);
     // Note: the g-sum heuristic typically underestimates (Go itself reports ~4250 for 10k inserts).
     // We verify the Rust result matches Go's algorithm rather than the true cardinality.
-    println!(
-        "[UnivMon] Step 3/3 — cardinality ≈ {:.0} (g-sum heuristic, Go also ~4250)",
-        um_card
-    );
+    println!("[UnivMon] Step 3/3 — cardinality ≈ {um_card:.0} (g-sum heuristic, Go also ~4250)");
     if (1_000.0..=15_000.0).contains(&um_card) {
         println!("[UnivMon]   PASS");
     } else {
-        eprintln!(
-            "[UnivMon] FAIL: cardinality {:.0} not in [1000, 15000]",
-            um_card
-        );
+        eprintln!("[UnivMon] FAIL: cardinality {um_card:.0} not in [1000, 15000]");
         all_ok = false;
     }
 
@@ -439,7 +411,7 @@ fn cross_language_proto() {
 
     let hydra_state = match env.sketch_state {
         Some(sketch_envelope::SketchState::Hydra(ref s)) => s.clone(),
-        other => panic!("expected Hydra sketch_state, got {:?}", other),
+        other => panic!("expected Hydra sketch_state, got {other:?}"),
     };
 
     println!(
@@ -456,14 +428,11 @@ fn cross_language_proto() {
     let hydra_subkey_hash = xxh3_64_seeded(SEED_6, b"hydra:42");
     let hydra_value_hash = xxh3_64_seeded(SEED_0, b"hydra:42");
     let hydra_est = hydra_query_cm(&hydra_state, hydra_subkey_hash, hydra_value_hash);
-    println!(
-        "[Hydra] Step 3/3 — 'hydra:42' est = {:.0} (expect ≥ 51)",
-        hydra_est
-    );
+    println!("[Hydra] Step 3/3 — 'hydra:42' est = {hydra_est:.0} (expect ≥ 51)");
     if hydra_est >= 51.0 {
         println!("[Hydra]   PASS");
     } else {
-        eprintln!("[Hydra] FAIL: estimate {:.0} < 51", hydra_est);
+        eprintln!("[Hydra] FAIL: estimate {hydra_est:.0} < 51");
         all_ok = false;
     }
 
@@ -488,7 +457,7 @@ fn cross_language_proto() {
 
         let cm_state = match env.sketch_state {
             Some(sketch_envelope::SketchState::CountMin(ref s)) => s.clone(),
-            other => panic!("expected CountMin sketch_state, got {:?}", other),
+            other => panic!("expected CountMin sketch_state, got {other:?}"),
         };
         let rows = cm_state.rows as usize;
         let cols = cm_state.cols as usize;
@@ -541,7 +510,7 @@ fn cross_language_proto() {
 
         let mut hll_state = match env.sketch_state {
             Some(sketch_envelope::SketchState::Hll(ref s)) => s.clone(),
-            other => panic!("expected HLL sketch_state, got {:?}", other),
+            other => panic!("expected HLL sketch_state, got {other:?}"),
         };
         // Dual-read the registers (sampling thins them → may be sparse-encoded).
         let regs =
@@ -1207,8 +1176,7 @@ struct DdFromProto {
     store_counts: Vec<u64>,
     store_offset: i32,
     // Total count is recovered by summing the bucket array; the
-    // DataPoint-level count/min/max scalars were dropped from the wire
-    // (ProjectASAP/sketchlib-go#243).
+    // DataPoint-level count/min/max scalars are not on the wire.
     count: u64,
 }
 

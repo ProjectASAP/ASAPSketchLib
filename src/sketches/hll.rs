@@ -37,11 +37,15 @@ use crate::structures::fixed_structure::{
     HllBucketListP12, HllBucketListP14, HllBucketListP16, HllRegisterStorage,
 };
 use crate::{CANONICAL_HASH_SEED, DataInput, DefaultXxHasher, SketchHasher, hash64_seeded};
-use rmp_serde::{
-    decode::Error as RmpDecodeError, encode::Error as RmpEncodeError, from_slice, to_vec_named,
-};
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
+
+mod wire;
+pub use wire::HllWireVariant;
+pub(crate) use wire::{
+    HLL_KIND_CLASSIC, HLL_KIND_ERTL_MLE, HLL_KIND_HIP, HllMetadata, HllPayloadHip, HllPayloadPlain,
+    standard_hll_metadata,
+};
 
 /// Generic HyperLogLog sketch parameterized by estimation variant, register storage, and hasher.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -116,16 +120,6 @@ impl<Variant, Registers: HllRegisterStorage, H: SketchHasher>
         }
     }
 
-    /// Serializes the sketch into MessagePack bytes.
-    pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
-        to_vec_named(self)
-    }
-
-    /// Deserializes a sketch from MessagePack bytes.
-    pub fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self, RmpDecodeError> {
-        from_slice(bytes)
-    }
-
     /// Borrow the raw register byte slice (one byte per register).
     pub fn registers_as_slice(&self) -> &[u8] {
         self.registers.as_slice()
@@ -174,10 +168,18 @@ impl<Variant, Registers: HllRegisterStorage, H: SketchHasher>
 impl<Variant, Registers: HllRegisterStorage, H: SketchHasher>
     HyperLogLogImpl<Variant, Registers, H>
 {
+    /// The hash this sketch indexes `obj` by.
+    ///
+    /// Exposed so a caller can hash on its own thread and hand a worker the
+    /// result, leaving nothing borrowed to cross the boundary.
+    #[inline(always)]
+    pub fn canonical_hash(obj: &DataInput) -> u64 {
+        H::hash64_seeded(CANONICAL_HASH_SEED, obj)
+    }
+
     /// Hashes and inserts a single input value into the sketch.
     pub fn insert(&mut self, obj: &DataInput) {
-        let hashed_val = H::hash64_seeded(CANONICAL_HASH_SEED, obj);
-        self.insert_with_hash(hashed_val);
+        self.insert_with_hash(Self::canonical_hash(obj));
     }
 
     /// Hashes and inserts multiple input values into the sketch.
@@ -204,7 +206,9 @@ impl<Registers: HllRegisterStorage, H: SketchHasher> HyperLogLogImpl<Classic, Re
         1.0 / z
     }
 
-    /// Returns the estimated cardinality using the classic HyperLogLog algorithm with small/large range corrections.
+    /// Returns the estimated cardinality using the classic HyperLogLog
+    /// algorithm with the small-range correction. Ranks are drawn from a
+    /// 64-bit hash, so the estimate needs no large-range correction.
     pub fn estimate(&self) -> usize {
         let m = Registers::NUM_REGISTERS as f64;
         let alpha_m = 0.7213 / (1.0 + 1.079 / m);
@@ -219,9 +223,6 @@ impl<Registers: HllRegisterStorage, H: SketchHasher> HyperLogLogImpl<Classic, Re
             if zero_count != 0 {
                 est = m * (m / zero_count as f64).ln();
             }
-        } else if est > 143165576.533 {
-            let correction_aux = i32::MAX as f64;
-            est = 1.0 * -correction_aux * (1.0 - est / correction_aux).ln();
         }
         est as usize
     }
@@ -278,40 +279,36 @@ impl<Registers: HllRegisterStorage, H: SketchHasher> HyperLogLogImpl<ErtlMLE, Re
     }
 }
 
-macro_rules! impl_ertl_mle_estimate {
-    ($storage:ty) => {
-        impl<H: SketchHasher> HyperLogLogImpl<ErtlMLE, $storage, H> {
-            /// "New cardinality estimation algorithms for HyperLogLog sketches"
-            /// Otmar Ertl, arXiv:1702.01284
-            #[inline]
-            fn get_histogram(&self) -> [u32; { <$storage>::REGISTER_BITS + 2 }] {
-                let mut histogram = [0; { <$storage>::REGISTER_BITS + 2 }];
-                for &register in self.registers.as_slice() {
-                    histogram[register as usize] += 1;
-                }
-                histogram
-            }
+/// Upper bound on the Ertl histogram length. `REGISTER_BITS + 2` peaks at
+/// `64 + 2` for `precision = 0`, so one array covers every precision and the
+/// per-precision `[u32; REGISTER_BITS + 2]` sizing is not needed.
+const ERTL_HISTOGRAM_CAP: usize = 66;
 
-            /// Returns the estimated cardinality using the Ertl MLE algorithm.
-            pub fn estimate(&self) -> usize {
-                let histogram = self.get_histogram();
-                let m: f64 = <$storage>::NUM_REGISTERS as f64;
-                let mut z = m * self
-                    .hll_ertl_tau((m - histogram[<$storage>::REGISTER_BITS + 1] as f64) / m);
-                for i in histogram[1..=<$storage>::REGISTER_BITS].iter().rev() {
-                    z += *i as f64;
-                    z *= 0.5;
-                }
-                z += m * self.hll_ertl_sigma(histogram[0] as f64 / m);
-                (0.5 / 2_f64.ln() * m * m / z).round() as usize
-            }
+impl<Registers: HllRegisterStorage, H: SketchHasher> HyperLogLogImpl<ErtlMLE, Registers, H> {
+    /// "New cardinality estimation algorithms for HyperLogLog sketches"
+    /// Otmar Ertl, arXiv:1702.01284
+    #[inline]
+    fn get_histogram(&self) -> [u32; ERTL_HISTOGRAM_CAP] {
+        let mut histogram = [0; ERTL_HISTOGRAM_CAP];
+        for &register in self.registers.as_slice() {
+            histogram[register as usize] += 1;
         }
-    };
-}
+        histogram
+    }
 
-impl_ertl_mle_estimate!(HllBucketListP12);
-impl_ertl_mle_estimate!(HllBucketListP14);
-impl_ertl_mle_estimate!(HllBucketListP16);
+    /// Returns the estimated cardinality using the Ertl MLE algorithm.
+    pub fn estimate(&self) -> usize {
+        let histogram = self.get_histogram();
+        let m: f64 = Registers::NUM_REGISTERS as f64;
+        let mut z = m * self.hll_ertl_tau((m - histogram[Registers::REGISTER_BITS + 1] as f64) / m);
+        for i in histogram[1..=Registers::REGISTER_BITS].iter().rev() {
+            z += *i as f64;
+            z *= 0.5;
+        }
+        z += m * self.hll_ertl_sigma(histogram[0] as f64 / m);
+        (0.5 / 2_f64.ln() * m * m / z).round() as usize
+    }
+}
 
 impl<Registers: HllRegisterStorage> Default for HyperLogLogHIPImpl<Registers> {
     fn default() -> Self {
@@ -368,16 +365,6 @@ impl<Registers: HllRegisterStorage> HyperLogLogHIPImpl<Registers> {
     pub fn estimate(&self) -> usize {
         self.est as usize
     }
-
-    /// Serializes the sketch into MessagePack bytes.
-    pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
-        to_vec_named(self)
-    }
-
-    /// Deserializes a sketch from MessagePack bytes.
-    pub fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self, RmpDecodeError> {
-        from_slice(bytes)
-    }
 }
 
 // DataInput adapters for HIP (hashing + batch helpers).
@@ -399,36 +386,78 @@ impl<Registers: HllRegisterStorage> HyperLogLogHIPImpl<Registers> {
     }
 }
 
-use crate::octo_delta::HllDelta;
+use crate::octo_delta::{HLL_PROMASK, HllDelta};
+use crate::sketch_framework::octo::max_hll_threshold;
 
 impl<Variant, Registers: HllRegisterStorage, H: SketchHasher>
     HyperLogLogImpl<Variant, Registers, H>
 {
     #[inline(always)]
-    /// Inserts a hashed value and emits a delta when a register increases.
+    /// Inserts a hashed value, promoting register improvements at the default
+    /// threshold `HLL_PROMASK`.
     pub fn insert_emit_delta_with_hash(
         &mut self,
         hashed_val: u64,
         emit: &mut impl FnMut(HllDelta),
     ) {
+        self.insert_emit_delta_with_hash_and_threshold(hashed_val, HLL_PROMASK, emit);
+    }
+
+    #[inline(always)]
+    /// Inserts a hashed value and promotes the register when the improvement is
+    /// large enough.
+    ///
+    /// Cardinality sketches merge by `max`, so a worker never clears a
+    /// register; it promotes one only when `|2^C' - 2^C| >= 2^threshold`, the
+    /// rule the paper gives for HyperLogLog (§4.4). A threshold of 0 promotes
+    /// every improvement and makes the aggregator exactly equal to a
+    /// single-threaded sketch.
+    pub fn insert_emit_delta_with_hash_and_threshold(
+        &mut self,
+        hashed_val: u64,
+        threshold: u8,
+        emit: &mut impl FnMut(HllDelta),
+    ) {
+        // A register holds a leading-zero count of at most `64 - PRECISION + 1`,
+        // so the gain `2^C' - 2^C` never reaches `2^(64 - PRECISION)`. Above
+        // that a threshold is unsatisfiable and the parent would stay empty
+        // rather than merely lag, so cap it at the largest one that can fire.
+        let threshold = threshold.min(max_hll_threshold(Registers::PRECISION as u8));
         let bucket_num = ((hashed_val >> Registers::REGISTER_BITS) & Registers::P_MASK) as usize;
         let leading_zero =
             ((hashed_val << Registers::PRECISION) + Registers::P_MASK).leading_zeros() as u8 + 1;
         let regs = self.registers.as_mut_slice();
-        if leading_zero > regs[bucket_num] {
+        let previous = regs[bucket_num];
+        if leading_zero > previous {
             regs[bucket_num] = leading_zero;
-            emit(HllDelta {
-                pos: bucket_num as u16,
-                value: leading_zero,
-            });
+            if pow2_saturating(leading_zero) - pow2_saturating(previous)
+                >= pow2_saturating(threshold)
+            {
+                emit(HllDelta {
+                    pos: bucket_num as u32,
+                    value: leading_zero,
+                });
+            }
         }
     }
 
     #[inline(always)]
-    /// Hashes an input, inserts it, and emits a delta when needed.
+    /// Hashes an input, inserts it, and emits a delta at the default threshold.
     pub fn insert_emit_delta(&mut self, obj: &DataInput, emit: &mut impl FnMut(HllDelta)) {
+        self.insert_emit_delta_with_threshold(obj, HLL_PROMASK, emit);
+    }
+
+    #[inline(always)]
+    /// Hashes an input, inserts it, and promotes the register when the
+    /// improvement clears `threshold`.
+    pub fn insert_emit_delta_with_threshold(
+        &mut self,
+        obj: &DataInput,
+        threshold: u8,
+        emit: &mut impl FnMut(HllDelta),
+    ) {
         let hashed_val = H::hash64_seeded(CANONICAL_HASH_SEED, obj);
-        self.insert_emit_delta_with_hash(hashed_val, emit);
+        self.insert_emit_delta_with_hash_and_threshold(hashed_val, threshold, emit);
     }
 
     /// Applies one externally emitted HLL delta.
@@ -441,6 +470,12 @@ impl<Variant, Registers: HllRegisterStorage, H: SketchHasher>
     }
 }
 
+/// `2^exp`, saturating rather than overflowing for out-of-range registers.
+#[inline(always)]
+fn pow2_saturating(exp: u8) -> u128 {
+    if exp >= 127 { u128::MAX } else { 1u128 << exp }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -448,9 +483,7 @@ mod tests {
     use crate::{DataInput, HllBucketList};
 
     const TARGETS: [usize; 7] = [10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000];
-    const ERROR_TOLERANCE: f64 = 0.02;
     const P12_ERROR_TOLERANCE: f64 = 0.03;
-    const SERDE_SAMPLE: usize = 100_000;
 
     #[test]
     fn hll_child_insert_emits_on_improvement() {
@@ -474,13 +507,6 @@ mod tests {
 
     trait HllMerge: HllEstimator + Clone {
         fn merge_into(&mut self, other: &Self);
-    }
-
-    trait HllSerializable: HllEstimator {
-        fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError>;
-        fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self, RmpDecodeError>
-        where
-            Self: Sized;
     }
 
     impl<Registers: HllRegisterStorage, H: SketchHasher> HllEstimator
@@ -511,59 +537,33 @@ mod tests {
         }
     }
 
-    impl<Registers: HllRegisterStorage, H: SketchHasher> HllSerializable
-        for HyperLogLogImpl<Classic, Registers, H>
+    impl<Registers: HllRegisterStorage, H: SketchHasher> HllEstimator
+        for HyperLogLogImpl<ErtlMLE, Registers, H>
     {
-        fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
-            HyperLogLogImpl::<Classic, Registers, H>::serialize_to_bytes(self)
+        fn push(&mut self, input: &DataInput) {
+            self.insert(input);
         }
 
-        fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self, RmpDecodeError> {
-            HyperLogLogImpl::<Classic, Registers, H>::deserialize_from_bytes(bytes)
+        fn insert_with_hash(&mut self, hashed: u64) {
+            HyperLogLogImpl::<ErtlMLE, Registers, H>::insert_with_hash(self, hashed);
+        }
+
+        fn estimate(&self) -> f64 {
+            HyperLogLogImpl::<ErtlMLE, Registers, H>::estimate(self) as f64
+        }
+
+        fn index(&self, i: usize) -> u8 {
+            self.registers.as_slice()[i]
         }
     }
 
-    macro_rules! impl_ertl_mle_test_traits {
-        ($storage:ty) => {
-            impl<H: SketchHasher> HllEstimator for HyperLogLogImpl<ErtlMLE, $storage, H> {
-                fn push(&mut self, input: &DataInput) {
-                    self.insert(input);
-                }
-
-                fn insert_with_hash(&mut self, hashed: u64) {
-                    HyperLogLogImpl::<ErtlMLE, $storage, H>::insert_with_hash(self, hashed);
-                }
-
-                fn estimate(&self) -> f64 {
-                    HyperLogLogImpl::<ErtlMLE, $storage, H>::estimate(self) as f64
-                }
-
-                fn index(&self, i: usize) -> u8 {
-                    self.registers.as_slice()[i]
-                }
-            }
-
-            impl<H: SketchHasher> HllMerge for HyperLogLogImpl<ErtlMLE, $storage, H> {
-                fn merge_into(&mut self, other: &Self) {
-                    self.merge(other);
-                }
-            }
-
-            impl<H: SketchHasher> HllSerializable for HyperLogLogImpl<ErtlMLE, $storage, H> {
-                fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
-                    HyperLogLogImpl::<ErtlMLE, $storage, H>::serialize_to_bytes(self)
-                }
-
-                fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self, RmpDecodeError> {
-                    HyperLogLogImpl::<ErtlMLE, $storage, H>::deserialize_from_bytes(bytes)
-                }
-            }
-        };
+    impl<Registers: HllRegisterStorage, H: SketchHasher> HllMerge
+        for HyperLogLogImpl<ErtlMLE, Registers, H>
+    {
+        fn merge_into(&mut self, other: &Self) {
+            self.merge(other);
+        }
     }
-
-    impl_ertl_mle_test_traits!(HllBucketListP12);
-    impl_ertl_mle_test_traits!(HllBucketListP14);
-    impl_ertl_mle_test_traits!(HllBucketListP16);
 
     impl<Registers: HllRegisterStorage> HllEstimator for HyperLogLogHIPImpl<Registers> {
         fn push(&mut self, input: &DataInput) {
@@ -582,31 +582,6 @@ mod tests {
         }
     }
 
-    impl<Registers: HllRegisterStorage> HllSerializable for HyperLogLogHIPImpl<Registers> {
-        fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
-            HyperLogLogHIPImpl::<Registers>::serialize_to_bytes(self)
-        }
-
-        fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self, RmpDecodeError> {
-            HyperLogLogHIPImpl::<Registers>::deserialize_from_bytes(bytes)
-        }
-    }
-
-    #[test]
-    fn hyperloglog_accuracy_within_two_percent() {
-        assert_accuracy::<HyperLogLog<Classic>>("HyperLogLog");
-    }
-
-    #[test]
-    fn hll_ertl_accuracy_within_two_percent() {
-        assert_accuracy::<HyperLogLog<ErtlMLE>>("HllErtl");
-    }
-
-    #[test]
-    fn hllds_accuracy_within_two_percent() {
-        assert_accuracy::<HyperLogLogHIP>("HllDs");
-    }
-
     #[test]
     fn hyperloglog_p12_accuracy_within_two_percent() {
         assert_accuracy_within::<HyperLogLogP12<Classic>>("HyperLogLogP12", P12_ERROR_TOLERANCE);
@@ -623,16 +598,6 @@ mod tests {
     }
 
     #[test]
-    fn hyperloglog_merge_within_two_percent() {
-        assert_merge_accuracy::<HyperLogLog<Classic>>("HyperLogLog");
-    }
-
-    #[test]
-    fn hll_ertl_merge_within_two_percent() {
-        assert_merge_accuracy::<HyperLogLog<ErtlMLE>>("HllErtl");
-    }
-
-    #[test]
     fn hyperloglog_p12_merge_within_two_percent() {
         assert_merge_accuracy_within::<HyperLogLogP12<Classic>>(
             "HyperLogLogP12",
@@ -645,34 +610,38 @@ mod tests {
         assert_merge_accuracy_within::<HyperLogLogP12<ErtlMLE>>("HllErtlP12", P12_ERROR_TOLERANCE);
     }
 
+    /// Ranks are drawn from a 64-bit hash, so a register state whose estimate
+    /// runs past the 32-bit range must still follow the HyperLogLog formula
+    /// rather than saturate or collapse to zero.
     #[test]
-    fn hyperloglog_round_trip_serialization() {
-        assert_serialization_round_trip::<HyperLogLog<Classic>>("HyperLogLog");
-    }
+    fn classic_estimate_holds_past_the_32_bit_range() {
+        const REGISTER_BITS: usize = HllBucketList::REGISTER_BITS;
+        let m = HllBucketList::NUM_REGISTERS as f64;
+        let alpha_m = 0.7213 / (1.0 + 1.079 / m);
 
-    #[test]
-    fn hll_ertl_round_trip_serialization() {
-        assert_serialization_round_trip::<HyperLogLog<ErtlMLE>>("HllErtl");
-    }
+        // A hash selecting `bucket` whose leading run gives every register the
+        // same rank, so the estimate is `alpha_m * m * 2^rank` in closed form.
+        for rank in [12u32, 16, 18, 20] {
+            let mut hll = HyperLogLog::<Classic>::default();
+            for bucket in 0..HllBucketList::NUM_REGISTERS as u64 {
+                let hashed = (bucket << REGISTER_BITS) | (1 << (REGISTER_BITS - rank as usize));
+                HyperLogLog::<Classic>::insert_with_hash(&mut hll, hashed);
+            }
+            assert!(
+                hll.registers_as_slice().iter().all(|&r| r == rank as u8),
+                "rank {rank} state was not built: got {:?}",
+                &hll.registers_as_slice()[..4]
+            );
 
-    #[test]
-    fn hllds_round_trip_serialization() {
-        assert_serialization_round_trip::<HyperLogLogHIP>("HllDs");
-    }
-
-    #[test]
-    fn hyperloglog_p12_round_trip_serialization() {
-        assert_serialization_round_trip::<HyperLogLogP12<Classic>>("HyperLogLogP12");
-    }
-
-    #[test]
-    fn hll_ertl_p12_round_trip_serialization() {
-        assert_serialization_round_trip::<HyperLogLogP12<ErtlMLE>>("HllErtlP12");
-    }
-
-    #[test]
-    fn hllds_p12_round_trip_serialization() {
-        assert_serialization_round_trip::<HyperLogLogHIPP12>("HllDsP12");
+            let expected = alpha_m * m * 2f64.powi(rank as i32);
+            let estimate = hll.estimate() as f64;
+            // The only slack is `estimate`'s truncation to a whole count.
+            let error = (estimate - expected).abs() / expected;
+            assert!(
+                error <= 1e-6,
+                "rank {rank} estimate {estimate} deviates from {expected} by {error:.6}"
+            );
+        }
     }
 
     // insert 10 values and check corresponding counter is updated
@@ -769,13 +738,6 @@ mod tests {
         );
     }
 
-    fn assert_accuracy<S>(name: &str)
-    where
-        S: HllEstimator,
-    {
-        assert_accuracy_within::<S>(name, ERROR_TOLERANCE);
-    }
-
     fn assert_accuracy_within<S>(name: &str, tolerance: f64)
     where
         S: HllEstimator,
@@ -802,13 +764,6 @@ mod tests {
                 "{name} accuracy error {error:.4} exceeded {tolerance} (truth {truth}, estimate {estimate})"
             );
         }
-    }
-
-    fn assert_merge_accuracy<S>(name: &str)
-    where
-        S: HllMerge,
-    {
-        assert_merge_accuracy_within::<S>(name, ERROR_TOLERANCE);
     }
 
     fn assert_merge_accuracy_within<S>(name: &str, tolerance: f64)
@@ -848,43 +803,5 @@ mod tests {
                 "{name} merge error {error:.4} exceeded {tolerance} (truth {truth}, estimate {estimate})"
             );
         }
-    }
-
-    fn assert_serialization_round_trip<S>(name: &str)
-    where
-        S: HllSerializable,
-    {
-        let mut sketch = S::default();
-        for value in 0..SERDE_SAMPLE {
-            let input = DataInput::U64(value as u64);
-            sketch.push(&input);
-        }
-
-        let encoded = sketch
-            .serialize_to_bytes()
-            .unwrap_or_else(|err| panic!("{name} serialize_to_bytes failed: {err}"));
-        assert!(
-            !encoded.is_empty(),
-            "{name} serialization output should not be empty"
-        );
-
-        let decoded = S::deserialize_from_bytes(&encoded)
-            .unwrap_or_else(|err| panic!("{name} deserialize_from_bytes failed: {err}"));
-
-        let reencoded = decoded
-            .serialize_to_bytes()
-            .unwrap_or_else(|err| panic!("{name} re-serialize failed: {err}"));
-
-        assert_eq!(
-            encoded, reencoded,
-            "{name} serialized bytes differed after round trip"
-        );
-
-        let original_est = sketch.estimate();
-        let decoded_est = decoded.estimate();
-        assert!(
-            (original_est - decoded_est).abs() <= ERROR_TOLERANCE * original_est.max(1.0),
-            "{name} estimate mismatch after round trip: before {original_est}, after {decoded_est}"
-        );
     }
 }

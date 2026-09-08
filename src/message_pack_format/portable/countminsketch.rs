@@ -13,11 +13,9 @@ use crate::{DataInput, FastPath, Vector2D};
 // `CountMinSketch` and `CountMinDelta` below are the public-field,
 // proto-decode-friendly types consumed by the ASAP query engine
 // accumulators, backed by `asap_sketchlib`'s in-tree CountMin. The
-// high-throughput in-process variant above (`CountMin`) keeps its
-// original design.
+// high-throughput in-process variant is
+// `crate::sketches::countminsketch::CountMin`, which keeps its own design.
 // =====================================================================
-
-// (de-duplicated) use serde::{Deserialize, Serialize};
 
 // ----- asap_sketchlib-backed Count-Min helpers -----
 // Used below by `CountMinSketch`. Lives in this file so the wire-format
@@ -394,6 +392,59 @@ impl CountMinSketch {
         self.apply_delta(&delta)
     }
 
+    /// MessagePack twin of [`Self::compute_delta`]. Computes the same
+    /// sparse cell delta of `self` against `snapshot` (a cell is carried
+    /// when `|Δcount|` is non-zero and `>= threshold`), but serializes it
+    /// as the cells-only parallel-array MessagePack layout via
+    /// [`CountMinSketchDelta`]'s [`MessagePackCodec`] instead of proto. The
+    /// per-row `l1`/`l2` norms and `hh_keys` the proto delta carries are
+    /// dropped — the plain-sketch estimate path does not consume them.
+    /// Delta-against-empty carries this window's own cell counts.
+    pub fn compute_delta_msgpack(
+        &self,
+        snapshot: &CountMinSketch,
+        threshold: f64,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        if self.rows != snapshot.rows || self.cols != snapshot.cols {
+            return Err(format!(
+                "CountMinSketch dimension mismatch: self={}x{}, snapshot={}x{}",
+                self.rows, self.cols, snapshot.rows, snapshot.cols
+            )
+            .into());
+        }
+        let cur = self.sketch();
+        let snap = snapshot.sketch();
+        let mut delta = CountMinSketchDelta {
+            rows: self.rows as u32,
+            cols: self.cols as u32,
+            ..CountMinSketchDelta::default()
+        };
+        for r in 0..self.rows {
+            for c in 0..self.cols {
+                let dc = (cur[r][c] - snap[r][c]) as i64;
+                if dc != 0 && (dc.unsigned_abs() as f64) >= threshold {
+                    delta.cells.push((r as u32, c as u32, dc));
+                }
+            }
+        }
+        Ok(delta.to_msgpack()?)
+    }
+
+    /// MessagePack twin of [`Self::apply_delta_bytes`]. Decodes the
+    /// cells-only parallel-array MessagePack [`CountMinSketchDelta`] and
+    /// applies it in place (additive cell merge).
+    ///
+    /// Returns `Err` if `bytes` is not a valid MessagePack
+    /// `CountMinSketchDelta` or a cell is out of range for this sketch's
+    /// dimensions.
+    pub fn apply_delta_msgpack_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let delta = CountMinSketchDelta::from_msgpack(bytes)?;
+        self.apply_delta(&delta)
+    }
+
     /// One-shot aggregation: build a sketch from parallel key/value slices
     /// and return the msgpack bytes.
     pub fn aggregate_count(
@@ -456,9 +507,97 @@ impl MessagePackCodec for CountMinSketch {
     }
 }
 
+impl MessagePackCodec for CountMinSketchDelta {
+    /// Encodes the sparse cell delta as the 5-element MessagePack array
+    /// `[ rows:u64, cols:u64, row_idx:[]u32, col_idx:[]u32, d_count:[]i64 ]`
+    /// — byte-identical to Rust
+    /// `rmp_serde::to_vec(&(u64, u64, Vec<u32>, Vec<u32>, Vec<i64>))`
+    /// (compact mode), the same struct-of-parallel-arrays shape the Go
+    /// `count_sketch_delta_sparse.go` established. Only the matrix cells
+    /// cross the wire; the per-row `l1`/`l2` norms and the `hh_keys`
+    /// heavy-hitter surface are not carried.
+    fn to_msgpack(&self) -> Result<Vec<u8>, MsgPackError> {
+        let mut row_idx: Vec<u32> = Vec::with_capacity(self.cells.len());
+        let mut col_idx: Vec<u32> = Vec::with_capacity(self.cells.len());
+        let mut d_count: Vec<i64> = Vec::with_capacity(self.cells.len());
+        for (r, c, d) in &self.cells {
+            row_idx.push(*r);
+            col_idx.push(*c);
+            d_count.push(*d);
+        }
+        Ok(rmp_serde::to_vec(&(
+            self.rows as u64,
+            self.cols as u64,
+            row_idx,
+            col_idx,
+            d_count,
+        ))?)
+    }
+
+    fn from_msgpack(bytes: &[u8]) -> Result<Self, MsgPackError> {
+        let (rows, cols, row_idx, col_idx, d_count): (u64, u64, Vec<u32>, Vec<u32>, Vec<i64>) =
+            rmp_serde::from_slice(bytes)?;
+        let cells = row_idx
+            .into_iter()
+            .zip(col_idx)
+            .zip(d_count)
+            .map(|((r, c), d)| (r, c, d))
+            .collect();
+        Ok(CountMinSketchDelta {
+            rows: rows as u32,
+            cols: cols as u32,
+            cells,
+            ..CountMinSketchDelta::default()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn msgpack_delta_against_empty_round_trips() {
+        let (rows, cols) = (5, 1024);
+        let mut w = CountMinSketch::new(rows, cols);
+        for _ in 0..200 {
+            w.update("hot", 1.0);
+        }
+        let empty = CountMinSketch::new(rows, cols);
+        let bytes = w.compute_delta_msgpack(&empty, 1.0).unwrap();
+        let mut recon = CountMinSketch::new(rows, cols);
+        recon.apply_delta_msgpack_bytes(&bytes).unwrap();
+        let (got, want) = (recon.estimate("hot"), w.estimate("hot"));
+        assert!((got - want).abs() <= want * 0.1, "got={got} want={want}");
+    }
+
+    #[test]
+    fn msgpack_delta_wire_layout_is_parallel_arrays() {
+        use crate::message_pack_format::MessagePackCodec;
+        let (rows, cols) = (3, 8);
+        let mut w = CountMinSketch::new(rows, cols);
+        w.update("x", 5.0);
+        let empty = CountMinSketch::new(rows, cols);
+        let bytes = w.compute_delta_msgpack(&empty, 1.0).unwrap();
+        let cur = w.sketch();
+        let (mut ri, mut ci, mut dc): (Vec<u32>, Vec<u32>, Vec<i64>) =
+            (Vec::new(), Vec::new(), Vec::new());
+        for (r, row) in cur.iter().enumerate() {
+            for (c, &cell) in row.iter().enumerate() {
+                let d = cell as i64;
+                if d != 0 {
+                    ri.push(r as u32);
+                    ci.push(c as u32);
+                    dc.push(d);
+                }
+            }
+        }
+        let expected = rmp_serde::to_vec(&(rows as u64, cols as u64, ri, ci, dc)).unwrap();
+        assert_eq!(bytes, expected);
+        let d = CountMinSketchDelta::from_msgpack(&bytes).unwrap();
+        assert_eq!(d.rows, rows as u32);
+        assert_eq!(d.cols, cols as u32);
+    }
 
     #[test]
     fn test_count_min_sketch_creation() {
@@ -634,7 +773,7 @@ mod tests {
     /// Any drift in [`CountMinSketch::update`]'s hash → column-index
     /// derivation breaks this test cell-for-cell; that is the contract
     /// `cross_language_parity::cms_byte_parity_with_go` in ASAPCollector
-    /// relies on. Closes part of ProjectASAP/ASAPCollector#243.
+    /// relies on.
     #[test]
     fn test_update_then_envelope_matches_sketchlib_go_bytes() {
         use crate::proto::sketchlib::{

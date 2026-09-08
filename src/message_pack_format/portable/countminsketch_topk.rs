@@ -86,7 +86,7 @@ pub fn heap_to_wire(cms_heap: &SketchlibCMSHeap) -> Vec<WireHeapItem> {
         .map(|hh_item| {
             let key = match &hh_item.key {
                 crate::HeapItem::String(s) => s.clone(),
-                other => format!("{:?}", other),
+                other => format!("{other:?}"),
             };
             WireHeapItem {
                 key,

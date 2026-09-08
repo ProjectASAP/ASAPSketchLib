@@ -19,10 +19,11 @@ use crate::DataInput;
 use crate::common::input::data_input_to_f64;
 use crate::common::numerical::NumericalValue;
 use crate::common::structures::Vector1D;
-use rmp_serde::decode::Error as RmpDecodeError;
-use rmp_serde::encode::Error as RmpEncodeError;
-use rmp_serde::{from_slice, to_vec_named};
+use crate::octo_delta::DdDelta;
 use serde::{Deserialize, Serialize};
+
+/// ASAPv1 wire serialization (kind_id `0x05 0x00`).
+mod wire;
 
 // Number of buckets to grow by when expanding.
 const GROW_CHUNK: usize = 128;
@@ -45,12 +46,6 @@ impl Buckets {
     fn is_empty(&self) -> bool {
         self.counts.is_empty()
     }
-
-    // not used in current version
-    // #[inline(always)]
-    // fn len(&self) -> usize {
-    //     self.counts.len()
-    // }
 
     #[inline(always)]
     fn range(&self) -> Option<(i32, i32)> {
@@ -102,9 +97,7 @@ impl Buckets {
             let idx = idx_i32 as usize;
             let slice = self.counts.as_mut_slice();
             if idx < slice.len() {
-                unsafe {
-                    *slice.as_mut_ptr().add(idx) += 1;
-                }
+                slice[idx] += 1;
                 return;
             }
         }
@@ -118,36 +111,101 @@ impl Buckets {
 
 /// Mergeable, relative-error quantile sketch using logarithmically-spaced buckets.
 ///
-/// The DataPoint-level METRIC scalars (`count`, `sum`, `min`, `max`) were
-/// dropped from the portable cross-language wire format
-/// (ProjectASAP/sketchlib-go#243). They are still tracked here as pure
-/// in-memory state because [`DDSketch::get_value_at_quantile`] and
-/// [`DDSketch::merge`] use them internally, but they are NOT serialized:
-/// `count`/`sum` are recovered exactly from the bucket counts on
-/// deserialize and `min`/`max` are re-estimated from the extreme
-/// non-empty buckets (within the α relative-accuracy bound).
+/// ASAPv1 serialization lives in the `wire` submodule (kind_id `0x05 0x00`); it
+/// carries `alpha`, the bucket store, and `sum` / `min` / `max`, and recovers
+/// `count` by summing the buckets.
+///
+/// The derived `Serialize` / `Deserialize` is a separate, Rust-internal form
+/// used where a `DDSketch` is nested in another type. It carries the same state
+/// as the ASAPv1 payload — `alpha`, the bucket store, and `sum` / `min` / `max`
+/// — and rebuilds the index mapping and `count` on the way in, refusing a state
+/// the ASAPv1 decoder would refuse.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(try_from = "DDSketchState")]
 pub struct DDSketch {
     alpha: f64,
+    #[serde(skip)]
     gamma: f64,
+    #[serde(skip)]
     log_gamma: f64,
+    #[serde(skip)]
     inv_log_gamma: f64,
 
     store: Buckets,
     #[serde(skip)]
     count: u64,
-    #[serde(skip)]
     sum: f64,
-    #[serde(skip)]
     min: f64,
-    #[serde(skip)]
     max: f64,
+}
+
+/// The fields a serialized [`DDSketch`] carries, in the order it emits them.
+/// `gamma` / `log_gamma` / `inv_log_gamma` follow from `alpha` and `count` is
+/// the sum of the buckets, so none of the four reaches the wire.
+#[derive(Deserialize)]
+struct DDSketchState {
+    alpha: f64,
+    store: Buckets,
+    sum: f64,
+    min: f64,
+    max: f64,
+}
+
+impl TryFrom<DDSketchState> for DDSketch {
+    type Error = String;
+
+    fn try_from(state: DDSketchState) -> Result<Self, Self::Error> {
+        wire::check_alpha(state.alpha)?;
+        let counts = state.store.counts.as_slice();
+        wire::check_store_span(state.store.offset, counts.len())?;
+        let count = wire::total_count(counts)
+            .ok_or_else(|| "DDSketch bucket counts overflow the total sample count".to_string())?;
+        wire::check_scalars(count, state.sum, state.min, state.max)?;
+
+        let gamma = (1.0 + state.alpha) / (1.0 - state.alpha);
+        let log_gamma = gamma.ln();
+        Ok(Self {
+            alpha: state.alpha,
+            gamma,
+            log_gamma,
+            inv_log_gamma: 1.0 / log_gamma,
+            store: state.store,
+            count,
+            sum: state.sum,
+            min: state.min,
+            max: state.max,
+        })
+    }
+}
+
+/// Smallest and largest finite positive values whose bucket index is
+/// representable without integer overflow (index within `i32`) or
+/// `exp`/`powf` overflow, mirroring DataDog's logarithmic_mapping.go
+/// `minIndexableValue`/`maxIndexableValue`. Values outside this range are
+/// dropped rather than mapped to an arbitrarily distant bucket index — that
+/// guards the dense bucket store against a single finite-but-extreme outlier
+/// forcing an allocation spanning the whole index gap.
+///
+/// Single source of truth shared by core `DDSketch`, the portable wire twin,
+/// and tests, so the two implementations cannot drift algebraically again.
+pub fn ddsketch_indexable_bounds(alpha: f64) -> (f64, f64) {
+    let gamma = (1.0 + alpha) / (1.0 - alpha);
+    let inv_log_gamma = 1.0 / gamma.ln();
+    // 709.0 is just under ln(f64::MAX) so exp() stays finite.
+    const EXP_OVERFLOW: f64 = 709.0;
+    let min = ((f64::from(i32::MIN)) / inv_log_gamma + 1.0)
+        .exp()
+        .max(f64::MIN_POSITIVE * gamma);
+    let max = ((f64::from(i32::MAX)) / inv_log_gamma - 1.0)
+        .exp()
+        .min(EXP_OVERFLOW.exp() / (2.0 * gamma) * (gamma + 1.0));
+    (min, max)
 }
 
 impl DDSketch {
     /// Creates a new DDSketch with relative accuracy guarantee `alpha` (must be in `(0, 1)`).
     pub fn new(alpha: f64) -> Self {
-        assert!((0.0..1.0).contains(&alpha), "alpha must be in (0,1)");
+        assert!(alpha > 0.0 && alpha < 1.0, "alpha must be in (0,1)");
         let gamma = (1.0 + alpha) / (1.0 - alpha);
         let log_gamma = gamma.ln();
         let inv_log_gamma = 1.0 / log_gamma;
@@ -165,61 +223,38 @@ impl DDSketch {
         }
     }
 
-    /// Serializes the sketch to a MessagePack byte vector.
-    pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
-        to_vec_named(self)
+    /// Advances the running `sum` by `delta`, saturating at `f64::MAX` instead
+    /// of reaching `+inf`. The wire format refuses a non-finite `sum` on a
+    /// populated store, so an unguarded `+=` would leave a legally-ingested
+    /// sketch that can never be serialized. `count` and the bucket store stay
+    /// exact, so only `sum` degrades, and only past `f64::MAX`.
+    #[inline(always)]
+    fn add_to_sum(&mut self, delta: f64) {
+        let next = self.sum + delta;
+        self.sum = if next.is_finite() { next } else { f64::MAX };
     }
 
-    /// Deserializes a DDSketch from a MessagePack byte slice.
+    /// Adds a positive finite numeric sample to the sketch; non-positive or
+    /// non-finite values are ignored.
     ///
-    /// The `count`/`sum`/`min`/`max` scalars are `#[serde(skip)]` (dropped
-    /// from the wire, ProjectASAP/sketchlib-go#243), so they default to
-    /// zero on decode. Recompute them from the bucket store: `count` is
-    /// exact (the sum of all bucket counts) and `sum`/`min`/`max` are
-    /// reconstructed from the per-bucket representative values, accurate
-    /// to within the sketch's α relative-accuracy bound.
-    pub fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self, RmpDecodeError> {
-        let mut sk: Self = from_slice(bytes)?;
-        sk.recompute_scalars_from_store();
-        Ok(sk)
-    }
-
-    /// Rebuild the in-memory `count`/`sum`/`min`/`max` aggregates from the
-    /// bucket store after a deserialize that dropped them. `count` is exact;
-    /// `sum`/`min`/`max` are bucket-representative estimates (α-bounded).
-    fn recompute_scalars_from_store(&mut self) {
-        self.count = 0;
-        self.sum = 0.0;
-        self.min = f64::INFINITY;
-        self.max = f64::NEG_INFINITY;
-        let offset = self.store.offset;
-        for (i, &c) in self.store.counts.as_slice().iter().enumerate() {
-            if c == 0 {
-                continue;
-            }
-            let bin = offset + i as i32;
-            let rep = self.bin_representative(bin);
-            self.count += c;
-            self.sum += rep * c as f64;
-            if rep < self.min {
-                self.min = rep;
-            }
-            if rep > self.max {
-                self.max = rep;
-            }
-        }
-    }
-
-    /// Adds a positive finite numeric sample to the sketch; non-positive or non-finite values are ignored.
+    /// Values outside `[min_indexable_value, max_indexable_value]` are also
+    /// dropped rather than mapped to an arbitrarily distant bucket index — that
+    /// guards the dense store against a single finite-but-extreme outlier
+    /// forcing an allocation spanning the whole index gap. Dropped silently,
+    /// like the non-positive case, since `add` has no error channel.
     #[inline(always)]
     pub fn add<T: NumericalValue>(&mut self, val: &T) {
         let v = val.to_f64();
         if !(v.is_finite() && v > 0.0) {
             return;
         }
+        let (min_indexable, max_indexable) = ddsketch_indexable_bounds(self.alpha);
+        if v < min_indexable || v > max_indexable {
+            return; // untrackable extreme: would blow up the dense bucket span
+        }
 
         self.count += 1;
-        self.sum += v;
+        self.add_to_sum(v);
         if v < self.min {
             self.min = v;
         }
@@ -229,6 +264,57 @@ impl DDSketch {
 
         let k = self.key_for(v);
         self.store.add_one(k);
+    }
+
+    /// Bucket index a value maps to, or `None` if `add` would have dropped it.
+    ///
+    /// Exposed so an OctoSketch worker can hold one-byte counters over the same
+    /// bucket space without duplicating the logarithmic mapping.
+    pub fn bucket_index_for(&self, value: f64) -> Option<i32> {
+        if !(value.is_finite() && value > 0.0) {
+            return None;
+        }
+        let (min_indexable, max_indexable) = ddsketch_indexable_bounds(self.alpha);
+        if value < min_indexable || value > max_indexable {
+            return None;
+        }
+        Some(self.key_for(value))
+    }
+
+    /// Adds a promoted bucket count from an OctoSketch worker.
+    ///
+    /// A delta carries only a bucket and a count, so `sum`, `min` and `max` are
+    /// advanced with the bucket's representative value - the same α-bounded
+    /// estimate a deserialize-and-recompute produces. Quantiles and `count`
+    /// stay exact with respect to the bucket store.
+    pub fn apply_delta(&mut self, delta: DdDelta) {
+        if delta.value == 0 {
+            return;
+        }
+        // `merge` checks that the two sketches share an alpha; a delta carries
+        // no alpha to check, so bound the index by what this sketch's own
+        // mapping can produce. A worker built with a much finer alpha would
+        // otherwise hand over an index near i32::MAX and grow the dense store
+        // across the whole gap. Out-of-range values are dropped, which is what
+        // `add` already does with values it cannot index.
+        let (min_indexable, max_indexable) = ddsketch_indexable_bounds(self.alpha);
+        let (lowest, highest) = (self.key_for(min_indexable), self.key_for(max_indexable));
+        if delta.index < lowest || delta.index > highest {
+            return;
+        }
+        self.store.ensure(delta.index);
+        let slot = (delta.index - self.store.offset) as usize;
+        self.store.counts.as_mut_slice()[slot] += delta.value;
+
+        let representative = self.bin_representative(delta.index);
+        self.count += delta.value;
+        self.add_to_sum(representative * delta.value as f64);
+        if representative < self.min {
+            self.min = representative;
+        }
+        if representative > self.max {
+            self.max = representative;
+        }
     }
 
     /// Returns the estimated value at quantile `q` (in `[0, 1]`), or `None` if the sketch is empty.
@@ -250,7 +336,6 @@ impl DDSketch {
         let offset = self.store.offset;
 
         for (i, &c) in slice.iter().enumerate() {
-            // let c = slice[i];
             if c == 0 {
                 continue;
             }
@@ -299,7 +384,10 @@ impl DDSketch {
         self.alpha
     }
 
-    /// Returns the running sum of all positive samples ingested.
+    /// Returns the running sum. Exact over the values passed to [`Self::add`];
+    /// a bucket promoted through [`Self::apply_delta`] contributes its bucket
+    /// representative instead, and the total saturates at `f64::MAX` rather
+    /// than overflowing to `+inf`.
     pub fn sum(&self) -> f64 {
         self.sum
     }
@@ -316,21 +404,34 @@ impl DDSketch {
         self.store.offset
     }
 
-    /// Merges another DDSketch (with the same `alpha`) into this one.
-    pub fn merge(&mut self, other: &DDSketch) {
-        debug_assert!((self.alpha - other.alpha).abs() < 1e-12);
-        debug_assert!((self.gamma - other.gamma).abs() < 1e-12);
+    /// Merges another DDSketch into this one. Returns `Err` if the two sketches
+    /// use different index mappings (different `alpha`/`gamma`): merging under a
+    /// mismatched mapping would reinterpret one sketch's bucket indices under
+    /// the other's γ and silently corrupt every quantile.
+    ///
+    /// This is a REAL runtime check, not a `debug_assert!`: a `debug_assert!`
+    /// compiles out in release builds, leaving a mismatched merge to corrupt
+    /// results with no signal at all. DataDog's `MergeWith` and sketchlib-go's
+    /// Go `Merge` both return an error here; the portable `DdSketch::merge` in
+    /// this same crate does too.
+    pub fn merge(&mut self, other: &DDSketch) -> Result<(), String> {
+        if (self.alpha - other.alpha).abs() >= 1e-12 || (self.gamma - other.gamma).abs() >= 1e-12 {
+            return Err(format!(
+                "cannot merge DDSketches with different index mappings: alpha {} vs {}",
+                self.alpha, other.alpha
+            ));
+        }
 
         if other.count == 0 {
-            return;
+            return Ok(());
         }
         if self.count == 0 {
             *self = other.clone();
-            return;
+            return Ok(());
         }
 
         self.count += other.count;
-        self.sum += other.sum;
+        self.add_to_sum(other.sum);
         if other.min < self.min {
             self.min = other.min;
         }
@@ -340,6 +441,7 @@ impl DDSketch {
 
         // Merge bucket vectors
         self.merge_buckets_from(other);
+        Ok(())
     }
 
     #[inline(always)]
@@ -348,9 +450,19 @@ impl DDSketch {
         (v.ln() * self.inv_log_gamma).floor() as i32
     }
 
+    /// Lower edge γ^k of bucket k.
+    #[inline]
+    fn lower_bound(&self, k: i32) -> f64 {
+        self.gamma.powf(k as f64)
+    }
+
+    /// Representative of bucket k: the lower bound γ^k scaled by (1+α), matching
+    /// DataDog's logarithmic_mapping.go `Value = LowerBound(index) * (1 +
+    /// RelativeAccuracy())`. This makes the relative error EXACTLY α at both
+    /// bucket edges, as the advertised α-accuracy guarantee requires.
     #[inline]
     fn bin_representative(&self, k: i32) -> f64 {
-        self.gamma.powf(k as f64 + 0.5)
+        self.lower_bound(k) * (1.0 + self.alpha)
     }
 
     fn merge_buckets_from(&mut self, other: &DDSketch) {
@@ -417,34 +529,6 @@ impl DDSketch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{
-        sample_exponential_f64, sample_normal_f64, sample_uniform_f64, sample_zipf_f64,
-    };
-
-    // Absolute relative error helper
-    fn rel_err(a: f64, b: f64) -> f64 {
-        if a == 0.0 && b == 0.0 {
-            0.0
-        } else {
-            (a - b).abs() / f64::max(1e-30, b.abs())
-        }
-    }
-
-    // True quantile from sorted data
-    fn true_quantile(sorted: &[f64], p: f64) -> f64 {
-        if sorted.is_empty() {
-            return f64::NAN;
-        }
-        if p <= 0.0 {
-            return sorted[0];
-        }
-        if p >= 1.0 {
-            return sorted[sorted.len() - 1];
-        }
-        let n = sorted.len();
-        let k = ((p * n as f64).ceil() as usize).clamp(1, n) - 1;
-        sorted[k]
-    }
 
     #[test]
     fn insert_and_query_basic() {
@@ -478,277 +562,6 @@ mod tests {
     }
 
     #[test]
-    fn dds_uniform_distribution_quantiles() {
-        // choose alpha as 1%
-        const ALPHA: f64 = 0.01;
-
-        const QUANTILES: &[(f64, &str)] = &[
-            (0.0, "min"),
-            (0.10, "p10"),
-            (0.25, "p25"),
-            (0.50, "p50"),
-            (0.75, "p75"),
-            (0.90, "p90"),
-            (1.0, "max"),
-        ];
-
-        fn build_dds_with_uniform(
-            alpha: f64,
-            n: usize,
-            min: f64,
-            max: f64,
-            seed: u64,
-        ) -> (DDSketch, Vec<f64>) {
-            // sample uniform values from test utils
-            let mut vals = sample_uniform_f64(min, max, n, seed);
-            // retain only finite positive values
-            vals.retain(|v| v.is_finite() && *v > 0.0);
-            // build DDSketch
-            let mut sk = DDSketch::new(alpha);
-            for &x in &vals {
-                sk.add(&x);
-            }
-            (sk, vals)
-        }
-
-        fn assert_quantiles_within_error_dds(
-            sk: &DDSketch,
-            sorted_vals: &[f64],
-            qs: &[(f64, &str)],
-            tol: f64,
-        ) {
-            for &(p, name) in qs {
-                let got = sk.get_value_at_quantile(p).expect("quantile");
-                let want = true_quantile(sorted_vals, p);
-                let err = rel_err(got, want);
-                assert!(
-                    err <= tol,
-                    "quantile {} (p={:.2}) relerr={:.4} got={} want={} tol={}",
-                    name,
-                    p,
-                    err,
-                    got,
-                    want,
-                    tol
-                );
-            }
-        }
-
-        for (idx, n) in [1_000usize, 5_000usize, 20_000usize]
-            .into_iter()
-            .enumerate()
-        {
-            let seed = 0xA5A5_0000_u64 + idx as u64;
-            let (sketch, mut values) =
-                build_dds_with_uniform(ALPHA, n, 1_000_000.0, 10_000_000.0, seed);
-            values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            assert_quantiles_within_error_dds(&sketch, &values, QUANTILES, ALPHA);
-        }
-    }
-
-    #[test]
-    fn dds_zipf_distribution_quantiles() {
-        const ALPHA: f64 = 0.01;
-
-        const QUANTILES: &[(f64, &str)] = &[
-            (0.0, "min"),
-            (0.10, "p10"),
-            (0.25, "p25"),
-            (0.50, "p50"),
-            (0.75, "p75"),
-            (0.90, "p90"),
-            (1.0, "max"),
-        ];
-
-        fn build_dds_with_zipf(
-            alpha: f64,
-            n: usize,
-            min: f64,
-            max: f64,
-            domain: usize,
-            exponent: f64,
-            seed: u64,
-        ) -> (DDSketch, Vec<f64>) {
-            let mut vals = sample_zipf_f64(min, max, domain, exponent, n, seed);
-            vals.retain(|v| v.is_finite() && *v > 0.0);
-            let mut sk = DDSketch::new(alpha);
-            for &x in &vals {
-                sk.add(&x);
-            }
-            (sk, vals)
-        }
-
-        fn assert_quantiles_within_error_dds(
-            sk: &DDSketch,
-            sorted_vals: &[f64],
-            qs: &[(f64, &str)],
-            tol: f64,
-        ) {
-            for &(p, name) in qs {
-                let got = sk.get_value_at_quantile(p).expect("quantile");
-                let want = true_quantile(sorted_vals, p);
-                let err = rel_err(got, want);
-                assert!(
-                    err <= tol,
-                    "quantile {} (p={:.2}) relerr={:.4} got={} want={} tol={}",
-                    name,
-                    p,
-                    err,
-                    got,
-                    want,
-                    tol
-                );
-            }
-        }
-
-        for (idx, n) in [1_000usize, 5_000usize, 20_000usize]
-            .into_iter()
-            .enumerate()
-        {
-            let seed = 0xB4B4_0000_u64 + idx as u64;
-            let (sketch, mut values) =
-                build_dds_with_zipf(ALPHA, n, 1_000_000.0, 10_000_000.0, 8_192, 1.1, seed);
-            values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            assert_quantiles_within_error_dds(&sketch, &values, QUANTILES, ALPHA);
-        }
-    }
-
-    #[test]
-    fn dds_normal_distribution_quantiles() {
-        const ALPHA: f64 = 0.01;
-
-        const QUANTILES: &[(f64, &str)] = &[
-            (0.0, "min"),
-            (0.10, "p10"),
-            (0.25, "p25"),
-            (0.50, "p50"),
-            (0.75, "p75"),
-            (0.90, "p90"),
-            (1.0, "max"),
-        ];
-
-        fn build_dds_with_normal(
-            alpha: f64,
-            n: usize,
-            mean: f64,
-            std: f64,
-            seed: u64,
-        ) -> (DDSketch, Vec<f64>) {
-            // changed the code to include the normal distribution sampler from test_utils
-            let vals = sample_normal_f64(mean, std, n, seed)
-                .into_iter()
-                .filter(|v| v.is_finite() && *v > 0.0)
-                .collect::<Vec<_>>();
-
-            let mut sk = DDSketch::new(alpha);
-            for &x in &vals {
-                sk.add(&x);
-            }
-            (sk, vals)
-        }
-
-        fn assert_quantiles_within_error_dds(
-            sk: &DDSketch,
-            mut vals: Vec<f64>,
-            qs: &[(f64, &str)],
-            tol: f64,
-        ) {
-            vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            for &(p, name) in qs {
-                let got = sk.get_value_at_quantile(p).expect("quantile");
-                let want = true_quantile(&vals, p);
-                let err = rel_err(got, want);
-                assert!(
-                    err <= tol,
-                    "quantile {} (p={:.2}) relerr={:.4} got={} want={} tol={}",
-                    name,
-                    p,
-                    err,
-                    got,
-                    want,
-                    tol
-                );
-            }
-        }
-
-        // Mean and std chosen so almost all samples are positive.
-        let mean = 1_000.0;
-        let std = 100.0;
-
-        for (idx, n) in [1_000usize, 5_000usize, 20_000usize]
-            .into_iter()
-            .enumerate()
-        {
-            let seed = 0xC0DE_0000_u64 + idx as u64;
-            let (sketch, values) = build_dds_with_normal(ALPHA, n, mean, std, seed);
-            assert_quantiles_within_error_dds(&sketch, values, QUANTILES, ALPHA);
-        }
-    }
-
-    #[test]
-    fn dds_exponential_distribution_quantiles() {
-        const ALPHA: f64 = 0.01;
-        const LAMBDA: f64 = 1e-3; // mean = 1000.0
-        const QUANTILES: &[(f64, &str)] = &[
-            (0.0, "min"),
-            (0.10, "p10"),
-            (0.25, "p25"),
-            (0.50, "p50"),
-            (0.75, "p75"),
-            (0.90, "p90"),
-            (1.0, "max"),
-        ];
-
-        fn build_dds_with_exponential(
-            alpha: f64,
-            n: usize,
-            lambda: f64,
-            seed: u64,
-        ) -> (DDSketch, Vec<f64>) {
-            let vals = sample_exponential_f64(lambda, n, seed);
-            let mut sk = DDSketch::new(alpha);
-            for &x in &vals {
-                sk.add(&x);
-            }
-            (sk, vals)
-        }
-
-        fn assert_quantiles_within_error_dds(
-            sk: &DDSketch,
-            vals: &[f64],
-            qs: &[(f64, &str)],
-            tol: f64,
-        ) {
-            let mut sorted = vals.to_vec();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            for &(p, name) in qs {
-                let got = sk.get_value_at_quantile(p).expect("quantile");
-                let want = true_quantile(&sorted, p);
-                let err = rel_err(got, want);
-                assert!(
-                    err <= tol + 1e-9,
-                    "quantile {} (p={:.2}) relerr={:.4} got={} want={} tol={}",
-                    name,
-                    p,
-                    err,
-                    got,
-                    want,
-                    tol
-                );
-            }
-        }
-
-        for (idx, n) in [1_000usize, 5_000usize, 20_000usize]
-            .into_iter()
-            .enumerate()
-        {
-            let seed = 0xE3E3_0000_u64 + idx as u64;
-            let (sketch, values) = build_dds_with_exponential(ALPHA, n, LAMBDA, seed);
-            assert_quantiles_within_error_dds(&sketch, &values, QUANTILES, 0.011); // not sure why but needed a bit more tolerance
-        }
-    }
-
-    #[test]
     fn merge_two_sketches_combines_counts_and_bounds() {
         const ALPHA: f64 = 0.01;
 
@@ -765,7 +578,7 @@ mod tests {
             s2.add(&v);
         }
 
-        s1.merge(&s2);
+        s1.merge(&s2).unwrap();
 
         // counts and bounds
         assert_eq!(s1.get_count(), (vals1.len() + vals2.len()) as u64);
@@ -784,55 +597,205 @@ mod tests {
     #[test]
     fn dds_serialization_round_trip() {
         let mut s = DDSketch::new(0.01);
-        let vals = [1.0, 2.0, 3.0, 10.0, 50.0, 100.0, 1000.0]; // sample values
-
-        for v in vals {
+        for v in [1.0, 2.0, 3.0, 10.0, 50.0, 100.0, 1000.0] {
             s.add(&v);
         }
 
-        let encoded = s.serialize_to_bytes().expect("DDSketch serialization fail"); // serialize to bytes
+        let encoded = s.serialize_to_bytes().expect("DDSketch serialization fail");
         assert!(
             !encoded.is_empty(),
             "encoded bytes should not be empty for DDSketch"
         );
-
         let decoded =
-            DDSketch::deserialize_from_bytes(&encoded).expect("DDSketch deserialization fail"); // deserialize back
+            DDSketch::deserialize_from_bytes(&encoded).expect("DDSketch deserialization fail");
 
-        // `count` survives exactly (recomputed by summing buckets). The
-        // `min`/`max`/`sum` scalars are no longer serialized
-        // (ProjectASAP/sketchlib-go#243) — they're reconstructed from the
-        // bucket midpoint `gamma^(k+0.5)`. A true value sitting at a bucket
-        // edge is at most `sqrt(gamma) - 1` away from that midpoint, which
-        // is marginally larger than α; use that as the tolerance.
-        assert_eq!(decoded.get_count(), s.get_count()); // counts should match
-        let alpha = s.alpha();
-        let gamma = (1.0 + alpha) / (1.0 - alpha);
-        let bucket_tol = gamma.sqrt() - 1.0;
-        let min_rel = (decoded.min().unwrap() - s.min().unwrap()).abs() / s.min().unwrap();
-        let max_rel = (decoded.max().unwrap() - s.max().unwrap()).abs() / s.max().unwrap();
-        assert!(
-            min_rel <= bucket_tol,
-            "min rel err {min_rel} exceeds bucket tol {bucket_tol}"
-        );
-        assert!(
-            max_rel <= bucket_tol,
-            "max rel err {max_rel} exceeds bucket tol {bucket_tol}"
-        );
-
-        // Quantiles are driven by the (serialized) bucket store, but the
-        // original sketch clamps results to its exact in-memory min/max
-        // while the decoded sketch clamps to the reconstructed bucket-edge
-        // estimates — so the two can differ by up to one bucket width. Both
-        // remain within the relative-accuracy guarantee.
+        // `count` is summed back from the buckets; `sum`/`min`/`max` are carried
+        // on the wire, so every scalar and every quantile comes back exact.
+        assert_eq!(decoded.get_count(), s.get_count());
+        assert_eq!(decoded.sum(), s.sum());
+        assert_eq!(decoded.min(), s.min());
+        assert_eq!(decoded.max(), s.max());
         for q in [0.0, 0.1, 0.5, 0.9, 1.0] {
-            let a = s.get_value_at_quantile(q).unwrap();
-            let b = decoded.get_value_at_quantile(q).unwrap();
-            let rel = (a - b).abs() / a.abs();
-            assert!(
-                rel <= bucket_tol,
-                "quantile p={q} rel err {rel} exceeds bucket tol {bucket_tol} (a={a}, b={b})"
+            assert_eq!(
+                decoded.get_value_at_quantile(q),
+                s.get_value_at_quantile(q),
+                "quantile p={q} diverged after a round trip"
             );
         }
+    }
+
+    // DataDog-parity tests.
+
+    #[test]
+    fn representative_within_alpha_at_bucket_edges() {
+        for &alpha in &[0.001, 0.01, 0.05, 0.1] {
+            let d = DDSketch::new(alpha);
+            for &k in &[-100i32, -1, 0, 1, 7, 500] {
+                let lo = d.lower_bound(k);
+                let hi = d.lower_bound(k + 1);
+                let rep = d.bin_representative(k);
+                assert!(rep >= lo && rep <= hi, "rep {rep} outside [{lo},{hi}]");
+                assert!(
+                    (rep - lo).abs() / lo <= alpha + 1e-9,
+                    "alpha={alpha} k={k}: lower-edge relerr exceeds alpha"
+                );
+                assert!(
+                    (rep - hi).abs() / hi <= alpha + 1e-9,
+                    "alpha={alpha} k={k}: upper-edge relerr exceeds alpha"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_alpha_mismatch_is_a_real_runtime_error() {
+        let mut a = DDSketch::new(0.01);
+        let b = DDSketch::new(0.02);
+        a.add(&5.0);
+        assert!(a.merge(&b).is_err(), "mismatched-mapping merge must Err");
+
+        let mut c = DDSketch::new(0.01);
+        let mut d = DDSketch::new(0.01);
+        c.add(&3.0);
+        d.add(&7.0);
+        assert!(c.merge(&d).is_ok(), "matched-mapping merge must succeed");
+        assert_eq!(c.get_count(), 2);
+    }
+
+    #[test]
+    fn untrackable_extreme_is_dropped() {
+        // A single finite-but-extreme outlier outside the indexable range must
+        // not be recorded, so the dense bucket store never spans the whole gap.
+        let mut d = DDSketch::new(0.01);
+        for i in 1..=2000 {
+            d.add(&(f64::from(i)));
+        }
+        let count_before = d.get_count();
+        let span_before = d.store.counts.as_slice().len();
+
+        let (min_indexable, max_indexable) = ddsketch_indexable_bounds(0.01);
+        d.add(&(max_indexable * 10.0));
+        d.add(&(min_indexable / 10.0));
+        assert_eq!(d.get_count(), count_before, "extreme values were recorded");
+        assert_eq!(
+            d.store.counts.as_slice().len(),
+            span_before,
+            "store span grew from an untrackable extreme"
+        );
+
+        // A large-but-trackable value is still recorded.
+        d.add(&(max_indexable / 2.0));
+        assert_eq!(d.get_count(), count_before + 1);
+    }
+
+    fn populated_sketch() -> DDSketch {
+        let mut sketch = DDSketch::new(0.01);
+        for v in [0.25f64, 1.0, 2.0, 3.0, 10.0, 50.0, 100.0, 1000.0] {
+            sketch.add(&v);
+        }
+        sketch
+    }
+
+    /// The derived serde form carries every scalar the buckets do not
+    /// determine, so a round trip continues the run rather than resetting it.
+    #[test]
+    fn serde_round_trip_keeps_the_running_scalars() {
+        let sketch = populated_sketch();
+        let bytes = rmp_serde::to_vec(&sketch).expect("encode");
+        let restored: DDSketch = rmp_serde::from_slice(&bytes).expect("decode");
+
+        assert_eq!(restored.get_count(), sketch.get_count());
+        assert_eq!(restored.sum(), sketch.sum());
+        assert_eq!(restored.min(), sketch.min());
+        assert_eq!(restored.max(), sketch.max());
+        assert_eq!(restored.alpha(), sketch.alpha());
+        assert_eq!(restored.store_counts(), sketch.store_counts());
+        assert_eq!(restored.store_offset(), sketch.store_offset());
+        for q in [0.0, 0.25, 0.5, 0.9, 1.0] {
+            assert_eq!(
+                restored.get_value_at_quantile(q),
+                sketch.get_value_at_quantile(q),
+                "quantile {q} moved across the round trip"
+            );
+        }
+    }
+
+    /// A decoded sketch keeps ingesting on top of the state it came back with.
+    #[test]
+    fn serde_round_trip_leaves_the_sketch_usable() {
+        let sketch = populated_sketch();
+        let bytes = rmp_serde::to_vec(&sketch).expect("encode");
+        let mut restored: DDSketch = rmp_serde::from_slice(&bytes).expect("decode");
+
+        restored.add(&5.0f64);
+        assert_eq!(restored.get_count(), sketch.get_count() + 1);
+        assert_eq!(restored.sum(), sketch.sum() + 5.0);
+        assert_eq!(
+            restored.store_counts().iter().sum::<u64>(),
+            restored.get_count(),
+            "the recovered count drifted from the buckets"
+        );
+    }
+
+    /// The scalars are checked against the store the same way the ASAPv1
+    /// decoder checks them: a populated store with an empty sketch's scalars
+    /// is refused rather than decoded into an inconsistent sketch.
+    #[test]
+    fn serde_refuses_scalars_that_disagree_with_the_store() {
+        #[derive(Serialize)]
+        struct CraftedState {
+            alpha: f64,
+            store: Buckets,
+            sum: f64,
+            min: f64,
+            max: f64,
+        }
+
+        let crafted = CraftedState {
+            alpha: 0.01,
+            store: Buckets {
+                counts: Vector1D::from_vec(vec![1u64, 2]),
+                offset: -3,
+            },
+            sum: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+        };
+        let bytes = rmp_serde::to_vec(&crafted).expect("encode crafted state");
+        let err = rmp_serde::from_slice::<DDSketch>(&bytes)
+            .expect_err("scalars disagreeing with the store must be refused");
+        assert!(
+            err.to_string().contains("DDSketch scalars"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// An alpha outside `(0, 1)` gives a meaningless index mapping, so it is
+    /// refused on the way in rather than at the first query.
+    #[test]
+    fn serde_refuses_an_out_of_range_alpha() {
+        #[derive(Serialize)]
+        struct CraftedState {
+            alpha: f64,
+            store: Buckets,
+            sum: f64,
+            min: f64,
+            max: f64,
+        }
+
+        let crafted = CraftedState {
+            alpha: 1.5,
+            store: Buckets {
+                counts: Vector1D::from_vec(Vec::new()),
+                offset: 0,
+            },
+            sum: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+        };
+        let bytes = rmp_serde::to_vec(&crafted).expect("encode crafted state");
+        let err = rmp_serde::from_slice::<DDSketch>(&bytes)
+            .expect_err("an out-of-range alpha must be refused");
+        assert!(err.to_string().contains("alpha"), "unexpected error: {err}");
     }
 }

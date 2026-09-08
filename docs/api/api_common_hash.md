@@ -10,6 +10,8 @@ Shared hashing traits, constants, and helpers used by sketches/frameworks.
 
 - `SketchHasher`
 - `DefaultXxHasher`
+- `DigestHasher` — `std::hash::Hasher` for `u64` keys that are already a digest; one avalanche step, no full hash
+- `DigestBuildHasher` — `BuildHasherDefault<DigestHasher>`, the `BuildHasher` to hand a `HashMap`
 - `MatrixHashMode`
 - `MatrixHashType` (see matrix storage)
 
@@ -25,6 +27,7 @@ Not applicable.
 
 ```rust
 pub const SEEDLIST: [u64; 20]
+pub const MATRIX_MAX_ROWS: usize
 pub const CANONICAL_HASH_SEED: usize
 pub const BOTTOM_LAYER_FINDER: usize
 pub const HYDRA_SEED: usize
@@ -72,6 +75,8 @@ assert!(h > 0 || h == 0);
 ## Caveats
 
 - Matrix hash helper selection depends on row/column shape.
+- Seed indices wrap at `SEEDLIST.len()`, so a matrix row `r` and row
+  `r + MATRIX_MAX_ROWS` draw the same seed and place every key identically.
 
 ## See Also
 

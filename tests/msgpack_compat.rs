@@ -80,8 +80,7 @@ fn dd_sketch_round_trip() {
     s.update(100.0);
     let bytes = s.to_msgpack().expect("encode");
     let restored = DdSketch::from_msgpack(&bytes).expect("decode");
-    // `count` was dropped from the wire (ProjectASAP/sketchlib-go#243);
-    // recover it by summing the bucket array.
+    // `count` is not on the wire; recover it by summing the bucket array.
     assert_eq!(restored.total_count(), 3);
 }
 
@@ -98,7 +97,7 @@ fn hll_sketch_round_trip() {
 
 #[test]
 fn kll_sketch_round_trip() {
-    let mut s = KllSketch::new(200);
+    let mut s = KllSketch::with_seed(200, 0x5EED_0800);
     for i in 0..100 {
         s.update(i as f64);
     }
@@ -110,7 +109,7 @@ fn kll_sketch_round_trip() {
 
 #[test]
 fn hydra_kll_sketch_round_trip() {
-    let mut s = HydraKllSketch::new(2, 4, 200);
+    let mut s = HydraKllSketch::with_seed(2, 4, 200, 0x5EED_0900);
     s.update("a", 1.0);
     s.update("a", 2.0);
     s.update("b", 3.0);
@@ -209,15 +208,28 @@ fn hydra_kll_wire_shape() {
     assert_eq!(restored.sketches[0].len(), 3);
 }
 
-// ===== golden-bytes placeholders =====
+// ===== golden-bytes placeholders: an ignored, uncovered gap =====
 //
-// When `sketchlib-go` fixtures land in `tests/fixtures/msgpack/`,
-// uncomment and fill these in. Each test should:
+// The five tests below are **empty and ignored**. They verify nothing today.
+//
+// What they need is a msgpack payload produced by `sketchlib-go` and checked in
+// under `tests/fixtures/msgpack/`. That fixture cannot be generated here: this
+// repository has no Go toolchain and no vendored copy of the Go encoder, so any
+// bytes produced locally would be this crate's own output compared against
+// itself — which is precisely the thing a cross-language golden exists to rule
+// out. Writing such bytes would make the tests pass while testing nothing, so
+// they stay ignored until a real fixture lands.
+//
+// The related `asapv1_golden/*.hex` files *are* cross-checked with the Go repo
+// (see `asapv1_golden/README.md`), so the ASAPv1 envelope has cross-language
+// coverage; what is missing is the older msgpack facade.
+//
+// When the fixtures arrive, each test should:
 //   1. include_bytes!("fixtures/msgpack/<type>.msgpack")
 //   2. <Type>::from_msgpack(bytes) succeeds
 //   3. assert specific field values match the Go producer
 
-#[ignore = "awaiting sketchlib-go fixture"]
+#[ignore = "gap: needs a sketchlib-go-produced msgpack fixture; none can be generated in this repo"]
 #[test]
 fn count_min_decodes_go_bytes() {
     // let bytes = include_bytes!("fixtures/msgpack/count_min.msgpack");
@@ -225,18 +237,18 @@ fn count_min_decodes_go_bytes() {
     // assert_eq!(s.rows, EXPECTED_ROWS);
 }
 
-#[ignore = "awaiting sketchlib-go fixture"]
+#[ignore = "gap: needs a sketchlib-go-produced msgpack fixture; none can be generated in this repo"]
 #[test]
 fn dd_sketch_decodes_go_bytes() {}
 
-#[ignore = "awaiting sketchlib-go fixture"]
+#[ignore = "gap: needs a sketchlib-go-produced msgpack fixture; none can be generated in this repo"]
 #[test]
 fn hll_sketch_decodes_go_bytes() {}
 
-#[ignore = "awaiting sketchlib-go fixture"]
+#[ignore = "gap: needs a sketchlib-go-produced msgpack fixture; none can be generated in this repo"]
 #[test]
 fn kll_sketch_decodes_go_bytes() {}
 
-#[ignore = "awaiting sketchlib-go fixture"]
+#[ignore = "gap: needs a sketchlib-go-produced msgpack fixture; none can be generated in this repo"]
 #[test]
 fn hydra_kll_decodes_go_bytes() {}

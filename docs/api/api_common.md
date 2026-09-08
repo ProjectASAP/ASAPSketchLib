@@ -26,6 +26,7 @@ src/common/
     ├── vector1d.rs
     ├── vector2d.rs
     ├── vector3d.rs
+    ├── bit_matrix.rs
     ├── matrix_storage.rs
     ├── fixed_structure.rs
     └── heap.rs
@@ -41,6 +42,7 @@ use asap_sketchlib::common::{
 
     // Hash layer
     SketchHasher, DefaultXxHasher,
+    DigestHasher, DigestBuildHasher,
     SEEDLIST, CANONICAL_HASH_SEED, BOTTOM_LAYER_FINDER, HYDRA_SEED,
     MatrixHashMode,
     hash64_seeded, hash128_seeded,
@@ -54,6 +56,7 @@ use asap_sketchlib::common::{
     // Structure layer
     MatrixStorage, FastPathHasher, MatrixHashType,
     Vector1D, Vector2D, Vector3D,
+    BitMatrix,
     FixedMatrix, HllBucketList,
     DefaultMatrixI32, DefaultMatrixI64, DefaultMatrixI128,
     QuickMatrixI32, QuickMatrixI64, QuickMatrixI128,
@@ -85,6 +88,11 @@ use asap_sketchlib::common::{
   generics.
 - Matrix fast paths choose hash packing mode automatically through
   `hash_mode_for_matrix(rows, cols)`.
+- `DigestHasher` replaces the full byte-wise hash with a single avalanche step,
+  for maps whose key is already a digest.
+- `BitMatrix` implements the same `MatrixStorage` interface as the counter
+  matrices over one bit per cell, so membership sketches share the matrix
+  hashing and fast paths.
 - `HHHeap` is built for top-k heavy hitter maintenance and key lookup.
 
 ## Quick Example

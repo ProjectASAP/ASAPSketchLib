@@ -75,10 +75,10 @@ pub const CANONICAL_HASH_SEED: usize = 5;
 /// derivation strategy so consumers can validate hash compatibility
 /// before merging.
 ///
-/// `asap_sketchlib`'s wire-format CountSketch (and the upcoming CMS
-/// byte-parity fix) construct a `HashSpec::default()` and feed it to
-/// [`derive_index`] / [`derive_sign`] on the hot path. The default
-/// matches Go's `portableHashSpec()`:
+/// `asap_sketchlib`'s wire-format CountSketch constructs a
+/// `HashSpec::default()` and feeds it to [`derive_index`] /
+/// [`derive_sign`] on the hot path. The default matches Go's
+/// `portableHashSpec()`:
 ///
 /// - `seed_list = CANONICAL_HASH_SEED_TABLE`
 /// - `canonical_seed_index = CANONICAL_HASH_SEED` (= 5)

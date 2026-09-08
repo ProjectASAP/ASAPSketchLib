@@ -21,6 +21,12 @@ pub fn new_sketchlib_kll(k: u16) -> SketchlibKll {
     KLL::init_kll(k as i32)
 }
 
+/// [`new_sketchlib_kll`] with an explicit compaction-coin seed, so the sketch
+/// replays identically across runs.
+pub fn new_sketchlib_kll_with_seed(k: u16, seed: u64) -> SketchlibKll {
+    KLL::init_kll_with_seed(k as i32, seed)
+}
+
 /// Updates a sketchlib KLL with one numeric observation.
 pub fn sketchlib_kll_update(inner: &mut SketchlibKll, value: f64) {
     inner.update(&value);
@@ -58,6 +64,19 @@ impl KllSketch {
         Self {
             k,
             backend: new_sketchlib_kll(k),
+        }
+    }
+
+    /// [`KllSketch::new`] with an explicit compaction-coin seed.
+    ///
+    /// `new` seeds the coin from the wall clock, so two runs over the same
+    /// input produce different sketches. Pass a seed when the result has to be
+    /// reproducible — replaying a stream, comparing two processes, or
+    /// asserting an accuracy bound in a test.
+    pub fn with_seed(k: u16, seed: u64) -> Self {
+        Self {
+            k,
+            backend: new_sketchlib_kll_with_seed(k, seed),
         }
     }
 
@@ -357,9 +376,45 @@ impl MessagePackCodec for KllSketch {
     }
 }
 
+impl MessagePackCodec for KllSketchData {
+    /// Encodes the `(k, sketch_bytes)` DTO directly, byte-identical to
+    /// [`KllSketch::to_msgpack`] (which serializes this same struct). Lets
+    /// producers that hold a raw sketchlib KLL backend (via
+    /// `serialize_to_bytes`) emit the portable KLL msgpack form without
+    /// constructing a [`KllSketch`] facade.
+    fn to_msgpack(&self) -> Result<Vec<u8>, MsgPackError> {
+        Ok(rmp_serde::to_vec(self)?)
+    }
+
+    fn from_msgpack(bytes: &[u8]) -> Result<Self, MsgPackError> {
+        Ok(rmp_serde::from_slice(bytes)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kll_data_msgpack_matches_kll_sketch() {
+        let mut sk = KllSketch::new(200);
+        for i in 0..500 {
+            sk.update(i as f64);
+        }
+        let via_sketch = sk.to_msgpack().unwrap();
+        let data = KllSketchData {
+            k: sk.k(),
+            sketch_bytes: sk.sketch_bytes(),
+        };
+        let via_data = data.to_msgpack().unwrap();
+        assert_eq!(
+            via_sketch, via_data,
+            "KllSketchData codec must byte-match KllSketch"
+        );
+        let rt = KllSketchData::from_msgpack(&via_data).unwrap();
+        assert_eq!(rt.k, data.k);
+        assert_eq!(rt.sketch_bytes, data.sketch_bytes);
+    }
 
     #[test]
     fn test_kll_creation() {

@@ -17,15 +17,28 @@ Approximate quantile estimation with rank-error guarantees.
 fn default() -> Self
 fn init_kll(k: i32) -> Self
 fn init(k: usize, m: usize) -> Self
+fn init_kll_with_seed(k: i32, seed: u64) -> Self
+fn init_with_seed(k: usize, m: usize, seed: u64) -> Self
 ```
+
+The unseeded constructors draw the compaction coin from the wall clock, so two
+runs over the same input produce different sketches. The `*_with_seed` forms
+fix the coin and store the seed, so `clear()` re-seeds from it too — use them
+for reproducible replay, cross-process parity, and any test asserting an
+accuracy bound. `KLLDynamic` exposes the same pair
+(`init_with_seed` / `init_kll_with_seed`).
 
 ## Insert/Update
 
 ```rust
 fn update(&mut self, val: &T)
+fn bulk_update(&mut self, values: &[T])
 fn update_data_input(&mut self, val: &DataInput) -> Result<(), &'static str> // KLL<f64> only
+fn bulk_update_data_input(&mut self, values: &[DataInput]) -> Result<(), &'static str> // KLL<f64> only
 fn clear(&mut self)
 ```
+
+`bulk_update` / `bulk_update_data_input` are exactly equivalent to looping `update` / `update_data_input` (including coin-state and byte-identical `serialize_to_bytes` for same seed), with empty slices as a no-op. `KLLDynamic` and `HydraCounter::KLL` expose the same `bulk_update` / `bulk_insert` via delegation.
 
 ## Query
 

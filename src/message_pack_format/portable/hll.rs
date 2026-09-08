@@ -11,6 +11,44 @@ use serde::{Deserialize, Serialize};
 use crate::message_pack_format::{Error as MsgPackError, MessagePackCodec};
 use crate::{CANONICAL_HASH_SEED, DataInput, hash64_seeded};
 
+// ---------------------------------------------------------------------------
+// DEPRECATED — temporary compatibility shim, slated for removal.
+//
+// A few call sites still depend on this portable `HllSketch`. Its ASAPv1 codec
+// now reuses the shared `envelope` framing plus the HLL metadata/payload types
+// in `crate::sketches::hll`, so it stays byte-identical with the native
+// `HyperLogLogImpl` / `HyperLogLogHIPImpl` serialization. Do NOT add new callers.
+//
+// Prefer instead the native path:
+// `sketches::hll::HyperLogLogImpl::serialize_to_bytes` /
+// `HyperLogLogHIPImpl::serialize_to_bytes` (+ `deserialize_from_bytes`).
+// ---------------------------------------------------------------------------
+
+use crate::message_pack_format::envelope;
+use crate::sketches::hll::{
+    HLL_KIND_CLASSIC, HLL_KIND_ERTL_MLE, HLL_KIND_HIP, HllMetadata, HllPayloadHip, HllPayloadPlain,
+    standard_hll_metadata,
+};
+
+/// Retained only for `test_msgpack_round_trip`'s magic-prefix assertion.
+#[cfg(test)]
+const HLL_WRAPPER_MAGIC: &[u8; 6] = b"ASAPv1";
+
+/// Map a portable [`HllVariant`] to its ASAPv1 wire `kind_id`. `Unspecified` is
+/// a placeholder with no wire form.
+fn wire_kind_id(variant: HllVariant) -> Result<&'static [u8], MsgPackError> {
+    match variant {
+        HllVariant::Regular => Ok(HLL_KIND_CLASSIC),
+        HllVariant::Datafusion => Ok(HLL_KIND_ERTL_MLE),
+        HllVariant::Hip => Ok(HLL_KIND_HIP),
+        HllVariant::Unspecified => Err(MsgPackError::Decode(
+            rmp_serde::decode::Error::Uncategorized(
+                "ASAPv1 HLL: the Unspecified variant is not serializable".to_string(),
+            ),
+        )),
+    }
+}
+
 /// HLL estimator variant. Mirrors `asap_sketchlib::proto::sketchlib::HllVariant`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HllVariant {
@@ -241,6 +279,51 @@ impl HllSketch {
         self.apply_delta(&delta)
     }
 
+    /// MessagePack twin of [`Self::compute_delta`]. Carries every register
+    /// that increased over `snapshot` (`self[i] > snapshot[i]`) as an
+    /// `(index, new_value)` pair, serialized as the parallel-array
+    /// MessagePack layout via [`HllSketchDelta`]'s [`MessagePackCodec`]
+    /// instead of proto. HLL uses max semantics, so the delta is lossless
+    /// regardless of `_threshold` (accepted for a uniform delta API).
+    /// Delta-against-empty carries every non-zero register — this window's
+    /// full register state encoded as a delta.
+    pub fn compute_delta_msgpack(&self, snapshot: &HllSketch, _threshold: u64) -> Vec<u8> {
+        let cur = &self.registers;
+        let snap = &snapshot.registers;
+        let n = cur.len().min(snap.len());
+        let mut updates: Vec<(u32, u8)> = Vec::new();
+        for i in 0..n {
+            if cur[i] > snap[i] {
+                updates.push((i as u32, cur[i]));
+            }
+        }
+        // Guard: registers present in `self` beyond the snapshot length
+        // (should not happen at a fixed precision) carry their non-zero
+        // values. Matches the proto path's trailing-register guard.
+        for (i, &v) in cur.iter().enumerate().skip(n) {
+            if v > 0 {
+                updates.push((i as u32, v));
+            }
+        }
+        HllSketchDelta { updates }
+            .to_msgpack()
+            .expect("HllSketchDelta msgpack encode is infallible for owned update arrays")
+    }
+
+    /// MessagePack twin of [`Self::apply_delta_bytes`]. Decodes the
+    /// parallel-array MessagePack [`HllSketchDelta`] and applies it in
+    /// place (register max-merge).
+    ///
+    /// Returns `Err` if `bytes` is not a valid MessagePack `HllSketchDelta`
+    /// or a register index is out of range for this sketch's precision.
+    pub fn apply_delta_msgpack_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let delta = HllSketchDelta::from_msgpack(bytes)?;
+        self.apply_delta(&delta)
+    }
+
     pub fn merge_refs(
         inputs: &[&HllSketch],
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -269,7 +352,9 @@ impl HllSketch {
         }
     }
 
-    /// Estimate cardinality (Classic HLL estimator with small/large-range corrections).
+    /// Estimate cardinality (Classic HLL estimator with the small-range
+    /// correction). Ranks are drawn from a 64-bit hash, so the estimate needs
+    /// no large-range correction.
     pub fn estimate(&self) -> f64 {
         let m = self.registers.len() as f64;
         if m == 0.0 {
@@ -290,9 +375,6 @@ impl HllSketch {
 
         if est <= m * 5.0 / 2.0 && zero_count != 0 {
             est = m * (m / zero_count as f64).ln();
-        } else if est > 143_165_576.533 {
-            let aux = i32::MAX as f64;
-            est = -aux * (1.0 - est / aux).ln();
         }
         est
     }
@@ -430,17 +512,176 @@ fn read_uvarint(buf: &[u8]) -> Option<(u64, usize)> {
 
 impl MessagePackCodec for HllSketch {
     fn to_msgpack(&self) -> Result<Vec<u8>, MsgPackError> {
-        Ok(rmp_serde::to_vec(self)?)
+        let kind_id = wire_kind_id(self.variant)?;
+        let metadata = rmp_serde::to_vec_named(&standard_hll_metadata(self.precision))?;
+        let payload = if self.variant == HllVariant::Hip {
+            rmp_serde::to_vec(&HllPayloadHip {
+                registers: self.registers.clone(),
+                hip_kxq0: self.hip_kxq0,
+                hip_kxq1: self.hip_kxq1,
+                hip_est: self.hip_est,
+            })?
+        } else {
+            rmp_serde::to_vec(&HllPayloadPlain {
+                registers: self.registers.clone(),
+            })?
+        };
+        Ok(envelope::encode(kind_id, &metadata, &payload))
     }
 
     fn from_msgpack(bytes: &[u8]) -> Result<Self, MsgPackError> {
-        Ok(rmp_serde::from_slice(bytes)?)
+        let (kind_id, metadata, payload) = envelope::split(bytes)
+            .map_err(|msg| MsgPackError::Decode(rmp_serde::decode::Error::Uncategorized(msg)))?;
+
+        // Validate the hash spec is the standard profile (precision is read from
+        // the metadata, so compare against a standard block built with it).
+        let meta: HllMetadata = rmp_serde::from_slice(metadata)?;
+        if meta != standard_hll_metadata(meta.precision) {
+            return Err(MsgPackError::Decode(
+                rmp_serde::decode::Error::Uncategorized(
+                    "ASAPv1 HLL envelope: hash metadata mismatch".to_string(),
+                ),
+            ));
+        }
+
+        let variant = if kind_id == HLL_KIND_CLASSIC {
+            HllVariant::Regular
+        } else if kind_id == HLL_KIND_ERTL_MLE {
+            HllVariant::Datafusion
+        } else if kind_id == HLL_KIND_HIP {
+            HllVariant::Hip
+        } else {
+            return Err(MsgPackError::Decode(
+                rmp_serde::decode::Error::Uncategorized(format!(
+                    "ASAPv1 HLL envelope: unsupported kind_id {kind_id:?}"
+                )),
+            ));
+        };
+
+        let (registers, hip_kxq0, hip_kxq1, hip_est) = if variant == HllVariant::Hip {
+            let p: HllPayloadHip = rmp_serde::from_slice(payload)?;
+            (p.registers, p.hip_kxq0, p.hip_kxq1, p.hip_est)
+        } else {
+            let p: HllPayloadPlain = rmp_serde::from_slice(payload)?;
+            (p.registers, 0.0, 0.0, 0.0)
+        };
+
+        // Fail closed if the register bin does not match `2^precision`
+        // (doc §2 validation rule 3). `checked_shl` avoids a shift-overflow
+        // panic on a crafted out-of-range `precision`.
+        let expected = 1usize.checked_shl(meta.precision).ok_or_else(|| {
+            MsgPackError::Decode(rmp_serde::decode::Error::Uncategorized(format!(
+                "ASAPv1 HLL envelope: precision {} out of range",
+                meta.precision
+            )))
+        })?;
+        if registers.len() != expected {
+            return Err(MsgPackError::Decode(
+                rmp_serde::decode::Error::Uncategorized(format!(
+                    "ASAPv1 HLL envelope: {} registers, expected 2^{} = {expected}",
+                    registers.len(),
+                    meta.precision
+                )),
+            ));
+        }
+
+        Ok(HllSketch::from_raw(
+            variant,
+            meta.precision,
+            registers,
+            hip_kxq0,
+            hip_kxq1,
+            hip_est,
+        ))
+    }
+}
+
+impl MessagePackCodec for HllSketchDelta {
+    /// Encodes the register delta as the 2-element MessagePack array
+    /// `[ reg_idx:[]u32, reg_val:[]u8 ]` — parallel arrays of register
+    /// index → new (max) value — byte-identical to Rust
+    /// `rmp_serde::to_vec(&(Vec<u32>, Vec<u8>))` (compact mode). The
+    /// `Vec<u8>` serializes as a msgpack array-of-int (not `bin`), matching
+    /// the Go `asapmsgpack` register-array convention.
+    fn to_msgpack(&self) -> Result<Vec<u8>, MsgPackError> {
+        let reg_idx: Vec<u32> = self.updates.iter().map(|(i, _)| *i).collect();
+        let reg_val: Vec<u8> = self.updates.iter().map(|(_, v)| *v).collect();
+        Ok(rmp_serde::to_vec(&(reg_idx, reg_val))?)
+    }
+
+    fn from_msgpack(bytes: &[u8]) -> Result<Self, MsgPackError> {
+        let (reg_idx, reg_val): (Vec<u32>, Vec<u8>) = rmp_serde::from_slice(bytes)?;
+        Ok(HllSketchDelta {
+            updates: reg_idx.into_iter().zip(reg_val).collect(),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ranks are drawn from a 64-bit hash, so a register state whose estimate
+    /// runs past the 32-bit range must still follow the HyperLogLog formula
+    /// rather than saturate or turn into a NaN.
+    #[test]
+    fn estimate_holds_past_the_32_bit_range() {
+        for rank in [12u8, 16, 18, 20] {
+            let mut sketch = HllSketch::new(HllVariant::Regular, 14);
+            sketch.registers.fill(rank);
+            let m = sketch.registers.len() as f64;
+            let alpha_m = 0.7213 / (1.0 + 1.079 / m);
+            let expected = alpha_m * m * 2f64.powi(rank as i32);
+            let estimate = sketch.estimate();
+            let error = (estimate - expected).abs() / expected;
+            assert!(
+                error <= 1e-9,
+                "rank {rank} estimate {estimate} deviates from {expected} by {error:.6}"
+            );
+        }
+    }
+
+    #[test]
+    fn msgpack_delta_against_empty_round_trips() {
+        let mut w = HllSketch::new(HllVariant::Regular, 12);
+        for i in 0..2000u64 {
+            w.update(&i.to_le_bytes());
+        }
+        let empty = HllSketch::new(HllVariant::Regular, 12);
+        let bytes = w.compute_delta_msgpack(&empty, 1);
+        let mut recon = HllSketch::new(HllVariant::Regular, 12);
+        recon.apply_delta_msgpack_bytes(&bytes).unwrap();
+        // Register delta over an empty base carries every non-zero register,
+        // so reconstructed registers are identical.
+        assert_eq!(recon.registers, w.registers);
+        let (got, want) = (recon.estimate(), w.estimate());
+        assert!((got - want).abs() <= want * 0.001, "got={got} want={want}");
+    }
+
+    #[test]
+    fn msgpack_delta_wire_layout_is_parallel_arrays() {
+        use crate::message_pack_format::MessagePackCodec;
+        let mut w = HllSketch::new(HllVariant::Regular, 4);
+        w.update(b"a");
+        w.update(b"b");
+        let empty = HllSketch::new(HllVariant::Regular, 4);
+        let bytes = w.compute_delta_msgpack(&empty, 1);
+        let mut reg_idx: Vec<u32> = Vec::new();
+        let mut reg_val: Vec<u8> = Vec::new();
+        for (i, &v) in w.registers.iter().enumerate() {
+            if v > 0 {
+                reg_idx.push(i as u32);
+                reg_val.push(v);
+            }
+        }
+        let expected = rmp_serde::to_vec(&(reg_idx, reg_val)).unwrap();
+        assert_eq!(bytes, expected);
+        let d = HllSketchDelta::from_msgpack(&bytes).unwrap();
+        assert_eq!(
+            d.updates.len(),
+            w.registers.iter().filter(|&&v| v > 0).count()
+        );
+    }
 
     #[test]
     fn test_new_empty() {
@@ -547,6 +788,7 @@ mod tests {
             3.0,
         );
         let bytes = original.to_msgpack().unwrap();
+        assert!(bytes.starts_with(HLL_WRAPPER_MAGIC));
         let decoded = HllSketch::from_msgpack(&bytes).unwrap();
         assert_eq!(decoded.registers, original.registers);
         assert_eq!(decoded.precision, original.precision);

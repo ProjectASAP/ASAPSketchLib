@@ -10,6 +10,12 @@ Common heavy-hitter heap helper used by multiple sketches/frameworks.
 
 - `HHHeap`
 
+A capacity-bounded min-heap of `HHItem` beside an index from key digest to heap
+position, so a keyed update is a lookup and a sift rather than a scan. The index
+is patched through each sift: `update` costs one hash, one map probe and
+`O(log k)` index writes, and its rate does not fall as `k` grows. See
+[HHHeap acceleration](../hhheap_acceleration.md) for the measurements.
+
 ## Constructors
 
 ```rust
@@ -42,7 +48,8 @@ No dedicated merge method on `HHHeap`; reconciliation is sketch-specific.
 
 ## Serialization
 
-No dedicated byte API helpers.
+No dedicated byte API helpers. Derived serde carries the heap and its capacity;
+the key index is derived data and is rebuilt on load rather than stored.
 
 ## Examples
 
@@ -57,6 +64,10 @@ assert!(hh.find(&DataInput::Str("u1")).is_some());
 ## Caveats
 
 - Key ownership conversion follows `DataInput`/`HeapItem` behavior from [Common Input Types](./api_common_input.md).
+- `find` returns a heap position, which the next `update` may move. Read it
+  before mutating, not after.
+- Counts come from the caller, so `update` accepts a count that falls as well as
+  one that rises; the resident re-sifts either way.
 
 ## See Also
 

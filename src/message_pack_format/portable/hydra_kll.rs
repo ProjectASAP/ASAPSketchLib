@@ -24,6 +24,18 @@ impl HydraKllSketch {
         Self { sketch, rows, cols }
     }
 
+    /// [`HydraKllSketch::new`] with an explicit compaction-coin seed shared by
+    /// every cell.
+    ///
+    /// `new` seeds from the wall clock, so two runs over the same input give
+    /// different per-key quantiles. Pass a seed when the result has to be
+    /// reproducible — replaying a stream, comparing two processes, or
+    /// asserting an accuracy bound in a test.
+    pub fn with_seed(rows: usize, cols: usize, k: u16, seed: u64) -> Self {
+        let sketch = vec![vec![KllSketch::with_seed(k, seed); cols]; rows];
+        Self { sketch, rows, cols }
+    }
+
     /// Number of hash rows in the sketch matrix.
     pub fn rows(&self) -> usize {
         self.rows

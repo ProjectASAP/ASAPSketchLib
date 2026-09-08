@@ -8,6 +8,8 @@ use super::EHSketchList;
 use super::eh_sketch_list::SketchNorm;
 use crate::DataInput;
 
+mod wire;
+
 const MASS_EPSILON: f64 = 1e-9;
 
 #[derive(Clone, Debug)]
@@ -53,13 +55,16 @@ fn compute_l2_mass(eh_sketch: &EHSketchList) -> f64 {
 }
 
 impl EHBucket {
-    /// Merges another bucket into this one.
-    pub fn to_merge(&mut self, other: EHBucket) {
-        let _ = self.bucket.merge(&other.bucket);
+    /// Merges another bucket into this one. When the two sketches refuse to
+    /// merge the error is returned and this bucket's size, time range and
+    /// cached mass are left as they were.
+    pub fn to_merge(&mut self, other: EHBucket) -> Result<(), &'static str> {
+        self.bucket.merge(&other.bucket)?;
         self.size += other.size;
         self.max_time = self.max_time.max(other.max_time);
         self.min_time = self.min_time.min(other.min_time);
         self.l2_mass = compute_l2_mass(&self.bucket);
+        Ok(())
     }
 }
 
@@ -114,20 +119,23 @@ impl ExponentialHistogram {
         };
         self.payload.push(new_eh_vol);
 
-        self.merge_volumes();
+        // The public signature cannot carry the error out. A refused merge
+        // keeps both buckets, so what gives here is the bucket-count bound,
+        // never a bucket's counts.
+        let _ = self.merge_volumes();
     }
 
-    fn merge_volumes(&mut self) {
+    fn merge_volumes(&mut self) -> Result<(), &'static str> {
         match self.merge_norm {
             SketchNorm::L1 => self.merge_volumes_l1(),
             SketchNorm::L2 => self.merge_volumes_l2(),
         }
     }
 
-    fn merge_volumes_l1(&mut self) {
+    fn merge_volumes_l1(&mut self) -> Result<(), &'static str> {
         let s_count = self.payload.len();
         if s_count < 2 {
-            return;
+            return Ok(());
         }
 
         let mut same_size_vol = 1;
@@ -138,7 +146,7 @@ impl ExponentialHistogram {
                 same_size_vol += 1;
             } else {
                 if (same_size_vol as f64) >= (self.k as f64) / 2.0 + 2.0 {
-                    self.merge_at_index(i + 1);
+                    self.merge_at_index(i + 1)?;
                 }
                 same_size_vol = 1;
                 if i + 1 < self.payload.len()
@@ -155,14 +163,18 @@ impl ExponentialHistogram {
             i -= 1;
         }
         if self.payload.len() >= 2 && (same_size_vol as f64) >= (self.k as f64) / 2.0 + 2.0 {
-            self.merge_at_index(0);
+            self.merge_at_index(0)?;
         }
+        Ok(())
     }
 
-    fn merge_volumes_l2(&mut self) {
+    fn merge_volumes_l2(&mut self) -> Result<(), &'static str> {
         while let Some(index) = self.find_l2_merge_candidate() {
-            self.merge_at_index(index);
+            // A refused merge leaves the pair in place, so the candidate would
+            // be found again: stop rather than loop forever.
+            self.merge_at_index(index)?;
         }
+        Ok(())
     }
 
     fn find_l2_merge_candidate(&self) -> Option<usize> {
@@ -183,13 +195,17 @@ impl ExponentialHistogram {
         None
     }
 
-    fn merge_at_index(&mut self, index: usize) {
+    /// Merges bucket `index + 1` into bucket `index` and drops the emptied
+    /// slot. A bucket that refuses to merge is kept, so the pair survives the
+    /// failure and the error reaches the caller.
+    fn merge_at_index(&mut self, index: usize) -> Result<(), &'static str> {
         if index + 1 >= self.payload.len() {
-            return;
+            return Ok(());
         }
         let vol_to_merge = self.payload[index + 1].clone();
-        self.payload[index].to_merge(vol_to_merge);
+        self.payload[index].to_merge(vol_to_merge)?;
         self.payload.remove(index + 1);
+        Ok(())
     }
 
     /// Returns `true` if the payload covers `[mint, maxt]`.
@@ -219,7 +235,9 @@ impl ExponentialHistogram {
         self.payload.len()
     }
 
-    /// Merges buckets overlapping the requested interval.
+    /// Merges buckets overlapping the requested interval. Returns `None` when
+    /// the payload is empty, and when two of the covered buckets refuse to
+    /// merge rather than handing back a partial answer.
     pub fn query_interval_merge(&self, t1: u64, t2: u64) -> Option<EHSketchList> {
         if self.payload.is_empty() {
             return None;
@@ -254,7 +272,7 @@ impl ExponentialHistogram {
         if from_volume < to_volume {
             let mut merged = self.payload[from_volume].bucket.clone();
             for i in (from_volume + 1)..=to_volume {
-                let _ = merged.merge(&self.payload[i].bucket);
+                merged.merge(&self.payload[i].bucket).ok()?;
             }
             Some(merged)
         } else {

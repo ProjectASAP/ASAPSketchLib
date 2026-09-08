@@ -17,3 +17,6 @@ Cargo.lock
 # vendored-proto drift check uses the same `prost-build` version the
 # maintainer used when committing `src/proto/generated/`.
 !/tools/gen-proto/Cargo.lock
+
+# Task planning artifacts (kept in PR description, not in main history)
+tasks/

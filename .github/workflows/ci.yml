@@ -38,6 +38,72 @@ jobs:
       - name: Run tests
         run: cargo test --all-features --locked --verbose
 
+  default-features:
+    name: Clippy and Test on the default feature set
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --verbose
+
+  octo-runtime-only:
+    name: Clippy and Test with octo-runtime alone
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --features octo-runtime --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --features octo-runtime --locked --verbose
+
+  experimental-only:
+    name: Clippy and Test with experimental alone
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --features experimental --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --features experimental --locked --verbose
+
   proto-vendored-up-to-date:
     name: Vendored proto code is up to date
     runs-on: ubuntu-latest

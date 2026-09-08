@@ -8,12 +8,14 @@
 //! # Supported sketch types
 //!
 //! Any type implementing [`TumblingWindowSketch`] can be used. Built-in
-//! implementations are provided for [`FoldCMS`], [`FoldCS`], and [`KLL`].
+//! implementations are provided for [`FoldCMS`], [`FoldCS`], [`KLL`], and
+//! experimental [`UnivMonQ`].
 
 use crate::DataInput;
 use crate::fold_cms::FoldCMS;
 use crate::fold_cs::FoldCS;
 use crate::kll::KLL;
+use crate::{UnivMonQ, UnivMonQConfig};
 
 // ---------------------------------------------------------------------------
 // TumblingWindowSketch trait
@@ -78,6 +80,13 @@ pub struct KLLConfig {
     pub k: usize,
     /// Minimum compactor size parameter.
     pub m: usize,
+    /// Optional seed for the compaction coin. When `Some`, every pool sketch
+    /// is built with [`KLL::init_with_seed`], so two processes running the
+    /// same tumbling pipeline produce byte-identical sketches — including
+    /// across window rotations, because `tumbling_clear` re-seeds from the
+    /// stored seed. When `None`, the legacy wall-clock-seeded [`KLL::init`]
+    /// path is used and cross-process agreement is not achievable.
+    pub seed: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -138,7 +147,10 @@ impl TumblingWindowSketch for KLL {
     type Config = KLLConfig;
 
     fn from_config(config: &Self::Config) -> Self {
-        KLL::init(config.k, config.m)
+        match config.seed {
+            Some(seed) => KLL::init_with_seed(config.k, config.m, seed),
+            None => KLL::init(config.k, config.m),
+        }
     }
 
     fn tumbling_insert(&mut self, key: &DataInput, _value: i64) {
@@ -148,6 +160,27 @@ impl TumblingWindowSketch for KLL {
 
     fn tumbling_merge(&mut self, other: &Self) {
         self.merge(other);
+    }
+
+    fn tumbling_clear(&mut self) {
+        self.clear();
+    }
+}
+
+impl TumblingWindowSketch for UnivMonQ {
+    type Config = UnivMonQConfig;
+
+    fn from_config(config: &Self::Config) -> Self {
+        UnivMonQ::new(*config).expect("TumblingWindow received an invalid UnivMon-Q config")
+    }
+
+    fn tumbling_insert(&mut self, key: &DataInput, _value: i64) {
+        let _ = self.update_data_input(key);
+    }
+
+    fn tumbling_merge(&mut self, other: &Self) {
+        self.merge(other)
+            .expect("TumblingWindow UnivMon-Q configurations must match");
     }
 
     fn tumbling_clear(&mut self) {
@@ -497,6 +530,28 @@ mod tests {
         assert_eq!(cdf.query(0.5), 0.0, "empty sketch should return 0.0");
     }
 
+    #[test]
+    fn univmon_q_tumbling_merges_quantiles_and_universal_metrics() {
+        let config = UnivMonQConfig {
+            levels: 8,
+            width: 256,
+            width_halving_period: 0,
+            depth: 5,
+            counter_bits: 64,
+            candidates: 64,
+            ordered_samples: 64,
+            hash_seed: 5,
+        };
+        let mut windows: TumblingWindow<UnivMonQ> = TumblingWindow::new(100, 4, config, 2);
+        for value in 0..300_u64 {
+            windows.insert(value, &DataInput::F64((value % 50) as f64), 1);
+        }
+        let merged = windows.query_all();
+        assert_eq!(merged.count(), 300);
+        assert_eq!(merged.quantile(0.5), Some(24.0));
+        assert_eq!(merged.estimate_distinct(), 50.0);
+    }
+
     // -- Construction guard tests --------------------------------------------
 
     #[test]
@@ -547,16 +602,32 @@ mod tests {
         };
         let mut tw: TumblingWindow<FoldCMS> = TumblingWindow::new(100, 3, config, 4);
 
-        // Fill 4 windows (max_windows=3 closed + active).
+        // One key per window: five windows open, four of them close, and the
+        // fourth close pushes the retained count past max_windows.
         for w in 0..5 {
             tw.insert(w * 100, &DataInput::U64(w), 1);
         }
 
-        // We should have exactly 3 closed windows (oldest evicted).
-        assert!(
-            tw.closed_count() <= 3,
-            "closed_count {} should be <= max_windows 3",
-            tw.closed_count()
+        assert_eq!(
+            tw.closed_count(),
+            3,
+            "max_windows 3 retains exactly three closed windows"
+        );
+
+        // Windows 1, 2 and 3 are the retained ones and window 4 is active, so
+        // the merge sees their keys and not window 0's.
+        let merged = tw.query_all();
+        for w in 1..5u64 {
+            assert_eq!(
+                merged.query(&DataInput::U64(w)),
+                1,
+                "window {w}'s key is still in the merge"
+            );
+        }
+        assert_eq!(
+            merged.query(&DataInput::U64(0)),
+            0,
+            "the evicted window's key is gone from the merge, not merely capped"
         );
     }
 
@@ -572,20 +643,37 @@ mod tests {
 
         let initial_total = tw.pool_total_allocated();
 
-        // Create enough windows to trigger eviction.
+        // Six keys open six windows: five close and three are evicted, so
+        // three sketches go back to the pool and every close after the first
+        // eviction is served from the free list.
         for w in 0..6 {
             tw.insert(w * 100, &DataInput::U64(w), 1);
         }
 
-        // Pool should have recycled sketches, so available > 0.
-        assert!(
-            tw.pool_available() > 0,
-            "pool should have recycled sketches after eviction"
+        assert_eq!(tw.closed_count(), 2, "max_windows 2 retains two windows");
+        assert_eq!(
+            tw.pool_available(),
+            1,
+            "the last evicted sketch is waiting in the pool"
         );
-        // Total allocated should not grow unboundedly.
-        assert!(
-            tw.pool_total_allocated() <= initial_total + 6,
-            "pool should reuse sketches, not allocate indefinitely"
+        assert_eq!(
+            tw.pool_total_allocated(),
+            initial_total,
+            "recycling covers every window after the pool was primed, so nothing new is allocated"
+        );
+
+        // The free list is a stack, so the active window is running on the
+        // sketch window 2 was using. `put` clears on the way in, so window 2's
+        // key must not read back through it.
+        assert_eq!(
+            tw.active_sketch().query(&DataInput::U64(5)),
+            1,
+            "the recycled sketch holds the active window's own key"
+        );
+        assert_eq!(
+            tw.active_sketch().query(&DataInput::U64(2)),
+            0,
+            "a recycled sketch is cleared, so its previous window's key is gone"
         );
     }
 
@@ -715,7 +803,11 @@ mod tests {
 
     #[test]
     fn kll_tumbling_quantile_accuracy() {
-        let config = KLLConfig { k: 200, m: 8 };
+        let config = KLLConfig {
+            k: 200,
+            m: 8,
+            seed: None,
+        };
         let samples_per_window = 5000;
         let num_windows = 4;
 
@@ -1053,7 +1145,11 @@ mod tests {
 
     #[test]
     fn kll_tumbling_multi_quantile_accuracy() {
-        let config = KLLConfig { k: 200, m: 8 };
+        let config = KLLConfig {
+            k: 200,
+            m: 8,
+            seed: None,
+        };
         let total_samples = 100_000;
         let num_windows = 8;
         let samples_per_window = total_samples / num_windows;
@@ -1096,7 +1192,11 @@ mod tests {
 
     #[test]
     fn kll_tumbling_distribution_shift() {
-        let config = KLLConfig { k: 400, m: 8 };
+        let config = KLLConfig {
+            k: 400,
+            m: 8,
+            seed: None,
+        };
         let samples_per_phase = 50_000;
         let windows_per_phase = 4;
         let samples_per_window = samples_per_phase / windows_per_phase;
@@ -1154,6 +1254,61 @@ mod tests {
         assert!(p50 < p90, "p50 ({p50:.1}) should be < p90 ({p90:.1})");
     }
 
+    // -- Seeded determinism ---------------------------------------------------
+
+    #[test]
+    fn kll_tumbling_seeded_is_byte_identical_across_instances() {
+        let make = || {
+            TumblingWindow::<KLL>::new(
+                1000,
+                4,
+                KLLConfig {
+                    k: 200,
+                    m: 8,
+                    seed: Some(0x5EED_CAFE),
+                },
+                6,
+            )
+        };
+        // Two independent managers, as if on two hosts/processes.
+        let mut tw_a = make();
+        let mut tw_b = make();
+
+        let values = sample_uniform_f64(0.0, 1_000_000.0, 20_000, 0x5EED_0001);
+        for (i, &v) in values.iter().enumerate() {
+            let t = i as u64;
+            tw_a.insert(t, &DataInput::F64(v), 1);
+            tw_b.insert(t, &DataInput::F64(v), 1);
+        }
+
+        let bytes_a = tw_a.query_all().serialize_to_bytes().unwrap();
+        let bytes_b = tw_b.query_all().serialize_to_bytes().unwrap();
+        assert_eq!(
+            bytes_a, bytes_b,
+            "same KLLConfig seed must give byte-identical tumbling state"
+        );
+
+        // A different seed must not silently alias onto the same coin stream.
+        let mut tw_c: TumblingWindow<KLL> = TumblingWindow::new(
+            1000,
+            4,
+            KLLConfig {
+                k: 200,
+                m: 8,
+                seed: Some(0x5EED_CAFE + 1),
+            },
+            6,
+        );
+        for (i, &v) in values.iter().enumerate() {
+            tw_c.insert(i as u64, &DataInput::F64(v), 1);
+        }
+        let bytes_c = tw_c.query_all().serialize_to_bytes().unwrap();
+        assert_ne!(
+            bytes_a, bytes_c,
+            "different KLLConfig seeds must produce different state"
+        );
+    }
+
     #[test]
     fn tumbling_eviction_correctness() {
         let rows = 3;
@@ -1193,7 +1348,6 @@ mod tests {
             let start = w * samples_per_window;
             let end = start + samples_per_window;
             for (i, &value) in stream.iter().enumerate().take(end).skip(start) {
-                // let value = stream[i];
                 tw.insert(i as u64, &DataInput::U64(value), 1);
                 *window_truth.entry(value).or_insert(0) += 1;
             }
@@ -1308,7 +1462,6 @@ mod tests {
             let start = w * samples_per_window;
             let end = start + samples_per_window;
             for (i, &value) in stream.iter().enumerate().take(end).skip(start) {
-                // let value = stream[i];
                 tw.insert(i as u64, &DataInput::U64(value), 1);
                 *window_truth.entry(value).or_insert(0) += 1;
             }
@@ -1406,15 +1559,48 @@ mod tests {
         let merged = tw.query_all();
 
         // Ground truth top-k sorted by frequency (descending).
-        let mut truth_sorted: Vec<(u64, i64)> = truth.into_iter().collect();
+        let mut truth_sorted: Vec<(u64, i64)> = truth.iter().map(|(k, v)| (*k, *v)).collect();
         truth_sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
         let true_top_k: Vec<u64> = truth_sorted.iter().take(top_k).map(|&(k, _)| k).collect();
 
         // Heap entries from merged sketch.
         let heap_entries = merged.heap().heap();
-        assert!(
-            !heap_entries.is_empty(),
-            "heap should not be empty after merging {num_windows} windows"
+        assert_eq!(
+            heap_entries.len(),
+            top_k,
+            "merging {num_windows} windows fills the heap"
+        );
+
+        // The counts the heap reports, not just the keys it holds. A resident's
+        // count is the merged estimate taken when it was reconciled in, so it
+        // trails the final estimate but never exceeds it, and Count-Min's
+        // one-sided error puts that estimate at or above the truth.
+        let mut smallest = i64::MAX;
+        for item in heap_entries {
+            let crate::HeapItem::U64(key) = item.key else {
+                panic!("a U64 stream seats U64 keys, got {:?}", item.key);
+            };
+            let estimate = merged.query(&DataInput::U64(key));
+            assert!(item.count > 0, "resident {key} carries a count of zero");
+            assert!(
+                item.count <= estimate,
+                "resident {key}'s count {} exceeds the merged estimate {estimate}",
+                item.count
+            );
+            if let Some(&exact) = truth.get(&key) {
+                assert!(
+                    estimate >= exact,
+                    "Count-Min undercounted {key}: {estimate} < {exact}"
+                );
+            }
+            smallest = smallest.min(item.count);
+        }
+
+        // The bounded min-heap keeps its smallest resident at the root; that is
+        // what the next eviction compares against.
+        assert_eq!(
+            heap_entries[0].count, smallest,
+            "the root is not the smallest resident"
         );
 
         // Every key in the true top-k should appear in the heap.
@@ -1482,7 +1668,6 @@ mod tests {
             let start = w * samples_per_window;
             let end = start + samples_per_window;
             for (i, &value) in stream.iter().enumerate().take(end).skip(start) {
-                // let value = stream[i];
                 tw.insert(i as u64, &DataInput::U64(value), 1);
                 *window_truth.entry(value).or_insert(0) += 1;
             }
@@ -1555,7 +1740,11 @@ mod tests {
 
     #[test]
     fn kll_tumbling_query_recent_accuracy() {
-        let config = KLLConfig { k: 200, m: 8 };
+        let config = KLLConfig {
+            k: 200,
+            m: 8,
+            seed: None,
+        };
         let total_samples = 100_000;
         let num_windows = 8;
         let recent_n = 3;
@@ -1648,14 +1837,43 @@ mod tests {
 
         let merged = tw.query_all();
 
-        let mut truth_sorted: Vec<(u64, i64)> = truth.into_iter().collect();
+        let mut truth_sorted: Vec<(u64, i64)> = truth.iter().map(|(k, v)| (*k, *v)).collect();
         truth_sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
         let true_top_k: Vec<u64> = truth_sorted.iter().take(top_k).map(|&(k, _)| k).collect();
 
         let heap_entries = merged.heap().heap();
-        assert!(
-            !heap_entries.is_empty(),
-            "heap should not be empty after merging {num_windows} windows"
+        assert_eq!(
+            heap_entries.len(),
+            top_k,
+            "merging {num_windows} windows fills the heap"
+        );
+
+        // The counts the heap reports, not just the keys it holds. Count
+        // Sketch's error is two-sided, so a resident's count is checked
+        // against the truth as a relative band rather than as a floor.
+        let mut smallest = i64::MAX;
+        for item in heap_entries {
+            let crate::HeapItem::U64(key) = item.key else {
+                panic!("a U64 stream seats U64 keys, got {:?}", item.key);
+            };
+            assert!(item.count > 0, "resident {key} carries a count of zero");
+            if let Some(&exact) = truth.get(&key) {
+                let estimate = merged.query(&DataInput::U64(key));
+                let error = (estimate - exact).abs() as f64 / exact as f64;
+                assert!(
+                    error < 0.02,
+                    "resident {key}: estimate {estimate} is {:.0}% off the exact {exact}",
+                    error * 100.0
+                );
+            }
+            smallest = smallest.min(item.count);
+        }
+
+        // The bounded min-heap keeps its smallest resident at the root; that is
+        // what the next eviction compares against.
+        assert_eq!(
+            heap_entries[0].count, smallest,
+            "the root is not the smallest resident"
         );
 
         let mut found_in_heap = 0usize;
@@ -1802,7 +2020,11 @@ mod tests {
 
     #[test]
     fn kll_tumbling_vs_monolithic() {
-        let config = KLLConfig { k: 200, m: 8 };
+        let config = KLLConfig {
+            k: 200,
+            m: 8,
+            seed: None,
+        };
         let total_samples = 100_000;
         let num_windows = 8;
         let samples_per_window = total_samples / num_windows;
@@ -1951,7 +2173,11 @@ mod tests {
 
         // --- KLL subsection ---
         {
-            let config = KLLConfig { k: 200, m: 8 };
+            let config = KLLConfig {
+                k: 200,
+                m: 8,
+                seed: None,
+            };
             let mut tw: TumblingWindow<KLL> =
                 TumblingWindow::new(total_samples as u64 + 1, 10, config, 4);
 

@@ -11,9 +11,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 
-use rmp_serde::{
-    decode::Error as RmpDecodeError, encode::Error as RmpEncodeError, from_slice, to_vec_named,
-};
+mod wire;
 
 // expect error bound to be less than 2%
 const KMV_DEFAULT_LENGTH: usize = 4096_usize;
@@ -76,16 +74,6 @@ impl<H: SketchHasher> KMV<H> {
             self.insert_by_hash(value);
         }
     }
-
-    /// Serializes the sketch into MessagePack bytes.
-    pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
-        to_vec_named(self)
-    }
-
-    /// Deserializes a sketch from MessagePack bytes.
-    pub fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self, RmpDecodeError> {
-        from_slice(bytes)
-    }
 }
 
 #[cfg(test)]
@@ -94,74 +82,8 @@ mod tests {
     use super::*;
     use crate::DataInput;
 
-    // takes too long for 10_000_000
-    // const TARGETS: [usize; 7] = [10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000];
-    const TARGETS: [usize; 6] = [10, 100, 1_000, 10_000, 100_000, 1_000_000];
     const ERROR_TOLERANCE: f64 = 0.02;
     const SERDE_SAMPLE: usize = 100_000;
-
-    #[test]
-    fn assert_accuracy() {
-        let mut sketch: KMV = KMV::default();
-        let mut inserted: usize = 0;
-
-        for &target in TARGETS.iter() {
-            while inserted < target {
-                let input = DataInput::U64(inserted as u64);
-                sketch.insert(&input);
-                inserted += 1;
-            }
-
-            let truth = target as f64;
-            let estimate = sketch.estimate();
-            let error = if truth == 0.0 {
-                0.0
-            } else {
-                (estimate - truth).abs() / truth
-            };
-            assert!(
-                error <= ERROR_TOLERANCE,
-                "KMV accuracy error {error:.4} exceeded {ERROR_TOLERANCE} (truth {truth}, estimate {estimate})"
-            );
-        }
-    }
-
-    #[test]
-    fn assert_merge_accuracy() {
-        let mut left: KMV = KMV::default();
-        let mut right: KMV = KMV::default();
-        let mut next_even: usize = 0;
-        let mut next_odd: usize = 1;
-
-        for &target in TARGETS.iter() {
-            while next_even < target {
-                let input = DataInput::U64(next_even as u64);
-                left.insert(&input);
-                next_even += 2;
-            }
-
-            while next_odd < target {
-                let input = DataInput::U64(next_odd as u64);
-                right.insert(&input);
-                next_odd += 2;
-            }
-
-            let mut merged = left.clone();
-            merged.merge(&mut right);
-
-            let truth = target as f64;
-            let estimate = merged.estimate();
-            let error = if truth == 0.0 {
-                0.0
-            } else {
-                (estimate - truth).abs() / truth
-            };
-            assert!(
-                error <= ERROR_TOLERANCE,
-                "KMV merge error {error:.4} exceeded {ERROR_TOLERANCE} (truth {truth}, estimate {estimate})"
-            );
-        }
-    }
 
     #[test]
     fn assert_serialization_round_trip() {

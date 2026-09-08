@@ -46,6 +46,7 @@ pub use message_pack_format::portable::countminsketch_topk::{CmsHeapItem, CountM
 pub use message_pack_format::portable::countsketch::{
     COUNT_SKETCH_TOPK_CAPACITY, CountSketch, CountSketchDelta,
 };
+pub use message_pack_format::portable::countsketch_topk::{CountSketchWithHeap, CsHeapItem};
 pub use message_pack_format::portable::ddsketch::{DDSKETCH_GROW_CHUNK, DdSketch, DdSketchDelta};
 pub use message_pack_format::portable::delta_set_aggregator::DeltaResult;
 pub use message_pack_format::portable::hll::{HllSketch, HllSketchDelta, HllVariant};

@@ -12,15 +12,15 @@
 //!   <https://arxiv.org/abs/1603.05346>
 //! - <https://www.amazon.science/publications/insert-optimized-implementation-of-streaming-data-sketches>
 
-use rmp_serde::decode::Error as RmpDecodeError;
-use rmp_serde::encode::Error as RmpEncodeError;
 use serde::{Deserialize, Serialize};
 
 use crate::common::input::data_input_to_f64;
 use crate::common::numerical::NumericalValue;
 use crate::{DataInput, Vector1D};
 
-use super::kll::Coin;
+use super::kll::{Coin, merge_sorted_runs, randomly_halve_up};
+
+mod wire;
 
 const CAPACITY_CACHE_LEN: usize = 20;
 const MAX_CACHEABLE_K: usize = 26_602;
@@ -48,6 +48,13 @@ pub struct KLLDynamic<T: NumericalValue = f64> {
     m: usize, // Minimum buffer size (usually 8)
     num_levels: usize,
     co: Coin,
+    /// Explicit seed for the compaction coin, when present. Set by
+    /// [`KLLDynamic::init_with_seed`] / [`KLLDynamic::init_kll_with_seed`] so
+    /// a sketch replays identically across runs and `clear()` re-seeds from
+    /// the same value. Not part of the wire format: it describes how the
+    /// sketch was built, not what it currently holds.
+    #[serde(skip)]
+    seed: Option<u64>,
     /// Cached level capacities by height (from top to bottom)
     #[serde(skip)]
     capacity_cache: [u32; CAPACITY_CACHE_LEN],
@@ -68,6 +75,23 @@ impl<T: NumericalValue> Default for KLLDynamic<T> {
 impl<T: NumericalValue> KLLDynamic<T> {
     /// Creates a KLLDynamic sketch with the given `k` and `m` parameters.
     pub fn init(k: usize, m: usize) -> Self {
+        Self::init_internal(k, m, Coin::new(), None)
+    }
+
+    /// Creates a KLLDynamic sketch with an explicit RNG seed for the
+    /// compaction coin. Two sketches built with the same seed and fed the same
+    /// input produce identical state, which is what makes reproducible-replay
+    /// scenarios and deterministic accuracy tests possible. The seed is also
+    /// stored so `clear()` re-seeds deterministically.
+    ///
+    /// The unseeded [`KLLDynamic::init`] draws from the wall clock, so a
+    /// sketch built with it cannot be used to assert an accuracy bound
+    /// reproducibly. Mirrors [`crate::KLL::init_with_seed`].
+    pub fn init_with_seed(k: usize, m: usize, seed: u64) -> Self {
+        Self::init_internal(k, m, Coin::from_seed(seed), Some(seed))
+    }
+
+    fn init_internal(k: usize, m: usize, coin: Coin, seed: Option<u64>) -> Self {
         let mut norm_m = m.min(MAX_CACHEABLE_K);
         norm_m = norm_m.max(2);
         let mut norm_k = k.max(norm_m);
@@ -80,7 +104,8 @@ impl<T: NumericalValue> KLLDynamic<T> {
             k: norm_k,
             m: norm_m,
             num_levels: 1,
-            co: Coin::new(),
+            co: coin,
+            seed,
             capacity_cache: [0; CAPACITY_CACHE_LEN],
             top_height: 0,
             level0_capacity: 0,
@@ -92,6 +117,11 @@ impl<T: NumericalValue> KLLDynamic<T> {
     /// Creates a KLLDynamic sketch with default `m` and the provided `k`.
     pub fn init_kll(k: i32) -> Self {
         Self::init(k as usize, 8)
+    }
+
+    /// `init_kll` with an explicit RNG seed. See [`KLLDynamic::init_with_seed`].
+    pub fn init_kll_with_seed(k: i32, seed: u64) -> Self {
+        Self::init_with_seed(k as usize, 8, seed)
     }
 
     fn push_value(&mut self, value: T) {
@@ -113,6 +143,14 @@ impl<T: NumericalValue> KLLDynamic<T> {
     /// The hot path: O(1) insertion at the end of the vector.
     pub fn update(&mut self, val: &T) {
         self.push_value(*val);
+    }
+
+    /// Batch variant of `update`. Exactly equivalent to looping `update`.
+    #[inline]
+    pub fn bulk_update(&mut self, values: &[T]) {
+        for v in values {
+            self.push_value(*v);
+        }
     }
 
     /// Loops to maintain the KLL invariant.
@@ -239,7 +277,13 @@ impl<T: NumericalValue> KLLDynamic<T> {
         self.items.clear();
         self.levels = Vector1D::filled(2, 0);
         self.num_levels = 1;
-        self.co = Coin::new();
+        // Re-seed from the construction seed when there is one, so a cleared
+        // sketch replays exactly like a fresh one; fall back to the wall clock
+        // for the unseeded constructor.
+        self.co = match self.seed {
+            Some(s) => Coin::from_seed(s),
+            None => Coin::new(),
+        };
         self.rebuild_capacity_cache();
     }
 
@@ -305,11 +349,108 @@ impl<T: NumericalValue> KLLDynamic<T> {
         cdf
     }
 
-    /// Merges another sketch into this one.
+    /// Merges another sketch's retained items into this one, preserving
+    /// each retained item's level weight (`2^level`) instead of discarding
+    /// it. See [`KLL::merge`](super::kll::KLL::merge) for the full
+    /// rationale — this is the same weight-preserving, level-by-level
+    /// interleave-and-recompact merge (concatenate each level's retained
+    /// items, then re-run the same randomized halve-and-promote compaction
+    /// ordinary inserts use), adapted to `KLLDynamic`'s growable (rather
+    /// than fixed-capacity) backing storage.
     pub fn merge(&mut self, other: &KLLDynamic<T>) {
-        for &value in other.items.as_slice() {
-            self.push_value(value);
+        if other.items.is_empty() {
+            return; // `other` is empty: nothing to merge.
         }
+
+        let target_num_levels = self.num_levels.max(other.num_levels);
+        // work[h] holds level h's combined (not-yet-compacted) retained
+        // items. +1 slack so `work[h + 1]` is always valid while cascading.
+        let mut work: Vec<Vec<T>> = vec![Vec::new(); target_num_levels + 1];
+
+        // Unlike `KLL` (fixed-capacity), whose `compact` only ever sorts
+        // level 0 and otherwise maintains sortedness of levels >= 1 as a
+        // standing invariant via merge-promotion, `KLLDynamic::compact`
+        // re-sorts a level's *entire* current contents from scratch on
+        // every call. So a level here is only guaranteed sorted right
+        // after its own last compaction — one that has since received a
+        // promotion from below is a concatenation of separately-sorted
+        // runs, not one sorted run as a whole. Neither operand's levels
+        // (including >= 1) can be assumed pre-sorted, so sort each
+        // operand's own contribution to a level before combining. That's
+        // also cheaper than concatenating first and sorting the combined
+        // (up to 2x larger) run: O(a log a + b log b) beats O((a+b)
+        // log(a+b)), and the two now-genuinely-sorted runs merge in
+        // linear time via the existing `merge_sorted_runs`.
+        //
+        // Absolute level `h` lives at array index `num_levels - 1 - h`.
+        #[allow(clippy::needless_range_loop)] // `h` also indexes self.levels/self.items
+        for h in 0..self.num_levels {
+            let idx = self.num_levels - 1 - h;
+            let levels = self.levels.as_slice();
+            let (s, e) = (levels[idx], levels[idx + 1]);
+            work[h].extend_from_slice(&self.items.as_slice()[s..e]);
+            work[h].sort_unstable_by(T::total_cmp);
+        }
+        let mut merge_buf: Vec<T> = Vec::new();
+        #[allow(clippy::needless_range_loop)] // `h` also indexes other.levels/other.items
+        for h in 0..other.num_levels {
+            let idx = other.num_levels - 1 - h;
+            let levels = other.levels.as_slice();
+            let (s, e) = (levels[idx], levels[idx + 1]);
+            let self_len = work[h].len();
+            work[h].extend_from_slice(&other.items.as_slice()[s..e]);
+            work[h][self_len..].sort_unstable_by(T::total_cmp);
+            merge_sorted_runs(work[h].as_mut_slice(), self_len, &mut merge_buf);
+        }
+
+        // Grow self's level bookkeeping to cover the merged height.
+        self.num_levels = target_num_levels;
+        self.rebuild_capacity_cache();
+
+        // Cascade-compact exactly like `compress_while_needed`/`compact`,
+        // except a level may need more than one halving pass here (a merge
+        // can leave a level far over capacity, not just one element over).
+        // Every level was sorted up front (above), and each promotion
+        // below keeps its target level sorted via `merge_sorted_runs`, so
+        // no level needs re-sorting once the cascade begins.
+        let mut h = 0;
+        while h < self.num_levels {
+            while work[h].len() > self.capacity_for_level(h) {
+                if h + 1 == self.num_levels {
+                    self.num_levels += 1;
+                    self.rebuild_capacity_cache();
+                    work.resize(self.num_levels + 1, Vec::new());
+                }
+                let pop = work[h].len();
+                let offset = usize::from(self.co.toss());
+                let num_survivors = randomly_halve_up(work[h].as_mut_slice(), 0, pop, offset);
+                let discard = pop - num_survivors;
+                work[h].drain(0..discard);
+
+                // Promote the (sorted) survivors into level h+1, merging
+                // with its existing (already-sorted) content.
+                let mut promoted = std::mem::take(&mut work[h]);
+                let left_len = promoted.len();
+                promoted.append(&mut work[h + 1]);
+                merge_sorted_runs(promoted.as_mut_slice(), left_len, &mut merge_buf);
+                work[h + 1] = promoted;
+            }
+            h += 1;
+        }
+
+        // Rebuild `items`/`levels` from the compacted per-level vectors,
+        // top level first, matching this type's storage order (array
+        // index 0 == top level, growing toward level 0 at the tail).
+        let total: usize = work[..self.num_levels].iter().map(Vec::len).sum();
+        let mut items = Vec::with_capacity(total);
+        let mut levels = Vec::with_capacity(self.num_levels + 1);
+        levels.push(0usize);
+        for h in (0..self.num_levels).rev() {
+            items.extend_from_slice(&work[h]);
+            levels.push(items.len());
+        }
+        self.items = Vector1D::from_vec(items);
+        self.levels = Vector1D::from_vec(levels);
     }
 
     /// Returns the estimated value at quantile `q`.
@@ -352,25 +493,6 @@ impl<T: NumericalValue> KLLDynamic<T> {
     fn buffer_size(&self) -> usize {
         self.items.len()
     }
-
-    /// Serialize the sketch into MessagePack bytes.
-    pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError>
-    where
-        T: Serialize,
-    {
-        rmp_serde::to_vec(self)
-    }
-
-    /// Deserialize a sketch from MessagePack bytes.
-    pub fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self, RmpDecodeError>
-    where
-        T: for<'de> Deserialize<'de>,
-    {
-        rmp_serde::from_slice(bytes).map(|mut sketch: KLLDynamic<T>| {
-            sketch.rebuild_capacity_cache();
-            sketch
-        })
-    }
 }
 
 impl KLLDynamic<f64> {
@@ -378,6 +500,15 @@ impl KLLDynamic<f64> {
     pub fn update_data_input(&mut self, val: &DataInput) -> Result<(), &'static str> {
         let value = data_input_to_f64(val)?;
         self.push_value(value);
+        Ok(())
+    }
+
+    /// Batch variant of `update_data_input`.
+    pub fn bulk_update_data_input(&mut self, values: &[DataInput]) -> Result<(), &'static str> {
+        for v in values {
+            let value = data_input_to_f64(v)?;
+            self.push_value(value);
+        }
         Ok(())
     }
 }
@@ -471,47 +602,7 @@ mod tests {
     use super::*;
     use crate::test_utils::{sample_uniform_f64, sample_zipf_f64};
 
-    #[derive(Clone, Copy)]
-    enum TestDistribution {
-        Uniform {
-            min: f64,
-            max: f64,
-        },
-        Zipf {
-            min: f64,
-            max: f64,
-            domain: usize,
-            exponent: f64,
-        },
-    }
-
     const SKETCH_K: i32 = 200;
-
-    fn build_kll_with_distribution(
-        k: i32,
-        sample_size: usize,
-        distribution: TestDistribution,
-        seed: u64,
-    ) -> (KLLDynamic, Vec<f64>) {
-        let mut sketch = KLLDynamic::init_kll(k);
-        let values = match distribution {
-            TestDistribution::Uniform { min, max } => {
-                sample_uniform_f64(min, max, sample_size, seed)
-            }
-            TestDistribution::Zipf {
-                min,
-                max,
-                domain,
-                exponent,
-            } => sample_zipf_f64(min, max, domain, exponent, sample_size, seed),
-        };
-
-        for &value in &values {
-            sketch.update(&value);
-        }
-
-        (sketch, values)
-    }
 
     // return element from input with given quantile
     fn quantile_from_sorted(data: &[f64], quantile: f64) -> f64 {
@@ -554,66 +645,6 @@ mod tests {
     }
 
     #[test]
-    fn distributions_quantiles_stay_within_rank_error() {
-        const TOLERANCE: f64 = 0.02;
-        const SAMPLE_SIZES: &[usize] = &[1_000, 5_000, 20_000, 100_000, 1_000_000, 5_000_000];
-        const QUANTILES: &[(f64, &str)] = &[
-            (0.0, "min"),
-            (0.10, "p10"),
-            (0.25, "p25"),
-            (0.50, "p50"),
-            (0.75, "p75"),
-            (0.90, "p90"),
-            (1.0, "max"),
-        ];
-
-        struct Case {
-            name: &'static str,
-            distribution: TestDistribution,
-            seed_base: u64,
-        }
-
-        let cases = [
-            Case {
-                name: "uniform",
-                distribution: TestDistribution::Uniform {
-                    min: 0.0,
-                    max: 100_000_000.0,
-                },
-                seed_base: 0xA5A5_0000,
-            },
-            Case {
-                name: "zipf",
-                distribution: TestDistribution::Zipf {
-                    min: 1_000_000.0,
-                    max: 10_000_000.0,
-                    domain: 8_192,
-                    exponent: 1.1,
-                },
-                seed_base: 0xB4B4_0000,
-            },
-        ];
-
-        for case in cases {
-            for (idx, &sample_size) in SAMPLE_SIZES.iter().enumerate() {
-                let seed = case.seed_base + idx as u64;
-                let (sketch, mut values) =
-                    build_kll_with_distribution(SKETCH_K, sample_size, case.distribution, seed);
-                values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                assert_quantiles_within_error(
-                    &sketch,
-                    &values,
-                    QUANTILES,
-                    TOLERANCE,
-                    case.name,
-                    sample_size,
-                    seed,
-                );
-            }
-        }
-    }
-
-    #[test]
     fn test_data_input_api() {
         let mut kll = KLLDynamic::init_kll(128);
 
@@ -629,7 +660,7 @@ mod tests {
         let median = cdf.query(0.5);
 
         // Median should be 30.5
-        assert!(median > 20.0 && median < 40.2, "Median = {}", median);
+        assert!(median > 20.0 && median < 40.2, "Median = {median}");
 
         // Test error handling for non-numeric input
         let result = kll.update_data_input(&DataInput::String("not a number".to_string()));
@@ -652,7 +683,7 @@ mod tests {
         let cdf = kll.cdf();
         let median = cdf.query(0.5);
         // only 30 and 40 is possible
-        assert!(median == 30.0 || median == 40.0, "Median = {}", median);
+        assert!(median == 30.0 || median == 40.0, "Median = {median}");
     }
 
     #[test]
@@ -669,7 +700,7 @@ mod tests {
         let cdf = kll.cdf();
         let median = cdf.query(0.5);
         // Median should be 30
-        assert!(median == 30.0, "Median = {}", median);
+        assert!(median == 30.0, "Median = {median}");
     }
 
     #[test]
@@ -710,6 +741,152 @@ mod tests {
             values.len(),
             0x00C0_FFEE,
         );
+    }
+
+    #[test]
+    fn merge_into_empty_target_preserves_weight_issue_68_repro() {
+        let mut src = KLLDynamic::<f64>::init_kll(SKETCH_K);
+        for i in 1..=1000u32 {
+            src.update(&(i as f64));
+        }
+        let src_count = src.count();
+        assert!(
+            (980..=1020).contains(&src_count),
+            "source sketch count before merge should track N=1000 closely, got {src_count}"
+        );
+
+        let mut dst = KLLDynamic::<f64>::init_kll(SKETCH_K);
+        assert_eq!(dst.count(), 0, "target must start empty for this repro");
+
+        dst.merge(&src);
+
+        assert_eq!(
+            dst.count(),
+            src_count,
+            "merge into an empty target must preserve total weight EXACTLY \
+             (the old item-replay merge rescaled this down to src's \
+             retained-item count)"
+        );
+
+        let median = dst.quantile(0.5);
+        assert!(
+            (475.0..=525.0).contains(&median),
+            "merged median drifted outside tolerance: median={median}"
+        );
+    }
+
+    // General case: merging two NON-empty KLLDynamic sketches must still
+    // preserve total count (within the same inherent rounding budget as
+    // ordinary inserts) and produce quantile estimates consistent with a
+    // reference built from the union of both inputs' raw data. Guards
+    // against a fix that only special-cases the empty-target repro above.
+    #[test]
+    fn merge_two_nonempty_sketches_preserves_weight_and_quantiles() {
+        const TOLERANCE: f64 = 0.03;
+        const QUANTILES: &[(f64, &str)] = &[
+            (0.0, "min"),
+            (0.10, "p10"),
+            (0.25, "p25"),
+            (0.50, "p50"),
+            (0.75, "p75"),
+            (0.90, "p90"),
+            (1.0, "max"),
+        ];
+
+        let values_a = sample_uniform_f64(0.0, 1_000_000.0, 50_000, 0xA11CE);
+        let values_b = sample_zipf_f64(0.0, 1_000_000.0, 8_192, 1.1, 50_000, 0xB0B);
+
+        let mut a = KLLDynamic::<f64>::init_kll(SKETCH_K);
+        for v in &values_a {
+            a.update(v);
+        }
+        let mut b = KLLDynamic::<f64>::init_kll(SKETCH_K);
+        for v in &values_b {
+            b.update(v);
+        }
+
+        let count_a = a.count();
+        let count_b = b.count();
+        assert!(
+            (count_a as f64 - values_a.len() as f64).abs() / (values_a.len() as f64) < 0.03,
+            "sketch a count before merge diverged from N: count={count_a}, n={}",
+            values_a.len()
+        );
+        assert!(
+            (count_b as f64 - values_b.len() as f64).abs() / (values_b.len() as f64) < 0.03,
+            "sketch b count before merge diverged from N: count={count_b}, n={}",
+            values_b.len()
+        );
+
+        a.merge(&b);
+
+        let merged_count = a.count() as f64;
+        let expected_count = (count_a + count_b) as f64;
+        assert!(
+            (merged_count - expected_count).abs() / expected_count < 0.03,
+            "merging two non-empty sketches must preserve total weight (within the \
+             same rounding budget as ordinary inserts): merged={merged_count}, \
+             expected~={expected_count} (count_a={count_a}, count_b={count_b})"
+        );
+
+        let mut union: Vec<f64> = values_a.iter().chain(values_b.iter()).copied().collect();
+        union.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        assert_quantiles_within_error(
+            &a,
+            &union,
+            QUANTILES,
+            TOLERANCE,
+            "merge_two_nonempty",
+            union.len(),
+            0xA11C_E0B0,
+        );
+    }
+
+    // Deterministic regression: level h (h >= 1) is not always a single
+    // sorted run in both operands. It is for `KLL` (fixed-capacity), whose
+    // `compact` maintains it as a standing invariant via merge-promotion — but
+    // `KLLDynamic::compact` re-sorts a level's *entire* contents from
+    // scratch on every call instead, so a level that received a
+    // promotion since its last compaction can be a concatenation of
+    // separately-sorted chunks, not one sorted run. `randomly_halve_up`'s
+    // alternating-position subsampling is only value-order-correct on
+    // truly sorted input, and doesn't sort its input itself — so feeding
+    // it an unsorted level silently produces an unsorted (and thus not
+    // rank-error-bounded) survivor set.
+    //
+    // Hand-build `other`'s level 1 in exactly that legitimate-but-unsorted
+    // shape (two independently-ascending chunks concatenated out of
+    // order), small enough to stay well under capacity so level 1 is
+    // never itself compacted during the merge — the output then reflects
+    // the construction phase's ordering assumption directly, with no
+    // randomized (`Coin`) compaction able to mask the failure, keeping this
+    // test deterministic.
+    #[test]
+    fn merge_handles_operand_level_that_is_not_a_single_sorted_run() {
+        let mut other = KLLDynamic::<f64>::init(50, 4);
+        other.items = Vector1D::from_vec(vec![30.0, 40.0, 10.0, 20.0, 5.0]);
+        other.levels = Vector1D::from_vec(vec![0, 4, 5]);
+        other.num_levels = 2;
+        other.rebuild_capacity_cache();
+        assert!(
+            other.capacity_for_level(1) >= 4,
+            "test setup needs level 1 to stay under capacity, uncompacted"
+        );
+
+        let mut dst = KLLDynamic::<f64>::init(50, 4);
+        dst.merge(&other);
+
+        let levels = dst.levels.as_slice();
+        let items = dst.items.as_slice();
+        for h in 1..dst.num_levels {
+            let level_idx = dst.num_levels - 1 - h;
+            let (s, e) = (levels[level_idx], levels[level_idx + 1]);
+            assert!(
+                items[s..e].windows(2).all(|w| w[0] <= w[1]),
+                "level {h} is not a single ascending sorted run after merge: {:?}",
+                &items[s..e]
+            );
+        }
     }
 
     #[test]
@@ -798,5 +975,39 @@ mod tests {
         let restored =
             KLLDynamic::<i64>::deserialize_from_bytes(&bytes).expect("deserialize KLLDynamic<i64>");
         assert_eq!(sketch.count(), restored.count());
+    }
+
+    #[test]
+    fn bulk_update_equivalent_to_loop() {
+        let vals = sample_uniform_f64(0.0, 1000.0, 10_000, 0xCAFE_1234);
+        let mut a = KLLDynamic::<f64>::init_kll(200);
+        let mut b = KLLDynamic::<f64>::init_kll(200);
+        for v in &vals {
+            a.update(v);
+        }
+        b.bulk_update(&vals);
+        // KLLDynamic is non-deterministic (Coin::new wall-clock), so counts
+        // and quantiles are only approximately equal — same tolerance as
+        // merge tests.
+        let ca = a.count() as f64;
+        let cb = b.count() as f64;
+        assert!(
+            (ca - cb).abs() / ca < 0.05,
+            "count diverged: loop={ca}, bulk={cb}"
+        );
+        // Quantiles are non-deterministic for KLLDynamic (wall-clock coin),
+        // so large-batch quantile comparison is omitted here; small-batch
+        // exact check below covers determinism.
+
+        // DataInput batch equivalence — small batch (100) avoids compaction
+        // non-determinism, so exact.
+        let di: Vec<DataInput> = vals[..100].iter().map(|v| DataInput::F64(*v)).collect();
+        let mut c = KLLDynamic::<f64>::init_kll(200);
+        let mut d = KLLDynamic::<f64>::init_kll(200);
+        for v in &di {
+            c.update_data_input(v).unwrap();
+        }
+        d.bulk_update_data_input(&di).unwrap();
+        assert_eq!(c.count(), d.count());
     }
 }

@@ -20,21 +20,26 @@ This document provides a high-level overview of implemented and planned features
 
 - `DataInput` - Unified type system for all sketches
 - `Vector1D`, `Vector2D` - Flat storage structures for sketch counters
+- `BitMatrix` - Packed one-bit-per-cell grid behind the same `MatrixStorage` interface as the counter matrices, for membership sketches
 - `impl_fixed_matrix!` macro - Define compile-time fixed-size matrix types with any counter type and dimensions
+- `impl_hll_bucket_list!` macro - Define compile-time fixed-size HLL register storage types at any precision (the crate ships `lg_k` 12/14/16)
 - `CommonHeap` & `HHHeap` - Generic and specialized heaps for heavy hitter tracking
 - Deterministic hashing with seed management
 - Pluggable hash via the `SketchHasher` trait — swap the hash function without changing sketch code
+- `DigestHasher` / `DigestBuildHasher` - Single-avalanche hasher for maps keyed by a value that is already a digest
 - `RegularPath` / `FastPath` modes - Type-level pairing of insert/estimate paths
 
-**Sketch APIs** — Frequency estimation, cardinality, quantiles, heavy hitters, sampling, and more. See [apis.md](apis.md) for the full list with per-sketch status, error guarantees, and references.
+**Sketch APIs** — Frequency estimation, cardinality, quantiles, heavy hitters, set membership, sampling, and more. See [apis.md](apis.md) for the full list with per-sketch status, error guarantees, and references.
 
 ### Frameworks
 
-**Hydra** - Hierarchical heavy hitters for multi-dimensional queries ([apis.md](apis.md))
+**Hydra** - Subpopulation queries over multi-dimensional keys ([apis.md](apis.md))
 
 **UnivMon** - Universal monitoring (L1, L2, entropy, cardinality from single structure) ([apis.md](apis.md))
 
 **UnivMonPyramid** - Optimized two-tier UnivMon with `UnivSketchPool` for insert and memory management ([apis.md](apis.md))
+
+**UnivMonQ (Experimental)** - Terminal-stratum UnivMon with exact insertion-only L1, F0/F2/compatible g-sum queries, an adaptively assisted occurrence sample for entropy, ranks, and quantiles, and reusable prepared query views. Its API, estimators, and guarantees may change.
 
 **HashSketchEnsemble** - Hash-once-use-many pattern for coordinating multiple sketches with single hash computation
 
@@ -43,6 +48,8 @@ This document provides a high-level overview of implemented and planned features
 **EHSketchList** - Unified sketch enum for insert/merge/query across sketch types, that can be integrated into `ExponentialHistogram`
 
 **ExponentialHistogram** - Sliding window coordinator for mergeable sketches
+
+**TumblingWindow** - Non-overlapping windows over pooled mergeable sketches, with built-in support for FoldCMS, FoldCS, KLL and the experimental UnivMon-Q
 
 **EHUnivOptimized** - Hybrid two-tier ExponentialHistogram for UnivMon with sketch memory reuse (currently `Unstable`)
 
@@ -60,7 +67,7 @@ This document provides a high-level overview of implemented and planned features
 
 ### Serialization
 
-**MessagePack (rmp-serde) and Protobuf (prost)** - Dual serialization support across most sketch types
+**MessagePack (rmp-serde)** - Serialization support across most sketch types
 
 ### Sampling
 
@@ -74,33 +81,13 @@ This document provides a high-level overview of implemented and planned features
 
 Insertion throughput measured on 10,000,000 Zipf-distributed `int64` values (s=1.1, support=100k), averaged over 10 seeded runs.
 
-#### Count-Min Sketch
-
-![CMS Insertion Throughput (5×2048)](./benchmark_plots/plots/cms/cms_throughput_insertion.png)
-
-![CMS Insertion Throughput (5×32768)](./benchmark_plots/plots/cms32k/cms32k_throughput_insertion.png)
-
-#### Count
-
-![Count Insertion Throughput (5×2048)](./benchmark_plots/plots/cs/cs_throughput_insertion.png)
-
-![Count Insertion Throughput (5×32768)](./benchmark_plots/plots/cs32k/cs32k_throughput_insertion.png)
-
-#### HyperLogLog
-
-![HLL Insertion Throughput](./benchmark_plots/plots/hll/hll_throughput_insertion.png)
-
-#### KLL
-
-![KLL Insertion Throughput](./benchmark_plots/plots/kll/kll_throughput_insertion.png)
-
 ### Testing
 
 - Current test coverage is documented in [tests.md](tests.md). Additional unit tests and strict correctness tests are in progress.
 
 ### Serialization
 
-MessagePack (`rmp-serde`) support. **serde support** means the type derives `Serialize`/`Deserialize` and can be used with any serde-compatible serializer. **Built-in helpers** (`serialize_to_bytes` / `deserialize_from_bytes`) provide one-call MessagePack round-tripping without requiring users to depend on `rmp-serde` directly.
+MessagePack (`rmp-serde`) support. **serde support** means the type derives `Serialize`/`Deserialize` and can be used with any serde-compatible serializer. **Built-in helpers** (`serialize_to_bytes` / `deserialize_from_bytes`) provide one-call round-tripping without requiring users to depend on `rmp-serde` directly. These helpers emit the self-describing **ASAPv1** wire envelope (see the [ASAPv1 wire format spec](./asapv1_wire_format.md)) for every sketch the spec's `kind_id` registry marks *implemented*; NitroBatch, FoldCMS, FoldCS, HashSketchEnsemble, EHUnivOptimized and OctoSketch are not converted.
 
 | Component | serde support | Built-in helpers |
 | --- | --- | --- |
@@ -110,15 +97,20 @@ MessagePack (`rmp-serde`) support. **serde support** means the type derives `Ser
 | DDSketch | Yes | Yes |
 | KLL / KLLDynamic | Yes | Yes |
 | KMV | Yes | Yes |
-| Elastic | Yes | In Progress |
-| Coco | Yes | In Progress |
-| UniformSampling | Yes | In Progress |
+| Elastic | Yes | Yes |
+| Coco | Yes | Yes |
+| UniformSampling | Yes | Yes |
 | FoldCMS / FoldCS | Yes | In Progress |
-| CMSHeap / CSHeap | In Progress | In Progress |
+| CMSHeap / CSHeap | In Progress | Yes |
+| SpaceSaving | Yes | Yes |
+| Bloom | Yes | Yes |
 | Hydra | Yes | Yes |
 | UnivMon | Yes | Yes |
+| UnivMon Optimized | No | Yes |
+| UnivMonQ (experimental) | Internal wire DTO | Yes |
 | NitroBatch | Yes | In Progress |
-| EHSketchList | Yes | In Progress |
+| EHSketchList | Yes | Yes |
+| ExponentialHistogram | No | Yes |
 
 Protobuf (prost): `.proto` definitions exist for CountMin, Count, HLL, DDSketch, KLL, Elastic, Coco, Hydra, and UnivMon. Rust conversion code is in progress.
 

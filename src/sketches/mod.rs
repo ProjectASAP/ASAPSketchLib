@@ -39,12 +39,19 @@
 //! queries, while the `_topk` variants compose the sketch with heap
 //! bookkeeping for heavy-hitter workloads.
 
-#[cfg(feature = "experimental")]
 pub mod coco;
-#[cfg(feature = "experimental")]
 pub use coco::Coco;
-#[cfg(feature = "experimental")]
 pub use coco::CocoBucket;
+
+/// Fixed-counter heavy-hitter tracking over a Stream-Summary.
+pub mod space_saving;
+pub use space_saving::{SPACE_SAVING_DEFAULT_CAPACITY, SpaceSaving};
+
+/// Approximate set membership over a packed bit grid.
+pub mod bloom;
+pub use bloom::{
+    BLOOM_DEFAULT_COLS, BLOOM_DEFAULT_ROWS, BLOOM_MAX_BITS, BLOOM_MAX_SLICES, Bloom, BloomMode,
+};
 
 pub mod countsketch;
 pub use countsketch::Count;
@@ -61,11 +68,8 @@ pub mod countminsketch;
 pub use crate::MatrixStorage;
 pub use countminsketch::{CountMin, QUICKSTART_COL_NUM, QUICKSTART_ROW_NUM};
 
-#[cfg(feature = "experimental")]
 pub mod elastic;
-#[cfg(feature = "experimental")]
 pub use elastic::Elastic;
-#[cfg(feature = "experimental")]
 pub use elastic::HeavyBucket;
 
 /// HyperLogLog implementations and aliases.
@@ -98,11 +102,15 @@ pub mod countminsketch_topk;
 pub use countminsketch_topk::CMSHeap;
 
 pub mod countsketch_topk;
-pub use countsketch_topk::CSHeap;
-pub use countsketch_topk::CountL2HH;
+pub use countsketch_topk::{CSHeap, cs_heap_count};
+pub use countsketch_topk::{CountL2HH, l2hh_cell_for_row};
 
 pub mod octo_delta;
-pub use octo_delta::{CM_PROMASK, COUNT_PROMASK, CmDelta, CountDelta, HLL_PROMASK, HllDelta};
+pub use octo_delta::{
+    CM_PROMASK, COCO_PROMASK, COUNT_PROMASK, CmDelta, CocoDelta, CountDelta, DD_PROMASK, DdDelta,
+    ELASTIC_PROMASK, ElasticDelta, HLL_PROMASK, HllDelta, KeyedCmDelta, KeyedCountDelta,
+    LayeredCountDelta, MAX_PROMASK, OctoThreshold, UNIVMON_PROMASK,
+};
 
 pub mod fold_cms;
 pub use fold_cms::{FoldCMS, FoldCell, FoldEntry};

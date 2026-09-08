@@ -416,9 +416,7 @@ impl<H: SketchHasher> FoldCS<H> {
     /// The outer `Vec<FoldCell>` allocation is preserved; inner `Collided(Vec)`
     /// data is dropped.
     pub fn clear(&mut self) {
-        for cell in &mut self.cells {
-            *cell = FoldCell::Empty;
-        }
+        self.cells.fill(FoldCell::Empty);
         self.heap.clear();
     }
 
@@ -823,9 +821,74 @@ mod tests {
 
         let flat = fold.to_flat_counters();
         let std_flat = standard.as_storage().as_slice();
+        assert_eq!(
+            flat.len(),
+            std_flat.len(),
+            "the flattened counters must cover the whole rows x cols matrix"
+        );
         for (i, (f, s)) in flat.iter().zip(std_flat.iter()).enumerate() {
             assert_eq!(*f, *s, "flat counter mismatch at [{i}]: fold={f}, std={s}");
         }
+    }
+
+    // -- Serde round trip ---------------------------------------------------
+
+    /// The derived serde form is the only serialization FoldCS has, so the
+    /// round trip has to carry the whole sketch: the folded cells with their
+    /// permanent `full_col` tags, the geometry the unfold path reads, and the
+    /// heavy-hitter heap (whose index is rebuilt on load rather than carried).
+    #[test]
+    fn serde_round_trip_keeps_the_cells_the_geometry_and_the_heap() {
+        let rows = 3;
+        let full_cols = 4096;
+        let fold_level = 4;
+        let top_k = 16;
+
+        let mut sk: FoldCS = FoldCS::new(rows, full_cols, fold_level, top_k);
+        let stream = sample_zipf_u64(2_000, 1.2, 20_000, 0x5EED_C55C);
+        for &value in &stream {
+            sk.insert(&DataInput::U64(value), 1);
+        }
+        assert!(
+            sk.collided_cells() > 0,
+            "the fixture should exercise collided cells, not just Single ones"
+        );
+
+        let bytes = rmp_serde::to_vec(&sk).expect("encode");
+        let restored: FoldCS = rmp_serde::from_slice(&bytes).expect("decode");
+
+        assert_eq!(restored.rows(), sk.rows());
+        assert_eq!(restored.fold_cols(), sk.fold_cols());
+        assert_eq!(restored.full_cols(), sk.full_cols());
+        assert_eq!(restored.fold_level(), sk.fold_level());
+        assert_eq!(restored.total_entries(), sk.total_entries());
+        assert_eq!(restored.collided_cells(), sk.collided_cells());
+        assert_eq!(restored.to_flat_counters(), sk.to_flat_counters());
+
+        for value in 0..2_000u64 {
+            let key = DataInput::U64(value);
+            assert_eq!(
+                restored.query(&key),
+                sk.query(&key),
+                "estimate for {value} moved across the round trip"
+            );
+        }
+
+        let before = sk.heap().heap();
+        let after = restored.heap().heap();
+        assert_eq!(after.len(), before.len(), "heap size moved");
+        assert_eq!(after.len(), top_k, "the fixture should fill the heap");
+        for (a, b) in after.iter().zip(before.iter()) {
+            assert_eq!(a.key, b.key, "heap order moved across the round trip");
+            assert_eq!(a.count, b.count, "heap count moved across the round trip");
+        }
+        // The heap's key index is `#[serde(skip)]` and rebuilt on load, so a
+        // lookup has to work on the decoded side too.
+        let resident = before[0].key.clone();
+        assert!(
+            restored.heap().find_heap_item(&resident).is_some(),
+            "the rebuilt heap index cannot find its own resident"
+        );
     }
 
     // -- Memory efficiency --------------------------------------------------
@@ -967,118 +1030,6 @@ mod tests {
         assert!(
             within_count as f64 > correct_lower_bound,
             "in-bound items {within_count} not > expected {correct_lower_bound}"
-        );
-    }
-
-    // -- Large-window merge benchmark ---------------------------------------
-
-    #[test]
-    fn large_window_merge_benchmark_cs() {
-        let rows = 3;
-        let full_cols = 4096;
-        let fold_level = 4; // 256 physical cols per sub-window
-        let top_k = 20;
-        let domain = 10_000;
-        let exponent = 1.1;
-        let total_samples = 500_000;
-        let num_subwindows = 16;
-        let samples_per_window = total_samples / num_subwindows;
-
-        // Generate full stream and split into sub-windows.
-        let stream = sample_zipf_u64(domain, exponent, total_samples, 0xBEEF_CAFE);
-
-        let mut truth = HashMap::<u64, i64>::new();
-        let mut subwindow_sketches = Vec::with_capacity(num_subwindows);
-
-        for w in 0..num_subwindows {
-            let start = w * samples_per_window;
-            let end = start + samples_per_window;
-            let mut sk: FoldCS = FoldCS::new(rows, full_cols, fold_level, top_k);
-
-            for &value in &stream[start..end] {
-                sk.insert(&DataInput::U64(value), 1);
-                *truth.entry(value).or_insert(0) += 1;
-            }
-            subwindow_sketches.push(sk);
-        }
-
-        // Print per sub-window stats.
-        eprintln!("\n=== FoldCS Large-Window Merge Benchmark ===");
-        eprintln!(
-            "Config: rows={rows}, full_cols={full_cols}, fold_level={fold_level}, \
-             sub-windows={num_subwindows}, samples/window={samples_per_window}"
-        );
-        for (w, sk) in subwindow_sketches.iter().enumerate() {
-            eprintln!(
-                "  Sub-window {w:>2}: cells={:<6} entries={:<6} collided={}",
-                sk.cells().len(),
-                sk.total_entries(),
-                sk.collided_cells()
-            );
-        }
-
-        // Hierarchical merge.
-        let merged = FoldCS::hierarchical_merge(&subwindow_sketches);
-        eprintln!(
-            "  Merged:        cells={:<6} entries={:<6} collided={} fold_level={}",
-            merged.cells().len(),
-            merged.total_entries(),
-            merged.collided_cells(),
-            merged.fold_level()
-        );
-
-        // Standard CS for comparison.
-        let std_memory = rows * full_cols * std::mem::size_of::<i64>();
-        eprintln!(
-            "  Standard CS memory (per sketch): {} bytes ({} counters)",
-            std_memory,
-            rows * full_cols
-        );
-
-        // Error statistics.
-        let epsilon = (std::f64::consts::E / full_cols as f64).sqrt();
-        let l2_norm = truth
-            .values()
-            .map(|&c| (c as f64).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        let error_bound = epsilon * l2_norm;
-
-        let mut total_abs_error: f64 = 0.0;
-        let mut max_abs_error: i64 = 0;
-        let mut within_bound = 0usize;
-
-        for (&key, &true_count) in &truth {
-            let est = merged.query(&DataInput::U64(key));
-            let abs_err = (est - true_count).abs();
-            total_abs_error += abs_err as f64;
-            if abs_err > max_abs_error {
-                max_abs_error = abs_err;
-            }
-            if (abs_err as f64) < error_bound {
-                within_bound += 1;
-            }
-        }
-
-        let mean_abs_error = total_abs_error / truth.len() as f64;
-        let pct_within = within_bound as f64 / truth.len() as f64 * 100.0;
-
-        eprintln!("\n  Error Distribution:");
-        eprintln!("    Mean absolute error:  {mean_abs_error:.2}");
-        eprintln!("    Max absolute error:   {max_abs_error}");
-        eprintln!("    CS error bound (eps*||f||_2): {error_bound:.2}");
-        eprintln!(
-            "    Within bound:         {within_bound}/{} ({pct_within:.1}%)",
-            truth.len()
-        );
-
-        // Assertions: at least 90% within bound is reasonable for CS.
-        let delta = 1.0 / std::f64::consts::E.powi(rows as i32);
-        let expected_fraction = 1.0 - delta;
-        assert!(
-            pct_within / 100.0 > expected_fraction,
-            "only {pct_within:.1}% within bound, expected > {:.1}%",
-            expected_fraction * 100.0
         );
     }
 

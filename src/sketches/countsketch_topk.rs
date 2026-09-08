@@ -6,18 +6,47 @@
 //! - [`CountL2HH`]: Count Sketch augmented with per-row L2 norm tracking for
 //!   heavy-hitter detection.
 
-use rmp_serde::{
-    decode::Error as RmpDecodeError, encode::Error as RmpEncodeError, from_slice, to_vec_named,
-};
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 
+use crate::octo_delta::CountDelta;
 use crate::sketches::countsketch::CountSketchCounter;
 use crate::{
     Count, DataInput, DefaultMatrixI32, DefaultMatrixI64, DefaultMatrixI128, DefaultXxHasher,
     FastPath, FixedMatrix, HHHeap, MatrixStorage, QuickMatrixI64, QuickMatrixI128, RegularPath,
     SketchHasher, Vector1D, Vector2D, compute_median_inline_f64, heap_item_to_sketch_input,
 };
+
+pub(crate) mod l2hh_wire;
+mod wire;
+
+/// The count a `CSHeap` entry carries for a Count Sketch estimate.
+///
+/// `Count::estimate` returns the row **median** as `f64`, because a Count
+/// Sketch estimate is signed and is a median rather than a counter read. The
+/// heap stores `i64`, so a conversion is unavoidable and its semantics are part
+/// of the API rather than an accident of a cast:
+///
+/// - **Saturating**, not wrapping. Rust's `f64 as i64` saturates at
+///   `i64::MIN`/`i64::MAX` and maps `NaN` to `0`; this function names that
+///   choice so it cannot be silently changed. An `i128`-backed sketch really
+///   can hold counts past `i64::MAX` — `CSHeap<QuickMatrixI128>` and friends
+///   accept `insert_many(key, i128)` — and those clamp here. A wrapped negative
+///   count would corrupt the heap's ordering, which is exactly what saturation
+///   prevents.
+/// - **Truncating toward zero** on the fractional part a median of an even row
+///   count can produce.
+///
+/// Above `2^53` the estimate has already lost precision in `f64` inside
+/// `Count::estimate`, so an `i128` sketch's heap entries are exact only up to
+/// that magnitude. Both limits are asserted in
+/// `tests/e2e_matrix_instances.rs`.
+#[inline]
+pub fn cs_heap_count(estimate: f64) -> i64 {
+    // `as` on a float is a saturating cast in Rust (since 1.45); this is the
+    // documented behaviour, not a fallback.
+    estimate as i64
+}
 
 const DEFAULT_TOP_K: usize = 32;
 const DEFAULT_ROW_NUM: usize = 3;
@@ -26,6 +55,7 @@ const DEFAULT_COL_NUM: usize = 4096;
 /// A Count Sketch paired with a top-k heavy-hitter heap.
 ///
 /// Generic over the same type parameters as [`Count`].
+#[derive(Clone)]
 pub struct CSHeap<
     S: MatrixStorage = Vector2D<i64>,
     Mode = RegularPath,
@@ -222,7 +252,7 @@ where
     pub fn insert(&mut self, key: &DataInput) {
         self.cs.insert(key);
         let est = self.cs.estimate(key);
-        self.heap.update(key, est as i64);
+        self.heap.update(key, cs_heap_count(est));
     }
 
     /// Inserts an observation with the given count and updates the top-k heap.
@@ -230,7 +260,7 @@ where
     pub fn insert_many(&mut self, key: &DataInput, many: S::Counter) {
         self.cs.insert_many(key, many);
         let est = self.cs.estimate(key);
-        self.heap.update(key, est as i64);
+        self.heap.update(key, cs_heap_count(est));
     }
 
     /// Inserts a batch of observations, updating the heap after each.
@@ -263,7 +293,7 @@ where
         for key in candidate_keys {
             let key_ref = heap_item_to_sketch_input(&key);
             let est = self.cs.estimate(&key_ref);
-            self.heap.update(&key_ref, est as i64);
+            self.heap.update(&key_ref, cs_heap_count(est));
         }
     }
 }
@@ -280,7 +310,7 @@ where
     pub fn insert(&mut self, key: &DataInput) {
         self.cs.insert(key);
         let est = self.cs.estimate(key);
-        self.heap.update(key, est as i64);
+        self.heap.update(key, cs_heap_count(est));
     }
 
     /// Inserts an observation with the given count using fast-path hashing.
@@ -288,7 +318,7 @@ where
     pub fn insert_many(&mut self, key: &DataInput, many: S::Counter) {
         self.cs.insert_many(key, many);
         let est = self.cs.estimate(key);
-        self.heap.update(key, est as i64);
+        self.heap.update(key, cs_heap_count(est));
     }
 
     /// Inserts a batch of observations using fast-path hashing.
@@ -318,7 +348,7 @@ where
         for key in candidate_keys {
             let key_ref = heap_item_to_sketch_input(&key);
             let est = self.cs.estimate(&key_ref);
-            self.heap.update(&key_ref, est as i64);
+            self.heap.update(&key_ref, cs_heap_count(est));
         }
     }
 }
@@ -909,6 +939,24 @@ mod tests {
 // file stays focused on plain Count Sketch.
 // =====================================================================
 
+/// Column and sign `CountL2HH` uses for `row`, given its 128-bit key hash.
+///
+/// Shared with the OctoSketch worker sketches so a worker and its parent can
+/// never disagree about which cell a key lands in.
+#[inline(always)]
+pub fn l2hh_cell_for_row(
+    hashed_val: u128,
+    row: usize,
+    cols: usize,
+    mask_bits: u32,
+) -> (usize, i64) {
+    let mask = (1u128 << mask_bits) - 1;
+    let hashed = (hashed_val >> (row * mask_bits as usize)) & mask;
+    let col = (hashed as usize) % cols;
+    let bit = ((hashed_val >> (127 - row)) & 1) as i64;
+    (col, -(1 - 2 * bit))
+}
+
 /// Count Sketch augmented with per-row L2 norm tracking for heavy-hitter detection.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(bound = "")]
@@ -977,12 +1025,19 @@ impl<H: SketchHasher> CountL2HH<H> {
             (other.row, other.col),
             "dimension mismatch while merging CountL2HH sketches"
         );
+        assert_eq!(
+            self.seed_idx, other.seed_idx,
+            "seed mismatch while merging CountL2HH sketches"
+        );
 
         for i in 0..self.row {
+            let mut row_l2 = 0_i128;
             for j in 0..self.col {
                 self.counts[i][j] += other.counts[i][j];
+                let counter = self.counts[i][j] as i128;
+                row_l2 = row_l2.saturating_add(counter.saturating_mul(counter));
             }
-            self.l2[i] = other.l2[i];
+            self.l2[i] = row_l2.min(i64::MAX as i128) as i64;
         }
     }
 
@@ -1001,28 +1056,48 @@ impl<H: SketchHasher> CountL2HH<H> {
 
     /// Inserts with hash optimization using precomputed hash value.
     pub fn fast_insert_with_count_and_hash(&mut self, hashed_val: u128, c: i64) {
-        let mask_bits = self.counts.get_mask_bits() as usize;
-        let mask = (1u128 << mask_bits) - 1;
-        let mut shift_amount = 0;
-        let mut sign_bit_pos = 127;
-
+        let mask_bits = self.counts.get_mask_bits();
         for i in 0..self.row {
-            let hashed = (hashed_val >> shift_amount) & mask;
-            let idx = (hashed as usize) % self.col;
-            let bit = ((hashed_val >> sign_bit_pos) & 1) as i64;
-            let sign_bit = -(1 - 2 * bit);
-
+            let (idx, sign_bit) = l2hh_cell_for_row(hashed_val, i, self.col, mask_bits);
             let old_value = self.counts.query_one_counter(i, idx);
-            let new_value = old_value + sign_bit * c;
-            self.counts[i][idx] = new_value;
-
-            let old_l2 = self.l2.as_slice()[i];
-            let new_l2 = old_l2 + new_value * new_value - old_value * old_value;
-            self.l2[i] = new_l2;
-
-            shift_amount += mask_bits;
-            sign_bit_pos -= 1;
+            self.write_counter(i, idx, old_value + sign_bit * c);
         }
+    }
+
+    /// Writes one counter and carries the row's L2 accumulator with it.
+    ///
+    /// Saturating i128 intermediate so extreme counts degrade gracefully
+    /// instead of wrapping (matches merge-path semantics, which also clamps to
+    /// [0, i64::MAX]: L2^2 can never go negative, even when a decrement follows
+    /// prior saturation).
+    #[inline(always)]
+    fn write_counter(&mut self, row: usize, col: usize, new_value: i64) {
+        let old_value = self.counts.query_one_counter(row, col);
+        self.counts[row][col] = new_value;
+        let old_l2 = self.l2.as_slice()[row] as i128;
+        let new_l2 = old_l2 + (new_value as i128) * (new_value as i128)
+            - (old_value as i128) * (old_value as i128);
+        self.l2[row] = new_l2.clamp(0, i64::MAX as i128) as i64;
+    }
+
+    /// Seed offset this sketch hashes with; UnivMon gives each layer its own.
+    pub fn seed_idx(&self) -> usize {
+        self.seed_idx
+    }
+
+    /// Column-mask width used to slice the 128-bit hash into per-row indices.
+    pub fn mask_bits(&self) -> u32 {
+        self.counts.get_mask_bits()
+    }
+
+    /// Applies a counter delta promoted by an OctoSketch worker.
+    ///
+    /// The row's L2 accumulator is carried along exactly, so a parent fed only
+    /// deltas reports the same `get_l2` as one fed the raw stream.
+    pub fn apply_delta(&mut self, delta: CountDelta) {
+        let (row, col) = (delta.row as usize, delta.col as usize);
+        let new_value = self.counts.query_one_counter(row, col) + delta.value as i64;
+        self.write_counter(row, col, new_value);
     }
 
     /// Inserts without L2 update using precomputed hash value.
@@ -1105,16 +1180,6 @@ impl<H: SketchHasher> CountL2HH<H> {
         }
         compute_median_inline_f64(&mut lst[..])
     }
-
-    /// Serializes the CountL2HH sketch into MessagePack bytes.
-    pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
-        to_vec_named(self)
-    }
-
-    /// Deserializes a CountL2HH sketch from MessagePack bytes.
-    pub fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self, RmpDecodeError> {
-        from_slice(bytes)
-    }
 }
 
 #[cfg(test)]
@@ -1149,6 +1214,7 @@ mod tests_count_l2_hh {
 
         left.merge(&right);
         assert_eq!(left.fast_get_est(&key), 13.0);
+        assert_eq!(left.get_l2(), 13.0);
     }
 
     #[test]

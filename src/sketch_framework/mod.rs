@@ -4,8 +4,8 @@
 //! workflows:
 //!
 //! - windowed analytics: [`ExponentialHistogram`], [`TumblingWindow`]
-//! - subpopulation and hierarchical queries: [`Hydra`]
-//! - universal multi-metric monitoring: [`UnivMon`]
+//! - subpopulation queries: [`Hydra`]
+//! - universal multi-metric monitoring: [`UnivMon`] and experimental [`UnivMonQ`]
 //! - batch update acceleration: [`NitroBatch`]
 //! - shared-hash or multi-sketch coordination: [`HashSketchEnsemble`]
 //! - runtime and parallel execution helpers: the `octo` family
@@ -37,13 +37,20 @@ pub mod hydra;
 pub use hydra::Hydra;
 
 pub mod univmon;
-pub use univmon::UnivMon;
+pub use univmon::{UnivMon, UnivMonDeltaFidelity, bottom_layer_for_hash};
+
+pub mod univmon_q;
+pub use univmon_q::{
+    OrderedQueryDiagnostics, UnivMonQ, UnivMonQConfig, UnivMonQError, UnivMonQPoint, UnivMonQQuery,
+};
 
 pub mod univmon_optimized;
 pub use univmon_optimized::{UnivMonPyramid, UnivSketchPool};
 
 pub mod nitro;
-pub use nitro::{NitroBatch, NitroEstimate, NitroTarget};
+pub use nitro::{
+    NitroBatch, NitroEstimate, NitroTarget, nitro_delta_saturated_i32, nitro_delta_saturated_u32,
+};
 
 #[cfg(feature = "experimental")]
 pub mod eh_univ_optimized;
@@ -52,11 +59,21 @@ pub use eh_univ_optimized::{EHMapBucket, EHUnivMonBucket, EHUnivOptimized, EHUni
 
 pub mod octo;
 pub use octo::{
-    CmOctoWorker, CountOctoAggregator, CountOctoWorker, HllOctoAggregator, HllOctoWorker,
-    OctoAggregator, OctoWorker,
+    CmOctoAggregator, CmOctoPlan, CmOctoWorker, CmTopKOctoAggregator, CmTopKOctoPlan,
+    CmTopKOctoWorker, CmWorkerSketch, CocoOctoAggregator, CocoOctoPlan, CocoOctoWorker,
+    CocoWorkerSketch, CountOctoAggregator, CountOctoPlan, CountOctoWorker, CountTopKOctoAggregator,
+    CountTopKOctoPlan, CountTopKOctoWorker, CountWorkerSketch, DEFAULT_OCTO_TOP_K,
+    DdOctoAggregator, DdOctoPlan, DdOctoWorker, DdWorkerSketch, ElasticOctoAggregator,
+    ElasticOctoPlan, ElasticOctoWorker, ElasticWorkerSketch, HllOctoAggregator, HllOctoPlan,
+    HllOctoWorker, KeyedHashes, L2hhWorkerSketch, OctoAggregator, OctoPlan, OctoWorker, RowHashes,
+    UnivMonInput, UnivMonOctoAggregator, UnivMonOctoPlan, UnivMonOctoWorker, flow_key_string,
+    max_hll_threshold, threshold_for_error, univmon_layer_threshold,
 };
 #[cfg(feature = "octo-runtime")]
-pub use octo::{OctoConfig, OctoReadHandle, OctoResult, OctoRuntime, run_octo};
+pub use octo::{
+    OctoAdaptiveThreshold, OctoConfig, OctoPartition, OctoReadHandle, OctoResult, OctoRuntime,
+    run_octo,
+};
 
 pub mod tumbling;
 pub use tumbling::{

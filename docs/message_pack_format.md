@@ -1,123 +1,183 @@
 # Message Pack Format
 
-`src/message_pack_format/` is the Rust-side source of truth for the
-MessagePack encode/decode contract. It is split into two sub-modules
-by audience:
+`src/message_pack_format/` holds the Rust-side serialization plumbing. The
+current, self-describing wire format is **ASAPv1**; its byte-level layout is the
+single source of truth in
+[**`asapv1_wire_format.md`**](./asapv1_wire_format.md) — read that for the
+authoritative spec. This page describes how the code is organized.
 
-- **`portable/`** — cross-language wire format shared with the Go
-  counterpart `sketchlib-go`. Touching anything here is a protocol
-  change and requires the Go side to be kept in lock-step (golden-byte
-  tests catch drift).
-- **`native/`** — thin trait shims over the existing
-  `serialize_to_bytes` / `deserialize_from_bytes` methods on the
-  pure-Rust generic sketch types in [`src/sketches/`](./api/). The byte
-  format is internal to Rust — Go never reads it, and the format is
-  free to evolve without cross-language coordination.
+## The ASAPv1 model
 
-The [`MessagePackCodec`](#core-types) trait and unified `Error` type
-live at the module root so both worlds share the same encode/decode
-contract.
+Every serialized sketch is one self-delimiting envelope:
 
-## Core Types
+```md
+[ magic:6 | version:u8 | kind_id_len:u8 | kind_id:bytes
+          | metadata_len:u32_be | payload_len:u32_be
+          | metadata:msgpack-map | payload:msgpack-array ]
+```
 
-Both live at the top of `src/message_pack_format/` and are re-exported
-through the module root:
+- **Envelope** — the sketch-agnostic frame (magic `b"ASAPv1"`, version,
+  `kind_id`, and the two length prefixes). It answers *is this ours?*, *how do I
+  parse the frame?*, and *what algorithm?* with zero knowledge of any sketch.
+- **Metadata** — a msgpack **map** (self-describing) carrying the hash spec plus
+  the structural params needed to interpret the payload (HLL `precision`;
+  Count-Min `rows`/`cols`/`counter_type`/`mode`). The hash-spec values are
+  **derived from the hasher's [`HashProfile`](../src/common/hash.rs)** trait, so
+  the bytes truthfully describe how the sketch was hashed and custom hash
+  profiles serialize self-describingly. Each sketch has its own fixed metadata
+  schema with `#[serde(deny_unknown_fields)]` (fail-closed on unknown/missing
+  keys). A sketch that never hashes its inputs omits the hash-spec group
+  entirely and carries structural params alone — KLL, DDSketch and
+  UniformSampling, plus the two wrappers `ExponentialHistogram` and
+  `EHSketchList`, whose hash specs live inside the sketch each one carries.
+- **Payload** — a positional msgpack **array** of the raw sketch state only
+  (registers, counter matrix). No field names, and nothing the `kind_id` or
+  metadata already determines.
+- **A nested sketch is inlined, not wrapped in an envelope of its own.** A
+  CMSHeap's base matrix, an Elastic's light Count-Min, a Hydra cell and a
+  UnivMon layer all write their raw state straight into the enclosing positional
+  array. Where the nested algorithm is data rather than a type, the nested block
+  is that variant's own envelope with the framing stripped: the
+  `[kind_id, descriptor, state]` triple `EHSketchList` carries and
+  `ExponentialHistogram` inlines per bucket.
 
-- `MessagePackCodec` (in [`codec.rs`](../src/message_pack_format/codec.rs)) —
-  the trait every codec-enabled type implements. Two methods:
-  `to_msgpack`, `from_msgpack`. This is the canonical encode/decode
-  entry point.
-- `Error` (in [`error.rs`](../src/message_pack_format/error.rs)) — the
-  unified encode/decode error type returned by both `native` and
-  `portable` impls.
+`kind_id` + metadata together fix the payload structure completely. See
+[`asapv1_wire_format.md`](./asapv1_wire_format.md) for the `kind_id` registry,
+the metadata field tables, and the byte-level encoding rules.
 
-## `portable/` — Cross-Language Wire Format
+## Code organization
 
-One submodule per algorithm, with the filenames mirrored on the Go
-side:
+### Shared framing — `envelope.rs`
 
-- `countminsketch.rs`, `countminsketch_topk.rs`, `countsketch.rs`,
-  `ddsketch.rs`, `hll.rs`, `kll.rs`, `hydra_kll.rs`,
-  `set_aggregator.rs`, `delta_set_aggregator.rs`
+`src/message_pack_format/envelope.rs` is the **one shared, sketch-agnostic**
+module every sketch calls into. It owns the magic sentinel, the layout version,
+and the byte framing (`encode` / `split`). It validates only the magic, version,
+and framing — it does **not** know the `kind_id` registry or any sketch. Rule
+"which `kind_id` do I own?" and all metadata validation happen in each sketch's
+decoder.
 
-Each submodule owns:
+### Per-sketch serialization — `<sketch>/wire.rs`
 
-1. The wire-format-aligned runtime type and its delta companion (e.g.
-   `CountMinSketch`, `CountMinSketchDelta`) — these are the types
-   re-exported at the crate root.
-2. The wire DTO struct(s), when the runtime type needs a separate
-   over-the-wire shape (e.g. borrow / owned pairs, byte-compatible
-   field reordering with `sketchlib-go`).
-3. The `MessagePackCodec` impl for the runtime type.
+Serialization lives **with each sketch**, split from the algorithm, under
+`src/sketches/` and `src/sketch_framework/` alike:
 
-The full list of re-exported wire-format-aligned types:
+- `<sketch>.rs` — the **algorithm** (struct, marker types, aliases,
+  insert/estimate/merge). It declares `mod wire;`.
+- `<sketch>/wire.rs` — the **serialization** (metadata/payload DTOs,
+  `kind_id` consts, wire-variant/counter/mode marker traits, and the
+  `serialize_to_bytes` / `deserialize_from_bytes` impls). Because `wire` is a
+  child submodule of the sketch, it reads the struct's **private** fields
+  (`self.registers`, `self.counts`) directly — no field is widened for
+  serialization.
 
-- `countminsketch.rs` — `CountMinSketch`, `CountMinSketchDelta`
-- `countminsketch_topk.rs` — `CountMinSketchWithHeap`, `CmsHeapItem`
-- `countsketch.rs` — `CountSketch`, `CountSketchDelta`
-- `ddsketch.rs` — `DdSketch`, `DdSketchDelta`
-- `hll.rs` — `HllSketch`, `HllSketchDelta`, `HllVariant`
-- `kll.rs` — `KllSketch`, `KllSketchData`
-- `hydra_kll.rs` — `HydraKllSketch`
-- `set_aggregator.rs` — `SetAggregator`
-- `delta_set_aggregator.rs` — `DeltaResult`
+Two encodings are shared by more than one sketch and live in a second module
+beside `wire.rs`, declared `pub(crate)` so the other user can import it by path:
 
-Use these for sketches that must cross a process / language boundary.
-For high-throughput local ingest, custom hashers, and framework
-composition, reach for the generic sketches in
-[`src/sketches/`](./apis.md) instead:
+- `src/sketches/countminsketch_topk/heap_wire.rs` — the top-k heap metadata
+  schema, payload, `key_type` mapping, emitted order and heap rebuild that
+  CMSHeap (`0x03 0x00`) and CSHeap (`0x0a 0x00`) share.
+- `src/sketches/countsketch_topk/l2hh_wire.rs` — CountL2HH (`0x19 0x00`), plus
+  the `[counts, l2]` layer sub-payload the whole UnivMon family inlines.
 
-| Need | Use |
-| --- | --- |
-| Local high-throughput ingest, custom hashers, framework composition | [`src/sketches/`](./apis.md) |
-| Cross-process / cross-language transfer matching `sketchlib-go` bytes | `src/message_pack_format/portable/` |
+Converted:
 
-### Types that act as their own DTO
+- **HLL** (`src/sketches/hll/wire.rs`) — all variants (Classic → `0x01 0x01`,
+  Ertl-MLE → `0x01 0x02`, HIP → `0x01 0x03`) × precisions (P12/P14/P16) ×
+  `H: HashProfile`. HLL is **fully wire-covered**. (HIP is a non-generic struct
+  hashed through the default functions, so it is wire-eligible under the standard
+  profile only.)
+- **Count-Min** (`src/sketches/countminsketch/wire.rs`, kind `0x02 0x00`) —
+  restricted to wire-eligible configs:
+  `CountMin<Vector2D<T>, Mode, H>` where `T` is `i32`, `i64` or `f64`
+  (`CmsWireCounter`), `Mode` is `FastPath` or `RegularPath` (`CmsWireMode`), and
+  `H: HashProfile`. `i32` is carried at its own width rather than widened.
+  `i128` and non-`Vector2D` storage must be converted first. `rows`
+  and `cols` live in the metadata; the payload is just `[counts]`.
+- **Count Sketch** (`src/sketches/countsketch/wire.rs`, kind `0x04 0x00`) — the
+  same shape as Count-Min: `Count<Vector2D<T>, Mode, H>` where `T` is `i32` or
+  `i64` (`CsWireCounter`), `Mode` is `FastPath` or `RegularPath` (`CsWireMode`),
+  and `H: HashProfile`. Counters must be signed and negatable, so there is no
+  `f64` counterpart; `i128` and non-`Vector2D` storage must be converted first.
+  `i32` is carried at its own width rather than widened, so a nested
+  `Vector2D<i32>` sketch decodes back into its own type. `rows`, `cols`,
+  `counter_type` and `mode` live in the metadata; the payload is just
+  `[counts]`, with signed cells.
+- **KLL** (`src/sketches/kll/wire.rs` compact → `0x06 0x00`,
+  `src/sketches/kll_dynamic/wire.rs` dynamic → `0x06 0x01`) — both variants share
+  one payload `[levels, items, coin]` and differ only by `kind_id`. KLL never
+  hashes, so its metadata carries no hash-spec group.
+- **Bloom** (`src/sketches/bloom/wire.rs`, kind `0x17 0x00`) — the payload is the
+  bit grid packed into `u64`s plus the insert count; the wire covers the
+  geometries `Bloom::with_capacity` produces.
+- **Space-Saving** (`src/sketches/space_saving/wire.rs`, kind `0x18 0x00`) — the
+  payload is the `(key, count, error)` triples plus `total` and `discarded_max`; the
+  Stream-Summary's links and arenas are rebuilt on decode.
+- **CMSHeap** (`src/sketches/countminsketch_topk/wire.rs`, `0x03 0x00`) and
+  **CSHeap** (`src/sketches/countsketch_topk/wire.rs`, `0x0a 0x00`) — a base
+  matrix inlined ahead of the shared top-k heap entries.
+- **DDSketch** (`src/sketches/ddsketch/wire.rs`, `0x05 0x00`) — the bucket store
+  verbatim plus `offset`, `sum`, `min` and `max`; no hash-spec group.
+- **Elastic** (`src/sketches/elastic/wire.rs`, `0x0b 0x00`) — the heavy table's
+  four parallel arrays, the `stale_copies` flag, and the inlined light Count-Min.
+- **Coco** (`src/sketches/coco/wire.rs`, `0x0c 0x00`) — the dense bucket table as
+  parallel nullable-key and mass arrays.
+- **UniformSampling** (`src/sketches/uniform/wire.rs`, `0x0d 0x00`) — the
+  priority-ordered sample pairs plus `total_seen` and the SplitMix64 state; no
+  hash-spec group.
+- **KMV** (`src/sketches/kmv/wire.rs`, `0x0e 0x00`) — the retained digests,
+  strictly ascending.
+- **CountL2HH** (`src/sketches/countsketch_topk/l2hh_wire.rs`, `0x19 0x00`) —
+  `[counts, l2]`.
+- **Hydra** (`src/sketch_framework/hydra/wire.rs`, `0x07 0x00`-`0x07 0x04`) — one
+  `kind_id` per counter variant; the cells' state tiles or nests one array.
+- **UnivMon** (`src/sketch_framework/univmon/wire.rs`, `0x10 0x00`) and
+  **UnivMon Optimized** (`src/sketch_framework/univmon_optimized/wire.rs`,
+  `0x11 0x00`) — one payload shape, two metadata schemas.
+- **UnivMon-Q** (`src/sketch_framework/univmon_q/wire.rs`, `0x1a 0x00`) — the
+  levels' counters, candidates, extrema and coordinated occurrence sample.
+- **ExponentialHistogram** (`src/sketch_framework/eh/wire.rs`, `0x13 0x00`) and
+  **EHSketchList** (`src/sketch_framework/eh_sketch_list/wire.rs`, `0x14 0x00`) —
+  one `[kind_id, descriptor, state]` triple, standalone and per bucket.
 
-`CountSketch`, `DdSketch`, and `HllSketch` derive `Serialize` /
-`Deserialize` directly because their public field layout already
-matches the wire shape. Their `MessagePackCodec` impls serialize the
-struct verbatim — no separate DTO is required.
+NitroBatch, FoldCMS, FoldCS, HashSketchEnsemble, EHUnivOptimized and OctoSketch
+have **no `wire.rs`**; their `kind_id`s are reserved with payload TBD.
 
-### Protocol invariants
+## `portable/` and `native/` are being retired
 
-- The wire envelope must remain byte-compatible with `sketchlib-go`.
-- Adding, reordering, renaming, or retyping a field counts as a
-  protocol change; bump the format version on both sides and add a
-  golden-byte test before shipping.
-- DTOs that appear as nested fields in another wire type (e.g.
-  `KllSketchData` inside `HydraKllSketchWire`) are part of the same
-  protocol surface — treat them with the same care.
+The `portable/` and `native/` sub-modules (and the `MessagePackCodec` trait /
+unified `Error` at the module root) are the **older** serialization path and are
+being **phased out** in favor of the per-sketch `wire.rs` + the shared
+`envelope.rs`.
 
-## `native/` — Rust-Internal Codec Shims
+- `portable/` holds per-sketch wire types that predate the envelope. They
+  carry their own byte-parity goldens against `sketchlib-go` — HLL, Count-Min,
+  Count Sketch and KLL (both directions) — separate from `asapv1_golden/`.
+- `native/` is a set of thin `MessagePackCodec` shims over the sketches'
+  `serialize_to_bytes` / `deserialize_from_bytes`. Every type it wraps emits the
+  ASAPv1 envelope, so each shim is a pass-through.
 
-One submodule per generic sketch type in [`src/sketches/`](./api/)
-whose serialization is exposed through `MessagePackCodec`:
+Sequencing note (from the spec): `portable` is not deleted until the golden
+byte-vector fixtures are the drift guard on both sides.
 
-- `countminsketch.rs`, `countsketch.rs`, `countsketch_topk.rs`,
-  `ddsketch.rs`, `hll.rs`, `kll.rs`, `kll_dynamic.rs`
-- `kmv.rs` (gated behind the `experimental` feature flag)
+## Cross-language parity
 
-Each impl forwards `to_msgpack` / `from_msgpack` to the sketch's
-existing `serialize_to_bytes` / `deserialize_from_bytes` methods. The
-byte format is **not** part of the cross-language protocol — it is an
-internal Rust serialization that can evolve freely.
+ASAPv1 parity with `sketchlib-go` is proven by **golden byte-vectors** in
+[`asapv1_golden/`](../asapv1_golden) (exercised by
+[`tests/asapv1_golden.rs`](../tests/asapv1_golden.rs)): both languages must
+decode → re-encode them byte-identically. The `kind_id` registry is mirrored
+verbatim with Go's `wire/asapmsgpack/magic_ids.go`, never independently
+allocated.
 
-Use the native codecs when you want a single unified trait-based
-encode/decode entry point for the generic in-process sketch types,
-without going through a wire-format-aligned wrapper.
-
-## Choosing Between `portable` and `native`
-
-| Need | Use |
-|------|-----|
-| Send a sketch to Go (`sketchlib-go`) or any non-Rust consumer | `portable` (the wire-format-aligned types re-exported at the crate root) |
-| Persist or transport a sketch within an all-Rust pipeline | `native` (works directly on the generic [`sketches`](./api/) types) |
-| New sketch crossing the wire | Add a `portable/<name>.rs`, mirror the filename in `sketchlib-go`, and add a golden-byte test |
-| New internal-only sketch serialization | Add a `native/<name>.rs` shim and you are done |
+That proof covers the six `kind_id`s a fixture exists for — HLL's three
+estimators, Count-Min, Count Sketch and compact KLL. Every other implemented
+kind has **no ASAPv1 golden and therefore no ASAPv1 drift guard**;
+[`asapv1_golden/README.md`](../asapv1_golden/README.md) lists what is covered.
+The older `portable` path is guarded separately, by the `sketchlib-go` goldens
+of its own listed above.
 
 ## Cross-Reference
 
-- Generated rustdoc for the trait and per-algorithm wire DTOs is the
-  most up-to-date reference; build it with
-  `cargo doc --no-deps --all-features --open`.
+- [`asapv1_wire_format.md`](./asapv1_wire_format.md) — the authoritative
+  byte-level spec (envelope, metadata schema, per-sketch payloads, encoding
+  rules, wire coverage).
+- Generated rustdoc: `cargo doc --no-deps --all-features --open`.

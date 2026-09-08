@@ -7,9 +7,16 @@
 
 use crate::UnivMon;
 use crate::common::heap::HHHeap;
-use crate::common::{BOTTOM_LAYER_FINDER, DataInput, hash_item64_seeded, hash64_seeded};
+use crate::common::{
+    BOTTOM_LAYER_FINDER, DataInput, HeapItem, hash_item64_seeded, hash64_seeded,
+    heap_item_to_sketch_input,
+};
 use crate::common::{L2HH, Vector1D};
+use crate::sketch_framework::univmon::{MAX_LAYER_SIZE, UnivMonUpdateMode};
 use crate::sketches::countsketch_topk::CountL2HH;
+use std::collections::{HashMap, HashSet};
+
+mod wire;
 
 /// Object pool for `UnivMon` sketches.
 ///
@@ -124,6 +131,8 @@ pub struct UnivMonPyramid {
     pub heap_size: usize,
     /// Bucket size used for hashing decisions.
     pub bucket_size: usize,
+    update_mode: UnivMonUpdateMode,
+    candidate_complete: Vec<bool>,
 }
 
 impl UnivMonPyramid {
@@ -137,6 +146,20 @@ impl UnivMonPyramid {
         mouse_col: usize,
         total_layers: usize,
     ) -> Self {
+        assert!(heap_size > 0, "heap size must be positive");
+        assert!(
+            elephant_row > 0 && mouse_row > 0,
+            "sketch row counts must be positive"
+        );
+        assert!(
+            elephant_col > 0 && mouse_col > 0,
+            "sketch column counts must be positive"
+        );
+        assert!(total_layers > 0, "layer count must be positive");
+        assert!(
+            total_layers <= MAX_LAYER_SIZE,
+            "layer count must be at most MAX_LAYER_SIZE {MAX_LAYER_SIZE}"
+        );
         let sk_vec: Vec<L2HH> = if total_layers <= elephant_layers {
             (0..total_layers)
                 .map(|i| {
@@ -175,7 +198,23 @@ impl UnivMonPyramid {
             mouse_col,
             heap_size,
             bucket_size: 0,
+            update_mode: UnivMonUpdateMode::Unset,
+            candidate_complete: vec![true; total_layers],
         }
+    }
+
+    #[inline]
+    fn begin_update(&mut self, value: i64, mode: UnivMonUpdateMode) {
+        assert!(value >= 0, "UnivMon only supports non-negative updates");
+        match self.update_mode {
+            UnivMonUpdateMode::Unset => self.update_mode = mode,
+            current if current == mode => {}
+            _ => panic!("cannot mix standard and terminal-only updates in one UnivMon"),
+        }
+        self.bucket_size = self
+            .bucket_size
+            .checked_add(value as usize)
+            .expect("UnivMon total weight overflowed usize");
     }
 
     /// Creates a pyramid using built-in default dimensions.
@@ -203,56 +242,28 @@ impl UnivMonPyramid {
 
     /// Standard insert: updates sketch + heap at every layer 0..=bottom.
     pub fn insert(&mut self, key: &DataInput, value: i64) {
-        self.bucket_size += value as usize;
+        self.begin_update(value, UnivMonUpdateMode::Standard);
         let h = hash64_seeded(BOTTOM_LAYER_FINDER, key);
         let bottom = self.find_bottom_layer_num(h);
         for i in 0..=bottom {
-            let count = if i == 0 {
-                self.l2_sketch_layers[i].update_and_est(key, value)
-            } else {
-                self.l2_sketch_layers[i].update_and_est_without_l2(key, value)
-            };
-            self.hh_layers[i].update(key, count as i64);
+            let count = self.l2_sketch_layers[i].update_and_est(key, value);
+            if !self.hh_layers[i].update(key, count as i64) {
+                self.candidate_complete[i] = false;
+            }
         }
     }
 
-    /// Optimized insert: only updates the count sketch at the bottom layer
-    /// and layer 0, skipping all intermediate sketch updates.
+    /// Joltik-style insert: updates only the terminal CountSketch and heap.
     ///
-    /// The bottom layer's count estimate is reused for all intermediate heap
-    /// updates (layers 1..=bottom), saving `bottom - 1` sketch updates per
-    /// item while keeping heavy-hitter heaps fully up to date.
-    ///
-    /// Mirrors the Go PromSketch `update_optimized` function with explicit
-    /// elephant / mouse branching.
+    /// Logical upper-layer candidate sets are reconstructed at query time.
+    /// Do not mix this method with [`Self::insert`] on the same sketch.
     pub fn fast_insert(&mut self, key: &DataInput, value: i64) {
-        self.bucket_size += value as usize;
+        self.begin_update(value, UnivMonUpdateMode::Terminal);
         let h = hash64_seeded(BOTTOM_LAYER_FINDER, key);
         let bottom = self.find_bottom_layer_num(h);
-
-        if bottom < self.elephant_layers {
-            // All touched layers are elephant layers.
-            if bottom > 0 {
-                let count = self.l2_sketch_layers[bottom].update_and_est_without_l2(key, value);
-                // Reuse bottom-layer estimate for upper-layer heaps.
-                for l in (1..=bottom).rev() {
-                    self.hh_layers[l].update(key, count as i64);
-                }
-                let count0 = self.l2_sketch_layers[0].update_and_est(key, value);
-                self.hh_layers[0].update(key, count0 as i64);
-            } else {
-                let count0 = self.l2_sketch_layers[0].update_and_est(key, value);
-                self.hh_layers[0].update(key, count0 as i64);
-            }
-        } else {
-            // Bottom layer is a mouse layer (smaller sketch dimensions).
-            let count = self.l2_sketch_layers[bottom].update_and_est_without_l2(key, value);
-            for l in (1..=bottom).rev() {
-                self.hh_layers[l].update(key, count as i64);
-            }
-            // Layer 0 is always an elephant layer.
-            let count0 = self.l2_sketch_layers[0].update_and_est(key, value);
-            self.hh_layers[0].update(key, count0 as i64);
+        let count = self.l2_sketch_layers[bottom].update_and_est(key, value);
+        if !self.hh_layers[bottom].update(key, count as i64) {
+            self.candidate_complete[bottom] = false;
         }
     }
 
@@ -263,15 +274,28 @@ impl UnivMonPyramid {
     where
         F: Fn(f64) -> f64,
     {
+        if self.bucket_size == 0 {
+            return 0.0;
+        }
+        if self.update_mode == UnivMonUpdateMode::Terminal {
+            return self.calc_terminal_g_sum(g);
+        }
+
         let mut y = vec![0.0; self.layer_size];
 
         let l2_top = self.l2_sketch_layers[self.layer_size - 1].get_l2();
-        let threshold_top = if is_card { (l2_top * 0.01) as i64 } else { 0 };
+        let threshold_top = if is_card {
+            self.heavy_threshold(l2_top, self.candidate_complete[self.layer_size - 1])
+        } else {
+            0
+        };
 
         let mut tmp = 0.0;
         for item in self.hh_layers[self.layer_size - 1].heap() {
-            if item.count > threshold_top {
-                tmp += g(item.count as f64);
+            let input = heap_item_to_sketch_input(&item.key);
+            let count = self.l2_sketch_layers[self.layer_size - 1].estimate(&input) as i64;
+            if count > threshold_top {
+                tmp += g(count as f64);
             }
         }
         y[self.layer_size - 1] = tmp;
@@ -279,13 +303,19 @@ impl UnivMonPyramid {
         for i in (0..(self.layer_size - 1)).rev() {
             tmp = 0.0;
             let l2_val = self.l2_sketch_layers[i].get_l2();
-            let threshold = if is_card { (l2_val * 0.01) as i64 } else { 0 };
+            let threshold = if is_card {
+                self.heavy_threshold(l2_val, self.candidate_complete[i])
+            } else {
+                0
+            };
 
             for item in self.hh_layers[i].heap() {
-                if item.count > threshold {
+                let input = heap_item_to_sketch_input(&item.key);
+                let count = self.l2_sketch_layers[i].estimate(&input) as i64;
+                if count > threshold {
                     let hash = (hash_item64_seeded(BOTTOM_LAYER_FINDER, &item.key) >> (i + 1)) & 1;
                     let coe = 1.0 - 2.0 * (hash as f64);
-                    tmp += coe * g(item.count as f64);
+                    tmp += coe * g(count as f64);
                 }
             }
             y[i] = 2.0 * y[i + 1] + tmp;
@@ -293,9 +323,88 @@ impl UnivMonPyramid {
         y[0]
     }
 
-    /// Returns the estimated L1 norm.
+    fn calc_terminal_g_sum<F>(&self, g: F) -> f64
+    where
+        F: Fn(f64) -> f64,
+    {
+        let (candidates, complete) = self.logical_terminal_candidates();
+        let mut logical_l2 = vec![0.0; self.layer_size];
+        let mut suffix_l2_squared = 0.0;
+        for level in (0..self.layer_size).rev() {
+            let terminal_l2 = self.l2_sketch_layers[level].get_l2();
+            suffix_l2_squared += terminal_l2 * terminal_l2;
+            logical_l2[level] = suffix_l2_squared.sqrt();
+        }
+
+        let mut y = vec![0.0; self.layer_size];
+        let last = self.layer_size - 1;
+        let threshold = self.heavy_threshold(logical_l2[last], complete[last]);
+        y[last] = candidates[last]
+            .iter()
+            .filter(|(_, count)| *count > threshold)
+            .map(|(_, count)| g(*count as f64))
+            .sum();
+
+        for level in (0..last).rev() {
+            let threshold = self.heavy_threshold(logical_l2[level], complete[level]);
+            let correction = candidates[level]
+                .iter()
+                .filter(|(_, count)| *count > threshold)
+                .map(|(key, count)| {
+                    let hash = (hash_item64_seeded(BOTTOM_LAYER_FINDER, key) >> (level + 1)) & 1;
+                    (1.0 - 2.0 * hash as f64) * g(*count as f64)
+                })
+                .sum::<f64>();
+            y[level] = 2.0 * y[level + 1] + correction;
+        }
+        y[0]
+    }
+
+    fn logical_terminal_candidates(&self) -> (Vec<Vec<(HeapItem, i64)>>, Vec<bool>) {
+        let mut logical = vec![Vec::new(); self.layer_size];
+        let mut complete = vec![false; self.layer_size];
+        let mut cumulative = HashMap::<HeapItem, i64>::with_capacity(self.heap_size * 2);
+        let mut suffix_complete = true;
+        for level in (0..self.layer_size).rev() {
+            suffix_complete &= self.candidate_complete[level];
+            for item in self.hh_layers[level].heap() {
+                let input = heap_item_to_sketch_input(&item.key);
+                let count = self.l2_sketch_layers[level].estimate(&input) as i64;
+                cumulative
+                    .entry(item.key.clone())
+                    .and_modify(|old| *old = (*old).max(count))
+                    .or_insert(count);
+            }
+            let mut retained: Vec<_> = cumulative
+                .iter()
+                .map(|(key, count)| (key.clone(), *count))
+                .collect();
+            retained.sort_unstable_by(|left, right| {
+                right.1.cmp(&left.1).then_with(|| {
+                    hash_item64_seeded(BOTTOM_LAYER_FINDER, &left.0)
+                        .cmp(&hash_item64_seeded(BOTTOM_LAYER_FINDER, &right.0))
+                })
+            });
+            complete[level] = suffix_complete && retained.len() <= self.heap_size;
+            retained.truncate(self.heap_size);
+            cumulative = retained.iter().cloned().collect();
+            logical[level] = retained;
+        }
+        (logical, complete)
+    }
+
+    #[inline]
+    fn heavy_threshold(&self, l2: f64, complete: bool) -> i64 {
+        if complete {
+            0
+        } else {
+            (l2 / (self.heap_size as f64).sqrt()) as i64
+        }
+    }
+
+    /// Returns the exact L1 norm for the supported non-negative update stream.
     pub fn calc_l1(&self) -> f64 {
-        self.calc_g_sum(|x| x, false)
+        self.bucket_size as f64
     }
 
     /// Returns the estimated L2 norm.
@@ -305,6 +414,9 @@ impl UnivMonPyramid {
 
     /// Returns the estimated entropy.
     pub fn calc_entropy(&self) -> f64 {
+        if self.bucket_size == 0 {
+            return 0.0;
+        }
         let tmp = self.calc_g_sum(|x| if x > 0.0 { x * x.log2() } else { 0.0 }, false);
         (self.bucket_size as f64).log2() - tmp / (self.bucket_size as f64)
     }
@@ -319,28 +431,69 @@ impl UnivMonPyramid {
     /// Resets all counters and heaps without deallocating.
     pub fn free(&mut self) {
         self.bucket_size = 0;
+        self.update_mode = UnivMonUpdateMode::Unset;
+        self.candidate_complete.fill(true);
         for i in 0..self.layer_size {
             self.l2_sketch_layers[i].clear();
             self.hh_layers[i].clear();
         }
     }
 
-    /// Merges another pyramid's data into this one (element-wise).
+    /// Merges another compatible pyramid and rebuilds its candidate heaps.
     pub fn merge(&mut self, other: &UnivMonPyramid) {
         assert_eq!(
             self.layer_size, other.layer_size,
             "layer size must match for merge"
         );
+        assert_eq!(
+            (
+                self.elephant_layers,
+                self.elephant_row,
+                self.elephant_col,
+                self.mouse_row,
+                self.mouse_col,
+                self.heap_size,
+            ),
+            (
+                other.elephant_layers,
+                other.elephant_row,
+                other.elephant_col,
+                other.mouse_row,
+                other.mouse_col,
+                other.heap_size,
+            ),
+            "UnivMon pyramid layouts must match for merge"
+        );
+        match (self.update_mode, other.update_mode) {
+            (UnivMonUpdateMode::Unset, mode) => self.update_mode = mode,
+            (_, UnivMonUpdateMode::Unset) => {}
+            (left, right) => assert_eq!(
+                left, right,
+                "cannot merge standard and terminal-only UnivMon states"
+            ),
+        }
+        self.bucket_size = self
+            .bucket_size
+            .checked_add(other.bucket_size)
+            .expect("merged UnivMon total weight overflowed usize");
         for i in 0..self.layer_size {
+            let sources_complete = self.candidate_complete[i] && other.candidate_complete[i];
+            let candidate_keys: HashSet<HeapItem> = self.hh_layers[i]
+                .heap()
+                .iter()
+                .chain(other.hh_layers[i].heap())
+                .map(|item| item.key.clone())
+                .collect();
+            let merged_candidates_complete =
+                sources_complete && candidate_keys.len() <= self.heap_size;
             self.l2_sketch_layers[i].merge(&other.l2_sketch_layers[i]);
-            for item in other.hh_layers[i].heap() {
-                let count = if let Some(index) = self.hh_layers[i].find_heap_item(&item.key) {
-                    self.hh_layers[i].heap()[index].count + item.count
-                } else {
-                    item.count
-                };
-                self.hh_layers[i].update_heap_item(&item.key, count);
+            self.hh_layers[i].clear();
+            for key in candidate_keys {
+                let input = heap_item_to_sketch_input(&key);
+                let count = self.l2_sketch_layers[i].estimate(&input) as i64;
+                self.hh_layers[i].update(&input, count);
             }
+            self.candidate_complete[i] = merged_candidates_complete;
         }
     }
 
@@ -428,8 +581,10 @@ mod tests {
     #[test]
     fn pyramid_fast_insert_matches_standard() {
         // Both insert paths should produce identical sketches.
-        let mut standard = UnivMonPyramid::new(32, 8, 3, 2048, 3, 512, 16);
-        let mut fast = UnivMonPyramid::new(32, 8, 3, 2048, 3, 512, 16);
+        // Retain the complete 100-key support so this tests construction
+        // equivalence rather than independent candidate-sampling variance.
+        let mut standard = UnivMonPyramid::new(128, 8, 3, 2048, 3, 512, 16);
+        let mut fast = UnivMonPyramid::new(128, 8, 3, 2048, 3, 512, 16);
 
         for i in 0..500i64 {
             let key = DataInput::I64(i % 100);
@@ -439,8 +594,8 @@ mod tests {
 
         assert_eq!(standard.bucket_size, fast.bucket_size);
 
-        // L1 and cardinality should be very close (heap contents may differ
-        // slightly because fast_insert reuses one estimate for all heaps).
+        // Standard cumulative layers and Joltik terminal strata must yield
+        // the same logical estimates when all candidates are retained.
         let l1_diff = (standard.calc_l1() - fast.calc_l1()).abs();
         let card_diff = (standard.calc_card() - fast.calc_card()).abs();
         assert!(
@@ -483,30 +638,41 @@ mod tests {
 
     #[test]
     fn pyramid_merge_combines_data() {
-        let mut left = UnivMonPyramid::with_defaults();
-        let mut right = UnivMonPyramid::with_defaults();
+        let mut one_pass = UnivMonPyramid::new(128, 8, 3, 2048, 3, 512, 16);
+        let mut left = UnivMonPyramid::new(128, 8, 3, 2048, 3, 512, 16);
+        let mut right = UnivMonPyramid::new(128, 8, 3, 2048, 3, 512, 16);
 
         for i in 0..50i64 {
             left.insert(&DataInput::I64(i), 10);
+            one_pass.insert(&DataInput::I64(i), 10);
         }
         for i in 50..100i64 {
             right.insert(&DataInput::I64(i), 10);
+            one_pass.insert(&DataInput::I64(i), 10);
         }
 
-        let left_l1 = left.calc_l1();
-        let right_l1 = right.calc_l1();
         left.merge(&right);
 
-        let merged_l1 = left.calc_l1();
-        let expected = left_l1 + right_l1;
-        let err = (merged_l1 - expected).abs() / expected;
+        assert_eq!(left.bucket_size, 1000);
+        assert!(left.calc_entropy().is_finite());
+        for level in 0..left.layer_size {
+            let L2HH::COUNT(merged_count) = &left.l2_sketch_layers[level];
+            let L2HH::COUNT(one_pass_count) = &one_pass.l2_sketch_layers[level];
+            assert_eq!(
+                merged_count.as_storage().as_slice(),
+                one_pass_count.as_storage().as_slice(),
+                "counter mismatch at level {level}"
+            );
+        }
         assert!(
-            err < 0.10,
-            "Merged L1 error {:.2}%: got {}, expected {}",
-            err * 100.0,
-            merged_l1,
-            expected
+            (left.calc_l1() - one_pass.calc_l1()).abs() < 1e-9,
+            "merged L1={}, one-pass L1={}",
+            left.calc_l1(),
+            one_pass.calc_l1()
         );
+        assert!((left.calc_l2() - one_pass.calc_l2()).abs() < 1e-9);
+        assert!((left.calc_card() - one_pass.calc_card()).abs() < 1e-9);
+        assert!((left.calc_entropy() - one_pass.calc_entropy()).abs() < 1e-9);
     }
 
     fn ground_truth(freq: &std::collections::HashMap<i64, i64>) -> (f64, f64, f64, f64) {

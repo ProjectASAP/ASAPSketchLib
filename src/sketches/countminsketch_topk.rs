@@ -10,6 +10,9 @@ use crate::{
     SketchHasher, Vector2D, heap_item_to_sketch_input,
 };
 
+pub(crate) mod heap_wire;
+mod wire;
+
 const DEFAULT_TOP_K: usize = 32;
 
 /// A Count-Min Sketch paired with a top-k heavy-hitter heap.

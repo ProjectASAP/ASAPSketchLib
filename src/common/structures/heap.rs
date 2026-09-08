@@ -54,11 +54,22 @@ pub struct CommonHeap<T, O: CommonHeapOrder<T>> {
     order: O,
 }
 
+/// Slots reserved up front. A heap whose capacity is larger grows on demand.
+pub(crate) const PREALLOCATED_SLOTS: usize = 1024;
+
 impl<T, O: CommonHeapOrder<T>> CommonHeap<T, O> {
     /// Creates a new heap with the specified capacity and ordering.
     pub fn with_capacity(capacity: usize, order: O) -> Self {
+        Self::with_expected_len(capacity, capacity, order)
+    }
+
+    /// Creates a heap of `capacity` that reserves for `expected_len` elements
+    /// rather than for the capacity, so a caller that already knows how many
+    /// elements it is about to push does not reserve for a capacity it will not
+    /// fill. `capacity` still fixes [`Self::capacity`] and [`Self::is_full`].
+    pub fn with_expected_len(capacity: usize, expected_len: usize, order: O) -> Self {
         Self {
-            data: Vec::with_capacity(capacity),
+            data: Vec::with_capacity(expected_len.min(capacity).min(PREALLOCATED_SLOTS)),
             size: capacity,
             order,
         }
@@ -110,13 +121,34 @@ impl<T, O: CommonHeapOrder<T>> CommonHeap<T, O> {
     /// If the heap is at capacity, the root element is replaced if appropriate.
     pub fn push(&mut self, value: T) {
         if self.data.len() < self.size {
-            self.data.push(value);
-            self.bubble_up(self.data.len() - 1);
+            self.push_back_with(value, &mut |_, _| {});
         } else if !self.data.is_empty() && self.order.should_replace_root(&self.data[0], &value) {
-            // For bounded heap: replace root if new value should replace it
-            self.data[0] = value;
-            self.bubble_down(0);
+            self.replace_root_with(value, &mut |_, _| {});
         }
+    }
+
+    /// Appends `value` and sifts it up, reporting every index swap.
+    ///
+    /// `on_swap(i, j)` fires for each swap the sift performs, so a caller
+    /// holding an index beside the heap can patch it instead of rebuilding.
+    /// The value is appended at `len()` before any swap fires.
+    ///
+    /// The caller is responsible for the capacity check; this appends
+    /// unconditionally.
+    pub fn push_back_with(&mut self, value: T, on_swap: &mut impl FnMut(usize, usize)) {
+        self.data.push(value);
+        self.bubble_up_with(self.data.len() - 1, on_swap);
+    }
+
+    /// Replaces the root with `value`, sifts it down, and returns the
+    /// displaced root. Swaps are reported as in [`Self::push_back_with`], and
+    /// the write to index 0 happens before any swap fires.
+    ///
+    /// Panics if the heap is empty.
+    pub fn replace_root_with(&mut self, value: T, on_swap: &mut impl FnMut(usize, usize)) -> T {
+        let displaced = std::mem::replace(&mut self.data[0], value);
+        self.bubble_down_with(0, on_swap);
+        displaced
     }
 
     /// Removes and returns the root element (min or max depending on order).
@@ -132,19 +164,26 @@ impl<T, O: CommonHeapOrder<T>> CommonHeap<T, O> {
         Some(root)
     }
 
-    /// Updates an element at the given index and maintains heap property.
-    /// Returns true if the element was moved.
+    /// Re-sifts the element at the given index to restore the heap property.
+    /// Returns false if `index` is out of range, true otherwise.
     #[inline]
     pub fn update_at(&mut self, index: usize) -> bool {
+        self.update_at_with(index, &mut |_, _| {})
+    }
+
+    /// Re-sifts the element at `index`, reporting every index swap as in
+    /// [`Self::push_back_with`].
+    ///
+    /// Returns false if `index` is out of range, true otherwise.
+    #[inline]
+    pub fn update_at_with(&mut self, index: usize, on_swap: &mut impl FnMut(usize, usize)) -> bool {
         if index >= self.data.len() {
             return false;
         }
-        if !self.bubble_down(index) {
-            self.bubble_up(index);
-            true
-        } else {
-            true
+        if !self.bubble_down_with(index, on_swap) {
+            self.bubble_up_with(index, on_swap);
         }
+        true
     }
 
     /// Provides immutable access to the underlying data slice.
@@ -186,7 +225,11 @@ impl<T, O: CommonHeapOrder<T>> CommonHeap<T, O> {
 
     /// Bubbles an element down to maintain heap property.
     /// Returns true if the element was moved.
-    fn bubble_down(&mut self, mut idx: usize) -> bool {
+    fn bubble_down(&mut self, idx: usize) -> bool {
+        self.bubble_down_with(idx, &mut |_, _| {})
+    }
+
+    fn bubble_down_with(&mut self, mut idx: usize, on_swap: &mut impl FnMut(usize, usize)) -> bool {
         let start_idx = idx;
         let len = self.data.len();
 
@@ -212,6 +255,7 @@ impl<T, O: CommonHeapOrder<T>> CommonHeap<T, O> {
             }
 
             self.data.swap(idx, target);
+            on_swap(idx, target);
             idx = target;
         }
 
@@ -219,7 +263,7 @@ impl<T, O: CommonHeapOrder<T>> CommonHeap<T, O> {
     }
 
     /// Bubbles an element up to maintain heap property.
-    fn bubble_up(&mut self, mut idx: usize) {
+    fn bubble_up_with(&mut self, mut idx: usize, on_swap: &mut impl FnMut(usize, usize)) {
         while idx > 0 {
             let parent_idx = Self::parent(idx);
             if self
@@ -227,6 +271,7 @@ impl<T, O: CommonHeapOrder<T>> CommonHeap<T, O> {
                 .should_swap(&self.data[parent_idx], &self.data[idx])
             {
                 self.data.swap(parent_idx, idx);
+                on_swap(parent_idx, idx);
                 idx = parent_idx;
             } else {
                 break;

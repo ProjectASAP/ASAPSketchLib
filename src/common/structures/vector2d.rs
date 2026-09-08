@@ -36,12 +36,8 @@ where
         D: serde::Deserializer<'de>,
     {
         let input = Vector2DDeserialize::deserialize(deserializer)?;
-        let mask_bits = if input.cols.is_power_of_two() {
-            input.cols.ilog2()
-        } else {
-            input.cols.ilog2() + 1
-        };
-        let mask = (1u128 << mask_bits) - 1;
+        let mask_bits = super::matrix_storage::cols_mask_bits(input.cols);
+        let mask = super::matrix_storage::cols_mask(input.cols);
         Ok(Self {
             data: input.data,
             rows: input.rows,
@@ -58,12 +54,8 @@ impl<T> Vector2D<T> {
     /// The underlying storage is left uninitialized until `fill` or similar methods are called,
     /// allowing callers to decide when and how counters are populated.
     pub fn init(rows: usize, cols: usize) -> Self {
-        let mask_bits = if cols.is_power_of_two() {
-            cols.ilog2()
-        } else {
-            cols.ilog2() + 1
-        };
-        let mask = (1u128 << mask_bits) - 1;
+        let mask_bits = super::matrix_storage::cols_mask_bits(cols);
+        let mask = super::matrix_storage::cols_mask(cols);
         Self {
             data: Vec::with_capacity(rows * cols),
             rows,
@@ -81,12 +73,8 @@ impl<T> Vector2D<T> {
     where
         F: FnMut(usize, usize) -> T,
     {
-        let mask_bits = if cols.is_power_of_two() {
-            cols.ilog2()
-        } else {
-            cols.ilog2() + 1
-        };
-        let mask = (1u128 << mask_bits) - 1;
+        let mask_bits = super::matrix_storage::cols_mask_bits(cols);
+        let mask = super::matrix_storage::cols_mask(cols);
         let mut data = Vec::with_capacity(rows * cols);
         for r in 0..rows {
             for c in 0..cols {
@@ -106,6 +94,16 @@ impl<T> Vector2D<T> {
     /// Enables Nitro sampling with the provided rate.
     pub fn enable_nitro(&mut self, sampling_rate: f64) {
         self.nitro = Nitro::init_nitro(sampling_rate);
+    }
+
+    /// Enables Nitro sampling with a reproducible, seed-selected schedule.
+    ///
+    /// [`Self::enable_nitro`] always starts the skip cursor at entry 0, so
+    /// every sketch at a given rate admits the same subset. Seeding it is what
+    /// lets an accuracy battery run over genuinely independent trials while
+    /// still reproducing exactly. See [`Nitro::init_nitro_seeded`].
+    pub fn enable_nitro_with_seed(&mut self, sampling_rate: f64, seed: u64) {
+        self.nitro = Nitro::init_nitro_seeded(sampling_rate, seed);
     }
 
     /// Disables Nitro sampling and resets the internal state.
@@ -149,7 +147,11 @@ impl<T> Vector2D<T> {
 
     #[inline(always)]
     fn col_for_row<Hash: MatrixFastHash>(&self, hashed_val: &Hash, row: usize) -> usize {
-        hashed_val.col_for_row(row, self.cols)
+        // Decode with the (mask_bits, mask) pair cached at construction —
+        // identical result to recomputing them from `self.cols`, without the
+        // per-row ilog2/shift. `fold_to_col` owns the pow2-skip invariant.
+        let raw = hashed_val.row_hash(row, self.mask_bits, self.mask);
+        super::matrix_storage::fold_to_col(raw, self.cols)
     }
 
     /// Returns the number of rows.
@@ -232,11 +234,7 @@ impl<T> Vector2D<T> {
     #[inline(always)]
     /// Returns the bit width needed to represent a column index.
     pub fn get_mask_bits(&self) -> u32 {
-        if self.cols.is_power_of_two() {
-            self.cols.ilog2()
-        } else {
-            self.cols.ilog2() + 1
-        }
+        super::matrix_storage::cols_mask_bits(self.cols)
     }
 
     /// get the number of bits required for hashed value
@@ -796,5 +794,56 @@ mod tests {
 
         let larger_shape: Vector2D<u64> = Vector2D::init(5, 1_048_576);
         assert_eq!(larger_shape.get_required_bits(), 128);
+    }
+
+    /// End-to-end coverage of `Vector2D::col_for_row` — the cached-field
+    /// decode path — with NON-power-of-two column counts. Every in-tree
+    /// FastPath caller uses pow2 cols, so without this test the non-pow2
+    /// branch of the decode is never executed at all.
+    ///
+    /// Each insert is mirrored into a reference matrix whose placements are
+    /// computed independently (`shift → mask → % cols`), then both full
+    /// matrices are compared.
+    #[test]
+    fn fast_insert_non_pow2_and_degenerate_cols_match_reference() {
+        let mut lcg = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next_hash = move || {
+            lcg ^= lcg << 13;
+            lcg ^= lcg >> 7;
+            lcg ^= lcg << 17;
+            lcg
+        };
+        let reference_col = |hash: u64, row: usize, cols: usize| -> usize {
+            let mask_bits = if cols.is_power_of_two() {
+                cols.ilog2()
+            } else {
+                cols.ilog2() + 1
+            } as usize;
+            (((hash >> (mask_bits * row)) & ((1u64 << mask_bits) - 1)) % cols as u64) as usize
+        };
+
+        for &cols in &[1usize, 17, 100, 1000] {
+            const ROWS: usize = 3;
+            let mut m: Vector2D<i64> = Vector2D::from_fn(ROWS, cols, |_, _| 0);
+            let mut reference = vec![0i64; ROWS * cols];
+
+            for _ in 0..500 {
+                let h = next_hash();
+                m.fast_insert(
+                    |c: &mut i64, _: &i64, _| *c += 1,
+                    1i64,
+                    &MatrixHashType::Packed64(h),
+                );
+                for row in 0..ROWS {
+                    reference[row * cols + reference_col(h, row, cols)] += 1;
+                }
+            }
+
+            assert_eq!(
+                m.as_slice(),
+                &reference[..],
+                "cols={cols}: cached-field decode diverged from reference"
+            );
+        }
     }
 }

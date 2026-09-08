@@ -78,6 +78,18 @@ fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError>
 fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self, RmpDecodeError>
 ```
 
+These produce/consume the **ASAPv1** wire envelope — see the
+[ASAPv1 wire format spec](../asapv1_wire_format.md). On the generic
+`HyperLogLogImpl<Variant, Registers, H>`, the methods are bounded on
+`Variant: HllWireVariant` and `H: HashProfile`, so every
+(variant × precision × hasher) combination serializes — **HLL is fully
+wire-covered**. Each variant maps to its own `kind_id` (Classic → `0x01 0x01`,
+Ertl-MLE → `0x01 0x02`, HIP → `0x01 0x03`); `precision` and the
+`HashProfile`-derived hash spec live in the envelope metadata, and the payload is
+the register bytes (plus three HIP scalars for the HIP variant). `HyperLogLogHIP`
+is a non-generic struct that hashes through the default functions, so it is
+wire-eligible under the **standard** hash profile only.
+
 ## Examples
 
 ```rust

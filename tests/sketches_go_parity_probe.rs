@@ -40,8 +40,8 @@ const COUNTMIN_GOLDEN_HEX: &str = include_str!("../src/sketches/testdata/cms_env
 const HLL_GOLDEN_HEX: &str = include_str!("../src/sketches/testdata/hll_envelope_golden.hex");
 
 /// 403-byte DDSketch envelope for `alpha=0.01`, `(1..=50)` integer-as-f64
-/// input, AFTER dropping the DataPoint-level METRIC scalars
-/// (count/sum/min/max → proto tags 4-7 reserved, ProjectASAP/sketchlib-go#243).
+/// input, without the DataPoint-level METRIC scalars (count/sum/min/max →
+/// proto tags 4-7 reserved).
 ///
 /// NOTE: this is currently the RUST-produced value; it MUST be reconciled
 /// against the parallel `sketchlib-go` golden regeneration before declaring
@@ -231,9 +231,8 @@ fn sketches_ddsketch_matches_go_envelope() {
     let alpha = sk.alpha();
     let gamma = (1.0 + alpha) / (1.0 - alpha);
     let alpha_wire = (gamma - 1.0) / (gamma + 1.0);
-    // The DataPoint-level METRIC scalars (count/sum/min/max) were dropped
-    // from the wire (ProjectASAP/sketchlib-go#243); only alpha + the bucket
-    // array remain.
+    // The DataPoint-level METRIC scalars (count/sum/min/max) are not on the
+    // wire; only alpha + the bucket array.
     let state = DdSketchState {
         alpha: alpha_wire,
         store_counts: sk.store_counts().to_vec(),

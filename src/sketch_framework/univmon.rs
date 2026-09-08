@@ -24,18 +24,30 @@
 //! This implementation is part of the `asap_sketchlib` library.
 
 use crate::common::heap::HHHeap;
-use crate::common::{BOTTOM_LAYER_FINDER, DataInput, hash_item64_seeded, hash64_seeded};
-use crate::common::{L2HH, Vector1D};
-use crate::sketches::countsketch_topk::CountL2HH;
-use rmp_serde::{
-    decode::Error as RmpDecodeError, encode::Error as RmpEncodeError, from_slice, to_vec_named,
+use crate::common::{
+    BOTTOM_LAYER_FINDER, DataInput, HeapItem, hash_item64_seeded, hash64_seeded,
+    heap_item_to_sketch_input,
 };
+use crate::common::{L2HH, Vector1D};
+use crate::octo_delta::LayeredCountDelta;
+use crate::sketches::countsketch_topk::CountL2HH;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+
+pub(crate) mod wire;
 
 const DEFAULT_SKETCH_ROW: usize = 5;
 const DEFAULT_SKETCH_COL: usize = 2048;
 const DEFAULT_HEAP_SIZE: usize = 32;
 const DEFAULT_LAYER_SIZE: usize = 8;
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum UnivMonUpdateMode {
+    #[default]
+    Unset,
+    Standard,
+    Terminal,
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 /// UnivMon sketch pyramid for multi-metric stream estimation.
@@ -54,6 +66,10 @@ pub struct UnivMon {
     pub heap_size: usize,
     /// Bucket size used for hashing decisions.
     pub bucket_size: usize,
+    #[serde(default)]
+    update_mode: UnivMonUpdateMode,
+    #[serde(default)]
+    candidate_complete: Vec<bool>,
 }
 
 impl Default for UnivMon {
@@ -67,6 +83,33 @@ impl Default for UnivMon {
     }
 }
 
+/// Layers one pyramid may hold. [`bottom_layer_for_hash`] and the query
+/// recurrences shift a 64-bit key hash right by up to `layer_size - 1`, so a
+/// deeper pyramid would shift past the hash's width.
+pub const MAX_LAYER_SIZE: usize = 64;
+
+/// Deepest pyramid layer the given key hash reaches.
+#[inline(always)]
+pub fn bottom_layer_for_hash(hash: u64, layer_size: usize) -> usize {
+    for l in 1..layer_size {
+        if ((hash >> l) & 1) == 0 {
+            return l - 1;
+        }
+    }
+    layer_size - 1
+}
+
+/// How much of the stream reached an aggregator being fed `LayeredCountDelta`s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnivMonDeltaFidelity {
+    /// Every insert was promoted, so candidate sets can still be complete.
+    /// Only true at a promotion threshold of 1.
+    EveryInsert,
+    /// Only counters that crossed the threshold arrived; candidate sets are
+    /// partial by construction.
+    PromotedOnly,
+}
+
 impl UnivMon {
     /// Creates a UnivMon instance with explicit dimensions.
     pub fn init_univmon(
@@ -75,6 +118,14 @@ impl UnivMon {
         sketch_col: usize,
         layer_size: usize,
     ) -> Self {
+        assert!(heap_size > 0, "heap size must be positive");
+        assert!(sketch_row > 0, "sketch row count must be positive");
+        assert!(sketch_col > 0, "sketch column count must be positive");
+        assert!(layer_size > 0, "layer count must be positive");
+        assert!(
+            layer_size <= MAX_LAYER_SIZE,
+            "layer count must be at most MAX_LAYER_SIZE {MAX_LAYER_SIZE}"
+        );
         let sk_vec: Vec<L2HH> = (0..layer_size)
             .map(|i| {
                 L2HH::COUNT(CountL2HH::with_dimensions_and_seed(
@@ -93,52 +144,151 @@ impl UnivMon {
             sketch_col,
             heap_size,
             bucket_size: 0,
+            update_mode: UnivMonUpdateMode::Unset,
+            candidate_complete: vec![true; layer_size],
         }
+    }
+
+    #[inline]
+    fn begin_update(&mut self, value: i64, mode: UnivMonUpdateMode) {
+        assert!(value >= 0, "UnivMon only supports non-negative updates");
+        match self.update_mode {
+            UnivMonUpdateMode::Unset => self.update_mode = mode,
+            current if current == mode => {}
+            _ => panic!("cannot mix standard and terminal-only updates in one UnivMon"),
+        }
+        self.bucket_size = self
+            .bucket_size
+            .checked_add(value as usize)
+            .expect("UnivMon total weight overflowed usize");
     }
 
     #[inline(always)]
     fn find_bottom_layer_num(&self, hash: u64, layer: usize) -> usize {
-        for l in 1..layer {
-            if ((hash >> l) & 1) == 0 {
-                return l - 1;
-            }
+        bottom_layer_for_hash(hash, layer)
+    }
+
+    /// Deepest pyramid layer an insert of `key` reaches; it touches `0..=this`.
+    ///
+    /// A pure function of the key's hash, so an OctoSketch worker picks exactly
+    /// the same layers as a single-threaded insert would.
+    pub fn bottom_layer_for(&self, key: &DataInput) -> usize {
+        bottom_layer_for_hash(hash64_seeded(BOTTOM_LAYER_FINDER, key), self.layer_size)
+    }
+
+    /// Whether each layer's heavy-hitter heap still holds every key that layer
+    /// received. Queries widen their threshold on the layers where it does not.
+    pub fn candidates_complete(&self) -> &[bool] {
+        &self.candidate_complete
+    }
+
+    /// Marks every layer's candidate set as partial.
+    ///
+    /// An OctoSketch aggregator calls this up front whenever its workers
+    /// promote above a threshold of 1: a layer that received traffic but never
+    /// promoted any of it sends the aggregator nothing at all, so waiting for a
+    /// delta to arrive before lowering the flag would leave exactly those
+    /// layers claiming a completeness they cannot have.
+    pub fn mark_candidates_incomplete(&mut self) {
+        self.candidate_complete.fill(false);
+    }
+
+    /// Marks one layer's candidate set as partial.
+    pub fn mark_layer_candidates_incomplete(&mut self, layer: usize) {
+        self.candidate_complete[layer] = false;
+    }
+
+    /// Overwrites the total weight the sketch believes it has seen.
+    ///
+    /// An OctoSketch aggregator never observes the raw stream, so it restores
+    /// this from the running totals its workers report. This *assigns* where
+    /// `insert` and `merge` accumulate, so a sketch fed by deltas must not also
+    /// be inserted into or merged with: the next delta would erase whatever
+    /// those added. Feeding one exclusively through `apply_layered_delta` and
+    /// this method is the supported arrangement.
+    pub fn set_total_weight(&mut self, weight: usize) {
+        debug_assert_ne!(
+            self.update_mode,
+            UnivMonUpdateMode::Terminal,
+            "a terminal-mode UnivMon cannot be fed by the delta path"
+        );
+        self.bucket_size = weight;
+        if self.update_mode == UnivMonUpdateMode::Unset {
+            self.update_mode = UnivMonUpdateMode::Standard;
         }
-        layer - 1
+    }
+
+    /// Applies one delta promoted by an OctoSketch worker.
+    ///
+    /// Mirrors `update` for a single layer: the counter lands, the layer's
+    /// estimate is re-read, and the layer's heavy-hitter heap follows - which
+    /// is Algorithm 2 of the OctoSketch paper.
+    pub fn apply_layered_delta(
+        &mut self,
+        delta: &LayeredCountDelta,
+        fidelity: UnivMonDeltaFidelity,
+    ) {
+        if self.update_mode == UnivMonUpdateMode::Unset {
+            self.update_mode = UnivMonUpdateMode::Standard;
+        }
+        let layer = delta.layer as usize;
+        assert!(
+            layer < self.layer_size,
+            "delta names layer {layer} but this pyramid has {} layers",
+            self.layer_size
+        );
+
+        self.l2_sketch_layers[layer].apply_delta(delta.delta);
+        let key = heap_item_to_sketch_input(&delta.key);
+        let count = self.l2_sketch_layers[layer].estimate(&key);
+        let heap_kept_everything = self.hh_layers[layer].update(&key, count as i64);
+
+        // A worker holds back every counter that has not reached the promotion
+        // threshold, so unless the threshold is 1 the aggregator has provably
+        // not seen every key this layer received and its candidate set cannot
+        // be called complete. Claiming otherwise would send `heavy_threshold`
+        // down the permissive branch and overcount.
+        let complete = heap_kept_everything && fidelity == UnivMonDeltaFidelity::EveryInsert;
+        if !complete {
+            self.candidate_complete[layer] = false;
+        }
     }
 
     #[inline(always)]
     fn update(&mut self, key: &DataInput, value: i64, bottom_layer_num: usize) {
         for i in 0..=bottom_layer_num {
-            let count = if i == 0 {
-                self.l2_sketch_layers[i].update_and_est(key, value)
-            } else {
-                self.l2_sketch_layers[i].update_and_est_without_l2(key, value)
-            };
-            self.hh_layers[i].update(key, count as i64);
+            let count = self.l2_sketch_layers[i].update_and_est(key, value);
+            if !self.hh_layers[i].update(key, count as i64) {
+                self.candidate_complete[i] = false;
+            }
         }
     }
 
     #[inline(always)]
     fn process_univmon(&mut self, key: &DataInput, value: i64, bottom_layer_num: usize) {
-        self.bucket_size += value as usize;
         self.update(key, value, bottom_layer_num);
     }
 
     /// Inserts one weighted update.
     pub fn insert(&mut self, key: &DataInput, value: i64) {
+        self.begin_update(value, UnivMonUpdateMode::Standard);
         let h = hash64_seeded(BOTTOM_LAYER_FINDER, key);
         let bottom_layer_num = self.find_bottom_layer_num(h, self.layer_size);
         self.process_univmon(key, value, bottom_layer_num)
     }
 
-    /// Inserts one weighted update using fast-path hashing.
+    /// Inserts one weighted update into its terminal stratum only.
+    ///
+    /// This is the Joltik update-last-layer construction. Logical sampled
+    /// streams and their candidate sets are reconstructed during queries.
+    /// Do not mix this method with [`Self::insert`] on the same sketch.
     pub fn fast_insert(&mut self, key: &DataInput, value: i64) {
-        self.bucket_size += value as usize;
+        self.begin_update(value, UnivMonUpdateMode::Terminal);
         let h = hash64_seeded(BOTTOM_LAYER_FINDER, key);
         let bottom_layer_num = self.find_bottom_layer_num(h, self.layer_size);
         let count = self.l2_sketch_layers[bottom_layer_num].update_and_est(key, value);
-        for i in 0..=bottom_layer_num {
-            self.hh_layers[i].update(key, count as i64);
+        if !self.hh_layers[bottom_layer_num].update(key, count as i64) {
+            self.candidate_complete[bottom_layer_num] = false;
         }
     }
 
@@ -146,7 +296,7 @@ impl UnivMon {
     pub fn print_hh_layer(&self) {
         print!("Print HH_Layer: ");
         for i in 0..self.layer_size {
-            println!("layer {}: ", i);
+            println!("layer {i}: ");
             self.hh_layers[i].print_heap();
         }
     }
@@ -156,19 +306,29 @@ impl UnivMon {
     where
         F: Fn(f64) -> f64,
     {
+        if self.bucket_size == 0 {
+            return 0.0;
+        }
+        if self.update_mode == UnivMonUpdateMode::Terminal {
+            return self.calc_terminal_g_sum(g);
+        }
+
         let mut y = vec![0.0; self.layer_size];
         let mut tmp: f64;
 
         let l2_value = self.l2_sketch_layers[self.layer_size - 1].get_l2();
-        let mut threshold = (l2_value * 0.01) as i64;
-        if !is_card {
-            threshold = 0;
-        }
+        let threshold = if is_card {
+            self.heavy_threshold(l2_value, self.candidate_complete[self.layer_size - 1])
+        } else {
+            0
+        };
 
         tmp = 0.0;
         for item in self.hh_layers[self.layer_size - 1].heap() {
-            if item.count > threshold {
-                tmp += g(item.count as f64);
+            let input = heap_item_to_sketch_input(&item.key);
+            let count = self.l2_sketch_layers[self.layer_size - 1].estimate(&input) as i64;
+            if count > threshold {
+                tmp += g(count as f64);
             }
         }
         y[self.layer_size - 1] = tmp;
@@ -176,24 +336,106 @@ impl UnivMon {
         for i in (0..(self.layer_size - 1)).rev() {
             tmp = 0.0;
             let l2_value = self.l2_sketch_layers[i].get_l2();
-            let mut threshold = (l2_value * 0.01) as i64;
-            if !is_card {
-                threshold = 0;
-            }
+            let threshold = if is_card {
+                self.heavy_threshold(l2_value, self.candidate_complete[i])
+            } else {
+                0
+            };
 
             for item in self.hh_layers[i].heap() {
-                if item.count > threshold {
-                    // let hash = (hash64_seeded(CANONICAL_HASH_SEED, &item.key) >> (i+1)) & 1;
-                    // let hash = (hash64_seeded(CANONICAL_HASH_SEED, &DataInput::Str(&item.key)) >> (i + 1)) & 1;
+                let input = heap_item_to_sketch_input(&item.key);
+                let count = self.l2_sketch_layers[i].estimate(&input) as i64;
+                if count > threshold {
                     let hash = (hash_item64_seeded(BOTTOM_LAYER_FINDER, &item.key) >> (i + 1)) & 1;
                     let coe = 1.0 - 2.0 * (hash as f64);
-                    tmp += coe * g(item.count as f64);
+                    tmp += coe * g(count as f64);
                 }
             }
             y[i] = 2.0 * y[i + 1] + tmp;
         }
 
         y[0]
+    }
+
+    fn calc_terminal_g_sum<F>(&self, g: F) -> f64
+    where
+        F: Fn(f64) -> f64,
+    {
+        let (candidates, complete) = self.logical_terminal_candidates();
+        let mut logical_l2 = vec![0.0; self.layer_size];
+        let mut suffix_l2_squared = 0.0;
+        for level in (0..self.layer_size).rev() {
+            let terminal_l2 = self.l2_sketch_layers[level].get_l2();
+            suffix_l2_squared += terminal_l2 * terminal_l2;
+            logical_l2[level] = suffix_l2_squared.sqrt();
+        }
+
+        let mut y = vec![0.0; self.layer_size];
+        let last = self.layer_size - 1;
+        let threshold = self.heavy_threshold(logical_l2[last], complete[last]);
+        y[last] = candidates[last]
+            .iter()
+            .filter(|(_, count)| *count > threshold)
+            .map(|(_, count)| g(*count as f64))
+            .sum();
+
+        for level in (0..last).rev() {
+            let threshold = self.heavy_threshold(logical_l2[level], complete[level]);
+            let correction = candidates[level]
+                .iter()
+                .filter(|(_, count)| *count > threshold)
+                .map(|(key, count)| {
+                    let hash = (hash_item64_seeded(BOTTOM_LAYER_FINDER, key) >> (level + 1)) & 1;
+                    (1.0 - 2.0 * hash as f64) * g(*count as f64)
+                })
+                .sum::<f64>();
+            y[level] = 2.0 * y[level + 1] + correction;
+        }
+        y[0]
+    }
+
+    /// Reconstructs the logical sampled-stream candidate sets from disjoint
+    /// terminal strata, as required by the Joltik update-last-layer scheme.
+    fn logical_terminal_candidates(&self) -> (Vec<Vec<(HeapItem, i64)>>, Vec<bool>) {
+        let mut logical = vec![Vec::new(); self.layer_size];
+        let mut complete = vec![false; self.layer_size];
+        let mut cumulative = HashMap::<HeapItem, i64>::with_capacity(self.heap_size * 2);
+        let mut suffix_complete = true;
+        for level in (0..self.layer_size).rev() {
+            suffix_complete &= self.candidate_complete[level];
+            for item in self.hh_layers[level].heap() {
+                let input = heap_item_to_sketch_input(&item.key);
+                let count = self.l2_sketch_layers[level].estimate(&input) as i64;
+                cumulative
+                    .entry(item.key.clone())
+                    .and_modify(|old| *old = (*old).max(count))
+                    .or_insert(count);
+            }
+            let mut retained: Vec<_> = cumulative
+                .iter()
+                .map(|(key, count)| (key.clone(), *count))
+                .collect();
+            retained.sort_unstable_by(|left, right| {
+                right.1.cmp(&left.1).then_with(|| {
+                    hash_item64_seeded(BOTTOM_LAYER_FINDER, &left.0)
+                        .cmp(&hash_item64_seeded(BOTTOM_LAYER_FINDER, &right.0))
+                })
+            });
+            complete[level] = suffix_complete && retained.len() <= self.heap_size;
+            retained.truncate(self.heap_size);
+            cumulative = retained.iter().cloned().collect();
+            logical[level] = retained;
+        }
+        (logical, complete)
+    }
+
+    #[inline]
+    fn heavy_threshold(&self, l2: f64, complete: bool) -> i64 {
+        if complete {
+            0
+        } else {
+            (l2 / (self.heap_size as f64).sqrt()) as i64
+        }
     }
 
     /// Computes a g-sum estimate.
@@ -204,9 +446,9 @@ impl UnivMon {
         self.calc_g_sum_heuristic(g, is_card)
     }
 
-    /// Returns the estimated L1 norm.
+    /// Returns the exact L1 norm for the supported non-negative update stream.
     pub fn calc_l1(&self) -> f64 {
-        self.calc_g_sum(|x| x, false)
+        self.bucket_size as f64
     }
 
     /// Returns the estimated L2 norm.
@@ -217,6 +459,9 @@ impl UnivMon {
 
     /// Returns the estimated entropy.
     pub fn calc_entropy(&self) -> f64 {
+        if self.bucket_size == 0 {
+            return 0.0;
+        }
         let tmp = self.calc_g_sum(
             |x| {
                 if x > 0.0 { x * x.log2() } else { 0.0 }
@@ -235,44 +480,65 @@ impl UnivMon {
     /// Zeroes all counters and clears all heaps, matching the Go `Free()` method.
     pub fn free(&mut self) {
         self.bucket_size = 0;
+        self.update_mode = UnivMonUpdateMode::Unset;
+        self.candidate_complete.fill(true);
         for i in 0..self.layer_size {
             self.l2_sketch_layers[i].clear();
             self.hh_layers[i].clear();
         }
     }
 
-    /// Merges another UnivMon into this one.
+    /// Merges another compatible UnivMon into this one.
+    ///
+    /// Both sketches must use the same dimensions and update strategy.
+    /// Counters are merged first, then candidate frequencies and cached L2
+    /// values are rebuilt from the combined counter state.
     pub fn merge(&mut self, other: &UnivMon) {
         assert_eq!(
             self.layer_size, other.layer_size,
             "layer size should be equal to merge"
         );
+        assert_eq!(
+            (self.sketch_row, self.sketch_col, self.heap_size),
+            (other.sketch_row, other.sketch_col, other.heap_size),
+            "UnivMon dimensions and heap size must match for merge"
+        );
+        match (self.update_mode, other.update_mode) {
+            (UnivMonUpdateMode::Unset, mode) => self.update_mode = mode,
+            (_, UnivMonUpdateMode::Unset) => {}
+            (left, right) => assert_eq!(
+                left, right,
+                "cannot merge standard and terminal-only UnivMon states"
+            ),
+        }
+        self.bucket_size = self
+            .bucket_size
+            .checked_add(other.bucket_size)
+            .expect("merged UnivMon total weight overflowed usize");
         for i in 0..self.layer_size {
+            let sources_complete = self.candidate_complete[i] && other.candidate_complete[i];
+            let candidate_keys: HashSet<HeapItem> = self.hh_layers[i]
+                .heap()
+                .iter()
+                .chain(other.hh_layers[i].heap())
+                .map(|item| item.key.clone())
+                .collect();
+            let merged_candidates_complete =
+                sources_complete && candidate_keys.len() <= self.heap_size;
             self.l2_sketch_layers[i].merge(&other.l2_sketch_layers[i]);
-            for item in other.hh_layers[i].heap() {
-                let count = if let Some(index) = self.hh_layers[i].find_heap_item(&item.key) {
-                    self.hh_layers[i].heap()[index].count + item.count
-                } else {
-                    item.count
-                };
-                self.hh_layers[i].update_heap_item(&item.key, count);
+            self.hh_layers[i].clear();
+            for key in candidate_keys {
+                let input = heap_item_to_sketch_input(&key);
+                let count = self.l2_sketch_layers[i].estimate(&input) as i64;
+                self.hh_layers[i].update(&input, count);
             }
+            self.candidate_complete[i] = merged_candidates_complete;
         }
     }
 
     /// Returns the heap for one layer.
     pub fn heap_at_layer(&mut self, layer: usize) -> &mut HHHeap {
         &mut self.hh_layers[layer]
-    }
-
-    /// Serializes the UnivMon sketch into MessagePack bytes.
-    pub fn serialize_to_bytes(&self) -> Result<Vec<u8>, RmpEncodeError> {
-        to_vec_named(self)
-    }
-
-    /// Deserializes a UnivMon sketch from MessagePack bytes.
-    pub fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self, RmpDecodeError> {
-        from_slice(bytes)
     }
 }
 
@@ -337,21 +603,13 @@ mod tests {
         );
     }
 
-    // fn bottom_layer_for(um: &UnivMon, key: &str) -> usize {
-    //     let hash = hash64_seeded(BOTTOM_LAYER_FINDER, &DataInput::Str(key));
-    //     um.find_bottom_layer_num(hash, um.layer)
-    // }
-
     #[test]
     fn update_populates_bucket_size_and_heavy_hitters() {
         // processing a single hot key should record its weight in the heavy hitter layers
         let mut um = UnivMon::init_univmon(16, 3, 32, 4);
         let key = "alpha";
 
-        // let bottom = bottom_layer_for(&um, key);
-
         for _ in 0..40 {
-            // um.univmon_processing(key, 1, bottom);
             um.insert(&DataInput::Str(key), 1);
         }
 
@@ -386,15 +644,10 @@ mod tests {
         let key_left = "left";
         let key_right = "right";
 
-        // let bottom_left = bottom_layer_for(&left, key_left);
-        // let bottom_right = bottom_layer_for(&right, key_right);
-
         for _ in 0..25 {
-            // left.univmon_processing(key_left, 1, bottom_left);
             left.insert(&DataInput::Str(key_left), 1);
         }
         for _ in 0..30 {
-            // right.univmon_processing(key_right, 1, bottom_right);
             right.insert(&DataInput::Str(key_right), 1);
         }
 
@@ -402,7 +655,6 @@ mod tests {
 
         let left_heap = left.heap_at_layer(00);
         let right_heap = right.heap_at_layer(0);
-        // let right_heap = right.heap_at_layer(00);
         let idx_left = left_heap
             .find_heap_item(&HeapItem::String(key_left.to_owned()))
             .expect("left key present");
@@ -427,7 +679,104 @@ mod tests {
             "right in left is: {}",
             left_heap.heap()[idx_right_in_left].count
         );
-        // assert!(left.hh_layers[0].heap()[idx_right].count > 0);
+    }
+
+    #[test]
+    fn merge_combines_weight_l2_and_evicted_candidate_counts() {
+        let mut left = UnivMon::init_univmon(1, 3, 1024, 1);
+        let mut right = UnivMon::init_univmon(1, 3, 1024, 1);
+        left.insert(&DataInput::Str("x"), 100);
+        right.insert(&DataInput::Str("x"), 5);
+        right.insert(&DataInput::Str("y"), 10);
+
+        left.merge(&right);
+
+        assert_eq!(left.bucket_size, 115);
+        let expected_l2 = (105.0_f64.powi(2) + 10.0_f64.powi(2)).sqrt();
+        assert!((left.l2_sketch_layers[0].get_l2() - expected_l2).abs() < 1e-9);
+        let x = HeapItem::String("x".to_owned());
+        let index = left.hh_layers[0]
+            .find_heap_item(&x)
+            .expect("merged top candidate");
+        assert_eq!(left.hh_layers[0].heap()[index].count, 105);
+        assert!(left.calc_entropy().is_finite());
+        assert!(left.calc_entropy() >= 0.0);
+    }
+
+    #[test]
+    fn standard_and_terminal_merges_match_one_pass_with_complete_candidates() {
+        for terminal_only in [false, true] {
+            let mut one_pass = UnivMon::init_univmon(128, 5, 2048, 10);
+            let mut left = UnivMon::init_univmon(128, 5, 2048, 10);
+            let mut right = UnivMon::init_univmon(128, 5, 2048, 10);
+            for observation in 0..2000_u64 {
+                let key = DataInput::U64(observation % 64);
+                if terminal_only {
+                    one_pass.fast_insert(&key, 1);
+                    if observation % 2 == 0 {
+                        left.fast_insert(&key, 1);
+                    } else {
+                        right.fast_insert(&key, 1);
+                    }
+                } else {
+                    one_pass.insert(&key, 1);
+                    if observation % 2 == 0 {
+                        left.insert(&key, 1);
+                    } else {
+                        right.insert(&key, 1);
+                    }
+                }
+            }
+
+            left.merge(&right);
+            assert_eq!(left.bucket_size, one_pass.bucket_size);
+            assert!((left.calc_l1() - one_pass.calc_l1()).abs() < 1e-9);
+            assert!((left.calc_l2() - one_pass.calc_l2()).abs() < 1e-9);
+            assert!((left.calc_card() - one_pass.calc_card()).abs() < 1e-9);
+            assert!((left.calc_entropy() - one_pass.calc_entropy()).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn standard_updates_l2_for_every_sampled_layer() {
+        let mut sketch = UnivMon::init_univmon(16, 3, 128, 6);
+        let key = (0_u64..)
+            .map(DataInput::U64)
+            .find(|key| {
+                let hash = hash64_seeded(BOTTOM_LAYER_FINDER, key);
+                sketch.find_bottom_layer_num(hash, sketch.layer_size) >= 2
+            })
+            .expect("find a key sampled into multiple layers");
+        let hash = hash64_seeded(BOTTOM_LAYER_FINDER, &key);
+        let bottom = sketch.find_bottom_layer_num(hash, sketch.layer_size);
+        sketch.insert(&key, 3);
+        for level in 0..=bottom {
+            assert_eq!(sketch.l2_sketch_layers[level].get_l2(), 3.0);
+        }
+    }
+
+    #[test]
+    fn terminal_update_touches_one_physical_layer_and_reconstructs_queries() {
+        let mut sketch = UnivMon::init_univmon(16, 3, 128, 6);
+        let key = (0_u64..)
+            .map(DataInput::U64)
+            .find(|key| {
+                let hash = hash64_seeded(BOTTOM_LAYER_FINDER, key);
+                sketch.find_bottom_layer_num(hash, sketch.layer_size) >= 2
+            })
+            .expect("find a key sampled into multiple layers");
+        let hash = hash64_seeded(BOTTOM_LAYER_FINDER, &key);
+        let bottom = sketch.find_bottom_layer_num(hash, sketch.layer_size);
+        sketch.fast_insert(&key, 3);
+
+        for level in 0..sketch.layer_size {
+            let expected = if level == bottom { 3.0 } else { 0.0 };
+            assert_eq!(sketch.l2_sketch_layers[level].get_l2(), expected);
+        }
+        assert_eq!(sketch.calc_l1(), 3.0);
+        assert_eq!(sketch.calc_l2(), 3.0);
+        assert_eq!(sketch.calc_card(), 1.0);
+        assert_eq!(sketch.calc_entropy(), 0.0);
     }
 
     #[test]
@@ -463,8 +812,6 @@ mod tests {
 
         for i in 0..20 {
             let key = format!("flow_{i}");
-            // let bottom = bottom_layer_for(&um, &key);
-            // um.univmon_processing(&key, 10, bottom);
             um.insert(&DataInput::String(key), 1);
         }
 
@@ -484,8 +831,6 @@ mod tests {
         let expected_total = 450;
 
         for (key, count) in &flows {
-            // let bottom = bottom_layer_for(&um, key);
-            // um.univmon_processing(key, *count, bottom);
             um.insert(&DataInput::Str(key), *count);
         }
 
@@ -521,103 +866,12 @@ mod tests {
 
         let mut um = UnivMon::init_univmon(100, 3, 2048, 16);
         for case in cases {
-            // let h = hash64_seeded(BOTTOM_LAYER_FINDER, &DataInput::Str(&case.0));
-            // let bln = um.find_bottom_layer_num(h, 16);
-            // um.univmon_processing(&case.0, case.1, bln);
             um.insert(&DataInput::String(case.0), case.1);
         }
 
         assert_eq!(um.calc_card(), 10.0, "Cardinality estimation incorrect");
         assert_eq!(um.calc_l1(), 131.0, "L1 estimation incorrect");
     }
-
-    // #[test]
-    // fn univmon_different_seeds_maintain_accuracy() {
-    //     // Verify that using different seed indices doesn't break basic accuracy
-    //     // Create two UnivMons with same config but verify both maintain accuracy
-
-    //     let mut um1 = UnivMon::new_univmon_pyramid(20, 3, 2048, 10, 0);
-    //     let mut um2 = UnivMon::new_univmon_pyramid(20, 3, 2048, 10, 1); // Different pool_idx
-
-    //     // Insert same data into both with more flows for better stability
-    //     let flows = [
-    //         ("flow_a", 150),
-    //         ("flow_b", 200),
-    //         ("flow_c", 100),
-    //         ("flow_d", 180),
-    //         ("flow_e", 120),
-    //     ];
-
-    //     let true_l1 = 750f64;
-
-    //     for (key, count) in &flows {
-    //         let bottom1 = bottom_layer_for(&um1, key);
-    //         let bottom2 = bottom_layer_for(&um2, key);
-    //         um1.univmon_processing(key, *count, bottom1);
-    //         um2.univmon_processing(key, *count, bottom2);
-    //     }
-
-    //     // Both should estimate L1 with reasonable accuracy
-    //     let est_l1_1 = um1.calc_l1();
-    //     let est_l1_2 = um2.calc_l1();
-
-    //     let error_1 = ((est_l1_1 - true_l1).abs()) / true_l1;
-    //     let error_2 = ((est_l1_2 - true_l1).abs()) / true_l1;
-
-    //     assert!(
-    //         est_l1_1 == true_l1,
-    //         "UnivMon 1 L1 estimate {} should be reasonably accurate (error: {:.2}%)",
-    //         est_l1_1,
-    //         error_1 * 100.0
-    //     );
-    //     assert!(
-    //         est_l1_1 == true_l1,
-    //         "UnivMon 2 L1 estimate {} should be reasonably accurate (error: {:.2}%)",
-    //         est_l1_2,
-    //         error_2 * 100.0
-    //     );
-    // }
-
-    // #[test]
-    // fn test_layer_update_correctness() {
-    //     // 1. Initialize UnivMon with enough layers
-    //     let layers = 8;
-    //     // Small dimensions to make debugging easier, but enough to avoid collisions in this simple test
-    //     let mut um = UnivMon::init_univmon(10, 5, 128, layers, 0);
-
-    //     let key = "test_key_layer_logic";
-    //     let value = 10;
-
-    //     // 2. Pre-calculate the expected bottom layer for this key
-    //     // We use the same hasher the struct uses internally
-    //     let hash = hash64_seeded(BOTTOM_LAYER_FINDER, &DataInput::Str(key));
-    //     let expected_bottom = um.find_bottom_layer_num(hash, layers);
-
-    //     // 3. Perform Update
-    //     um.univmon_processing(key, value, expected_bottom);
-
-    //     // 4. Verification Loop
-    //     for i in 0..layers {
-    //         // Check Heap Presence
-    //         let in_heap = um.hh_layers[i].find(key).is_some();
-
-    //         // Check Sketch Estimate
-    //         // We use estimate() to see if the counter was incremented
-    //         let count_est = um.cs_layers[i].get_estimate(&DataInput::Str(key));
-
-    //         if i <= expected_bottom {
-    //             // Case A: Layers the item SHOULD exist in
-    //             assert!(in_heap, "Key should be in heap for layer {}", i);
-    //             assert_eq!(count_est, value, "Sketch at layer {} should track count", i);
-    //         } else {
-    //             // Case B: Layers the item should NOT exist in (it was sampled out)
-    //             assert!(!in_heap, "Key should NOT be in heap for layer {}", i);
-    //             // Ideally 0, but technically collisions could occur.
-    //             // With 'value=10' and empty sketch, it should be 0.
-    //             assert_eq!(count_est, 0, "Sketch at layer {} should be empty", i);
-    //         }
-    //     }
-    // }
 
     #[test]
     fn test_statistical_accuracy() {
@@ -635,7 +889,7 @@ mod tests {
 
         for (prefix, count, repeat) in scenarios {
             for i in 0..repeat {
-                let key = format!("{}_{}", prefix, i);
+                let key = format!("{prefix}_{i}");
                 let val = count as i64;
                 let val_f = val as f64;
 
@@ -645,9 +899,6 @@ mod tests {
                 total_count += val_f;
 
                 // Update Sketch
-                // let hash = hash64_seeded(BOTTOM_LAYER_FINDER, &DataInput::Str(&key));
-                // let bln = um.find_bottom_layer_num(hash, 10);
-                // um.univmon_processing(&key, val, bln);
                 um.insert(&DataInput::String(key), val);
             }
         }
@@ -689,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn univmon_random_data_matches_ground_truth_within_five_percent() {
+    fn univmon_random_data_matches_ground_truth_within_configured_tolerance() {
         let mut rng = StdRng::seed_from_u64(0xDEADBEEF);
         let mut um = UnivMon::init_univmon(256, 6, 8192, 16);
         let mut truth: HashMap<String, i64> = HashMap::new();
@@ -723,323 +974,20 @@ mod tests {
         let true_entropy = total_mass.log2() - entropy_term / total_mass;
 
         let to_check = [
-            ("cardinality", um.calc_card(), true_card),
-            ("l1", um.calc_l1(), true_l1),
-            ("l2", um.calc_l2(), true_l2),
-            ("entropy", um.calc_entropy(), true_entropy),
+            ("cardinality", um.calc_card(), true_card, 0.07),
+            ("l1", um.calc_l1(), true_l1, 0.05),
+            ("l2", um.calc_l2(), true_l2, 0.05),
+            ("entropy", um.calc_entropy(), true_entropy, 0.05),
         ];
 
-        for (name, estimate, expected) in to_check {
+        for (name, estimate, expected, tolerance) in to_check {
             let rel_err = (estimate - expected).abs() / expected;
             assert!(
-                rel_err <= 0.05,
-                "{name} relative error {:.2}% exceeds 5%: est={estimate}, expected={expected}",
-                rel_err * 100.0
+                rel_err <= tolerance,
+                "{name} relative error {:.2}% exceeds {:.2}%: est={estimate}, expected={expected}",
+                rel_err * 100.0,
+                tolerance * 100.0,
             );
         }
     }
 }
-
-// following out-dated code contains pyramid optimization that is potentially useful
-// #[derive(Serialize, Deserialize, Clone, Debug)]
-// pub struct UnivMon {
-//     pub k: usize,
-//     pub row: usize,
-//     pub col: usize,
-//     pub layer: usize,
-//     pub cs_layers: Vector1D<L2HH>,
-//     pub hh_layers: Vector1D<HHHeap>,
-//     pub pool_idx: i64,
-//     pub heap_update: i32,
-//     pub bucket_size: usize,
-// }
-//
-// impl UnivMon {
-//     pub fn init_univmon(k: usize, r: usize, c: usize, l: usize, p_idx: i64) -> Self {
-//         // Create cs_layers - each layer needs different seeds
-//         // Layer i uses SEEDLIST[i] for hashing
-//         let cs_vec: Vec<L2HH> = (0..l)
-//             .map(|i| L2HH::COUNT(CountL2HH::with_dimensions_and_seed(r, c, i)))
-//             .collect();
-//         // Create hh_layers
-//         let hh_vec: Vec<HHHeap> = (0..l).map(|_| HHHeap::new(k)).collect();
-//
-//         UnivMon {
-//             k,
-//             row: r,
-//             col: c,
-//             layer: l,
-//             cs_layers: Vector1D::from_vec(cs_vec),
-//             hh_layers: Vector1D::from_vec(hh_vec),
-//             pool_idx: p_idx,
-//             heap_update: 0,
-//             bucket_size: 0,
-//         }
-//     }
-//
-//     pub fn get_bucket_size(&self) -> usize {
-//         self.bucket_size
-//     }
-//
-//     pub fn new_univmon_pyramid(k: usize, r: usize, c: usize, l: usize, p_idx: i64) -> Self {
-//         // 8 is ELEPHANT_LAYER in PromSketch
-//         // Each layer i uses SEEDLIST[i] for hashing
-//         let cs_vec: Vec<L2HH> = if l <= 8 {
-//             (0..l)
-//                 .map(|i| L2HH::COUNT(CountL2HH::with_dimensions_and_seed(3, 2048, i)))
-//                 .collect()
-//         } else {
-//             (0..8)
-//                 .map(|i| L2HH::COUNT(CountL2HH::with_dimensions_and_seed(3, 2048, i)))
-//                 .chain((8..l).map(|i| L2HH::COUNT(CountL2HH::with_dimensions_and_seed(3, 512, i))))
-//                 .collect()
-//         };
-//
-//         let hh_vec: Vec<HHHeap> = if l <= 8 {
-//             (0..l).map(|_| HHHeap::new(k)).collect()
-//         } else {
-//             (0..l).map(|_| HHHeap::new(100)).collect()
-//         };
-//
-//         UnivMon {
-//             k,
-//             row: r,
-//             col: c,
-//             layer: l,
-//             cs_layers: Vector1D::from_vec(cs_vec),
-//             hh_layers: Vector1D::from_vec(hh_vec),
-//             pool_idx: p_idx,
-//             heap_update: 0,
-//             bucket_size: 0,
-//         }
-//     }
-//
-//     // pub fn free(&mut self) {
-//     //     self.bucket_size = 0;
-//
-//     //     self.cs_layers.clear();
-//     //     self.hh_layers.clear();
-//     // }
-//
-//     // well... I'm not confident about this function
-//     // pub fn get_memory_kb(&self) -> f64 {
-//     //     let mut total = 0.0;
-//     //     for i in 0..self.layer {
-//     //         total += self.hh_layers[i].get_memory_bytes();
-//     //     }
-//     //     return (2048.0 * 3.0 * (self.layer as f64) * 8.0 + total) / 1024.0;
-//     // }
-//
-//     // pub fn get_memory_kb_pyramid(&self) -> f64 {
-//     //     let mut total = 0.0;
-//     //     for i in 0..self.layer {
-//     //         total += self.hh_layers[i].get_memory_bytes();
-//     //     }
-//     //     // again, hard code the ELEPHANT_LAYER for now
-//     //     if self.layer <= 8 {
-//     //         return (2048.0 * 3.0 * (self.layer as f64) * 8.0 + total) / 1024.0;
-//     //     } else {
-//     //         return ((2048.0 * 3.0 * 8.0 + 512.0 * 3.0 * (self.layer as f64 - 8.0)) * 8.0 + total)
-//     //             / 1024.0;
-//     //     }
-//     // }
-//
-//     // update univmon
-//     pub fn find_bottom_layer_num(&self, hash: u64, layer: usize) -> usize {
-//         for l in 1..layer {
-//             if ((hash >> l) & 1) == 0 {
-//                 return l - 1;
-//             }
-//         }
-//         layer - 1
-//     }
-//
-//     pub fn update(&mut self, key: &str, value: i64, bottom_layer_num: usize) {
-//         for i in 0..=bottom_layer_num {
-//             let count = if i == 0 {
-//                 self.cs_layers[i].update_and_est(&DataInput::Str(key), value)
-//             } else {
-//                 self.cs_layers[i].update_and_est_without_l2(&DataInput::Str(key), value)
-//             };
-//             self.hh_layers[i].update(key, count as i64);
-//         }
-//     }
-//
-//     pub fn update_optimized(&mut self, key: &str, value: i64, bottom_layer_num: usize) {
-//         // hardcode again
-//         if bottom_layer_num < 8 {
-//             if bottom_layer_num > 0 {
-//                 // let mut median = self.cs_layers[bottom_layer_num].update_and_est_without_l2(key, value);
-//                 let mut median = self.cs_layers[bottom_layer_num]
-//                     .update_and_est_without_l2(&DataInput::Str(key), value);
-//                 for l in (1..=bottom_layer_num).rev() {
-//                     self.hh_layers[l].update(key, median as i64);
-//                 }
-//                 // median = self.cs_layers[0].update_and_est(key, value);
-//                 median = self.cs_layers[0].update_and_est(&DataInput::Str(key), value);
-//                 self.hh_layers[0].update(key, median as i64);
-//             } else {
-//                 // let median = self.cs_layers[0].update_and_est(key, value);
-//                 let median = self.cs_layers[0].update_and_est(&DataInput::Str(key), value);
-//                 self.hh_layers[0].update(key, median as i64);
-//             }
-//         } else {
-//             // let mut median = self.cs_layers[bottom_layer_num].update_and_est_without_l2(key, value);
-//             let mut median = self.cs_layers[bottom_layer_num]
-//                 .update_and_est_without_l2(&DataInput::Str(key), value);
-//             for l in (1..=bottom_layer_num).rev() {
-//                 self.hh_layers[l].update(key, median as i64);
-//             }
-//             // median = self.cs_layers[0].update_and_est(key, value);
-//             median = self.cs_layers[0].update_and_est(&DataInput::Str(key), value);
-//             self.hh_layers[0].update(key, median as i64);
-//         }
-//     }
-//
-//     pub fn update_pyramid(&mut self, key: &str, value: i64, bottom_layer_num: usize) {
-//         // hardcode one more time
-//         if bottom_layer_num < 8 {
-//             for l in (0..=bottom_layer_num).rev() {
-//                 let median = if l == 0 {
-//                     self.cs_layers[l].update_and_est(&DataInput::Str(key), value)
-//                 } else {
-//                     self.cs_layers[l].update_and_est_without_l2(&DataInput::Str(key), value)
-//                 };
-//                 self.hh_layers[l].update(key, median as i64);
-//             }
-//         } else {
-//             let mut median;
-//             for l in (0..=7).rev() {
-//                 if l == 0 {
-//                     // median = self.cs_layers[l].update_and_est(key, value);
-//                     median = self.cs_layers[l].update_and_est(&DataInput::Str(key), value);
-//                 } else {
-//                     // median = self.cs_layers[l].update_and_est_without_l2(key, value);
-//                     median =
-//                         self.cs_layers[l].update_and_est_without_l2(&DataInput::Str(key), value);
-//                 }
-//                 self.hh_layers[l].update(key, median as i64);
-//             }
-//             for l in (8..=bottom_layer_num).rev() {
-//                 // median = self.cs_layers[l].update_and_est_without_l2(key, value);
-//                 median = self.cs_layers[l].update_and_est_without_l2(&DataInput::Str(key), value);
-//                 self.hh_layers[l].update(key, median as i64);
-//             }
-//         }
-//     }
-//
-//     pub fn univmon_processing(&mut self, key: &str, value: i64, bottom_layer_num: usize) {
-//         self.bucket_size += value as usize;
-//         self.update(key, value, bottom_layer_num);
-//     }
-//
-//     pub fn univmon_processing_optimized(&mut self, key: &str, value: i64, bottom_layer_num: usize) {
-//         self.bucket_size += value as usize;
-//         self.update_optimized(key, value, bottom_layer_num);
-//     }
-//
-//     // pub fn print_hh_layer(&self) {
-//     //     print!("Print HH_Layer: ");
-//     //     for i in 0..self.layer {
-//     //         println!("layer {}: ", i);
-//     //         self.hh_layers[i].print_heap();
-//     //     }
-//     // }
-//
-//     pub fn calc_g_sum_heuristic<F>(&self, g: F, is_card: bool) -> f64
-//     where
-//         F: Fn(f64) -> f64,
-//     {
-//         let mut y = vec![0.0; self.layer];
-//         let mut tmp: f64;
-//
-//         let l2_value = self.cs_layers[self.layer - 1].get_l2();
-//         let mut threshold = (l2_value * 0.01) as i64;
-//         if !is_card {
-//             threshold = 0;
-//         }
-//
-//         tmp = 0.0;
-//         for item in self.hh_layers[self.layer - 1].heap() {
-//             if item.count > threshold {
-//                 tmp += g(item.count as f64);
-//             }
-//         }
-//         y[self.layer - 1] = tmp;
-//
-//         for i in (0..(self.layer - 1)).rev() {
-//             tmp = 0.0;
-//             let l2_value = self.cs_layers[i].get_l2();
-//             let mut threshold = (l2_value * 0.01) as i64;
-//             if !is_card {
-//                 threshold = 0;
-//             }
-//
-//             for item in self.hh_layers[i].heap() {
-//                 if item.count > threshold {
-//                     // let hash = (hash64_seeded(CANONICAL_HASH_SEED, &item.key) >> (i+1)) & 1;
-//                     // let hash = (hash64_seeded(CANONICAL_HASH_SEED, &DataInput::Str(&item.key)) >> (i + 1)) & 1;
-//                     let hash =
-//                         (hash64_seeded(BOTTOM_LAYER_FINDER, &DataInput::Str(&item.key)) >> (i + 1)) & 1;
-//                     let coe = 1.0 - 2.0 * (hash as f64);
-//                     tmp += coe * g(item.count as f64);
-//                 }
-//             }
-//             y[i] = 2.0 * y[i + 1] + tmp;
-//         }
-//
-//         y[0]
-//     }
-//
-//     pub fn calc_g_sum<F>(&self, g: F, is_card: bool) -> f64
-//     where
-//         F: Fn(f64) -> f64,
-//     {
-//         self.calc_g_sum_heuristic(g, is_card)
-//     }
-//
-//     pub fn calc_l1(&self) -> f64 {
-//         self.calc_g_sum(|x| x, false)
-//     }
-//
-//     pub fn calc_l2(&self) -> f64 {
-//         let tmp = self.calc_g_sum(|x| x * x, false);
-//         tmp.sqrt()
-//     }
-//
-//     pub fn calc_entropy(&self) -> f64 {
-//         let tmp = self.calc_g_sum(
-//             |x| {
-//                 if x > 0.0 { x * x.log2() } else { 0.0 }
-//             },
-//             false,
-//         );
-//         (self.bucket_size as f64).log2() - tmp / (self.bucket_size as f64)
-//     }
-//
-//     pub fn calc_card(&self) -> f64 {
-//         self.calc_g_sum(|_| 1.0, true)
-//     }
-//
-//     pub fn merge_with(&mut self, other: &UnivMon) {
-//         for i in 0..self.layer {
-//             self.cs_layers[i].merge(&other.cs_layers[i]);
-//
-//             let mut topk = HHHeap::new(self.k);
-//             for item in self.hh_layers[i].heap() {
-//                 topk.update(&item.key, item.count);
-//             }
-//
-//             for item in other.hh_layers[i].heap() {
-//                 let count = if let Some(index) = topk.find(&item.key) {
-//                     topk.heap()[index].count + item.count
-//                 } else {
-//                     item.count
-//                 };
-//                 topk.update(&item.key, count);
-//             }
-//
-//             self.hh_layers[i] = topk;
-//         }
-//     }
-// }
