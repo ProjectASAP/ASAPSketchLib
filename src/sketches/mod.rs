@@ -62,6 +62,10 @@ pub mod countminsketch_hll;
 #[cfg(feature = "experimental")]
 pub use countminsketch_hll::CountMinHll;
 
+/// Sliding-window frequency estimation with adaptive zoom (MicroscopeSketch).
+#[cfg(feature = "experimental")]
+pub mod microscope;
+
 /// Hashing path markers for matrix-backed sketches.
 pub mod mode;
 pub use mode::{FastPath, RegularPath};
