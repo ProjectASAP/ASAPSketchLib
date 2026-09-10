@@ -6,10 +6,11 @@
 //!
 //! Internally this is a Count Sketch row/column grid where **every `(row, col)`
 //! bucket is a small HyperLogLog**. Each insert routes `key` to one column per
-//! row (exactly like Count Sketch) and records `distinct_value` into that
-//! bucket's HLL registers. Querying a key reads the same bucket(s) and returns
-//! the median HLL estimate across rows, which suppresses collision noise from
-//! other keys that happen to share a bucket.
+//! row and records `distinct_value` into that bucket's HLL registers.
+//! Querying a key reads the same buckets and returns the **minimum** HLL
+//! estimate across rows: a bucket accumulates the distinct values of every
+//! key that lands in it, so each row can only over-report, and the smallest
+//! row is the tightest bound.
 //!
 //! Storage is a [`Vector3D<u8>`](crate::Vector3D) of shape
 //! `rows × cols × 2^precision`: the third dimension is the HLL register array
@@ -30,9 +31,6 @@
 //!   avoiding unpredictable branches on dense streams.
 //! - **Single-pass bucket estimator**: `estimate_bucket` fuses the harmonic sum
 //!   and zero-count into one loop traversal.
-//! - **Fast median**: uses [`crate::compute_median_inline_f64`] which applies
-//!   branchless sorting networks for row counts ≤ 5, and falls back to
-//!   `sort_unstable` for larger counts.
 //!
 //! # Related sketches
 //!
@@ -50,7 +48,7 @@
 //! - Flajolet, Fusy, Gandouet & Meunier, "HyperLogLog: the analysis of a
 //!   near-optimal cardinality estimation algorithm," 2007.
 
-use crate::{DataInput, DefaultXxHasher, SketchHasher, Vector3D, compute_median_inline_f64};
+use crate::{DataInput, DefaultXxHasher, SketchHasher, Vector3D};
 use rmp_serde::{
     decode::Error as RmpDecodeError, encode::Error as RmpEncodeError, from_slice, to_vec_named,
 };
@@ -273,20 +271,21 @@ impl<H: SketchHasher> CountHll<H> {
     /// Estimates the number of distinct values seen for `key`.
     ///
     /// Each of the `rows` buckets `key` maps to holds an HLL over the
-    /// `distinct_value`s of all keys that hash to that bucket; the median
-    /// across rows suppresses collision over-counting.
+    /// `distinct_value`s of *every* key that hashes to that bucket, so a
+    /// bucket can only ever over-report this key's distinct count. The
+    /// error is therefore one-sided and the minimum across rows is the
+    /// tightest available estimate.
     pub fn estimate(&self, key: &DataInput) -> f64 {
         let rows = self.buckets.rows();
         let col_hash = H::hash128_seeded(0, key);
-        let mut estimates: Vec<f64> = (0..rows)
+        (0..rows)
             .map(|r| {
                 estimate_bucket(
                     self.buckets
                         .bucket_slice(r, self.col_from_packed(col_hash, r)),
                 )
             })
-            .collect();
-        compute_median_inline_f64(&mut estimates)
+            .fold(f64::INFINITY, f64::min)
     }
 
     /// Merges another sketch by taking the element-wise register maximum.
@@ -441,7 +440,8 @@ mod tests {
         }
         let est_b = sk.estimate(&kb);
         // key_B shares a bucket with key_A only by collision; with 64 cols the
-        // collision probability is low and the median suppresses it.
+        // collision probability is low, and taking the minimum across rows
+        // discards any row where such a collision happened.
         assert!(
             est_b < 50.0,
             "key_B estimate {est_b} should be near zero (no inserts for key_B)"
