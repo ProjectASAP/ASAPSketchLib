@@ -56,9 +56,9 @@ pub use bloom::{
 pub mod countsketch;
 pub use countsketch::Count;
 
-/// Count Sketch grid with a per-bucket HyperLogLog (distinct-count) sketch.
-pub mod countsketch_hll;
-pub use countsketch_hll::CountHll;
+/// Count-Min-shaped grid with a per-bucket HyperLogLog (distinct-count) sketch.
+pub mod countminsketch_hll;
+pub use countminsketch_hll::CountMinHll;
 
 /// Hashing path markers for matrix-backed sketches.
 pub mod mode;

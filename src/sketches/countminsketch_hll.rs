@@ -1,11 +1,12 @@
-//! Count Sketch + HyperLogLog hybrid (`CountHll`).
+//! Count-Min grid of HyperLogLogs (`CountMinHll`).
 //!
 //! A grouped distinct-count sketch: given a stream of `(key, distinct_value)`
-//! pairs, [`CountHll::estimate`] answers "how many distinct `distinct_value`s
-//! have been seen for this `key`?"
+//! pairs, [`CountMinHll::estimate`] answers "how many distinct
+//! `distinct_value`s have been seen for this `key`?"
 //!
-//! Internally this is a Count Sketch row/column grid where **every `(row, col)`
-//! bucket is a small HyperLogLog**. Each insert routes `key` to one column per
+//! The grid is Count-Min-shaped — `rows` independent hash rows, a minimum
+//! across them, and no Count-Sketch sign anywhere — where **every
+//! `(row, col)` bucket is a small HyperLogLog**. Each insert routes `key` to one column per
 //! row and records `distinct_value` into that bucket's HLL registers.
 //! Querying a key reads the same buckets and returns the **minimum** HLL
 //! estimate across rows: a bucket accumulates the distinct values of every
@@ -39,13 +40,14 @@
 //!   counting (no per-key breakdown).
 //! - [`crate::sketch_framework::hydra`] (`Hydra` with `HydraCounter::HLL`) —
 //!   also answers per-key distinct-count queries, but stores one heap-allocated
-//!   HLL object per grid cell. `CountHll` flattens all registers into a single
+//!   HLL object per grid cell. `CountMinHll` flattens all registers into a single
 //!   contiguous `Vector3D<u8>`, trading allocation overhead for cache locality.
 //!
 //! # References
 //!
-//! - Charikar, Chen & Farach-Colton, "Finding Frequent Items in Data Streams,"
-//!   ICALP 2002.
+//! - Cormode & Muthukrishnan, "An Improved Data Stream Summary: The Count-Min
+//!   Sketch and its Applications," J. Algorithms 55(1), 2005.
+//!   <https://www.cs.rutgers.edu/~muthu/cm-jal.pdf>
 //! - Flajolet, Fusy, Gandouet & Meunier, "HyperLogLog: the analysis of a
 //!   near-optimal cardinality estimation algorithm," 2007.
 
@@ -61,15 +63,15 @@ const DEFAULT_ROW_NUM: usize = 4;
 const DEFAULT_COL_NUM: usize = 64;
 const DEFAULT_PRECISION: u32 = 8;
 
-/// A Count Sketch grid whose cells are per-bucket HyperLogLog sketches.
+/// A Count-Min-shaped grid whose cells are per-bucket HyperLogLog sketches.
 ///
 /// `rows` independent hash rows each route an item to one of `cols` columns; the
 /// selected `(row, col)` bucket holds a `2^precision`-register HyperLogLog that
-/// records the item. See the [module docs](crate::sketches::countsketch_hll) for
+/// records the item. See the [module docs](crate::sketches::countminsketch_hll) for
 /// the supported queries and the performance notes for the optimization strategy.
 #[derive(Clone, Debug, Serialize)]
 #[serde(bound = "")]
-pub struct CountHll<H: SketchHasher = DefaultXxHasher> {
+pub struct CountMinHll<H: SketchHasher = DefaultXxHasher> {
     buckets: Vector3D<u8>,
     precision: u32,
     #[serde(skip)]
@@ -82,14 +84,14 @@ pub struct CountHll<H: SketchHasher = DefaultXxHasher> {
 // The derived p_mask is recomputed on load, and column routing is owned by
 // Vector3D, so stale or tampered bytes cannot produce inconsistent routing.
 #[derive(Deserialize)]
-struct CountHllSeed {
+struct CountMinHllSeed {
     buckets: Vector3D<u8>,
     precision: u32,
 }
 
-impl<'de, H: SketchHasher> Deserialize<'de> for CountHll<H> {
+impl<'de, H: SketchHasher> Deserialize<'de> for CountMinHll<H> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let CountHllSeed { buckets, precision } = CountHllSeed::deserialize(deserializer)?;
+        let CountMinHllSeed { buckets, precision } = CountMinHllSeed::deserialize(deserializer)?;
         let rows = buckets.rows();
         let cols = buckets.cols();
         if !(1..=18).contains(&precision) {
@@ -130,13 +132,13 @@ impl<'de, H: SketchHasher> Deserialize<'de> for CountHll<H> {
     }
 }
 
-impl Default for CountHll<DefaultXxHasher> {
+impl Default for CountMinHll<DefaultXxHasher> {
     fn default() -> Self {
         Self::with_dimensions(DEFAULT_ROW_NUM, DEFAULT_COL_NUM, DEFAULT_PRECISION)
     }
 }
 
-impl<H: SketchHasher> CountHll<H> {
+impl<H: SketchHasher> CountMinHll<H> {
     /// Creates a sketch with the requested grid size and per-bucket HLL precision.
     ///
     /// `precision` is the HyperLogLog precision `p`; each bucket holds `2^p`
@@ -314,7 +316,7 @@ mod tests {
 
     #[test]
     fn default_initializes_expected_dimensions() {
-        let sk = CountHll::default();
+        let sk = CountMinHll::default();
         assert_eq!(sk.rows(), DEFAULT_ROW_NUM);
         assert_eq!(sk.cols(), DEFAULT_COL_NUM);
         assert_eq!(sk.precision(), DEFAULT_PRECISION);
@@ -324,7 +326,7 @@ mod tests {
 
     #[test]
     fn with_dimensions_uses_custom_sizes() {
-        let sk = CountHll::<DefaultXxHasher>::with_dimensions(3, 16, 6);
+        let sk = CountMinHll::<DefaultXxHasher>::with_dimensions(3, 16, 6);
         assert_eq!(sk.rows(), 3);
         assert_eq!(sk.cols(), 16);
         assert_eq!(sk.precision(), 6);
@@ -335,7 +337,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "cols must be a power of two")]
     fn with_dimensions_rejects_non_power_of_two_cols() {
-        CountHll::<DefaultXxHasher>::with_dimensions(3, 17, 6);
+        CountMinHll::<DefaultXxHasher>::with_dimensions(3, 17, 6);
     }
 
     #[test]
@@ -343,7 +345,7 @@ mod tests {
         // Power-of-two cols means the column index is a clean slice of the
         // packed hash, so rows are independent and the load is flat. Check
         // both: every column gets hit, and two rows disagree often.
-        let sk = CountHll::<DefaultXxHasher>::with_dimensions(4, 16, 4);
+        let sk = CountMinHll::<DefaultXxHasher>::with_dimensions(4, 16, 4);
         let hash_for = |i: u64| DefaultXxHasher::hash128_seeded(0, &DataInput::U64(i));
         let mut seen = [0usize; 16];
         let mut rows_disagree = 0usize;
@@ -376,7 +378,7 @@ mod tests {
 
     #[test]
     fn same_distinct_value_repeated_counts_as_one() {
-        let mut sk = CountHll::<DefaultXxHasher>::default();
+        let mut sk = CountMinHll::<DefaultXxHasher>::default();
         let k = key("user_A");
         let v = val(42);
         for _ in 0..500 {
@@ -388,7 +390,7 @@ mod tests {
 
     #[test]
     fn distinct_values_accumulate_per_key() {
-        let mut sk = CountHll::<DefaultXxHasher>::with_dimensions(4, 64, 8);
+        let mut sk = CountMinHll::<DefaultXxHasher>::with_dimensions(4, 64, 8);
         let k = key("user_A");
         let n = 500u64;
         for i in 0..n {
@@ -404,7 +406,7 @@ mod tests {
 
     #[test]
     fn independent_keys_do_not_inflate_each_other() {
-        let mut sk = CountHll::<DefaultXxHasher>::with_dimensions(4, 64, 8);
+        let mut sk = CountMinHll::<DefaultXxHasher>::with_dimensions(4, 64, 8);
         // Insert 200 distinct values for key_A and 0 for key_B.
         let ka = key("key_A");
         let kb = key("key_B");
@@ -423,8 +425,8 @@ mod tests {
 
     #[test]
     fn merge_unions_distinct_values_per_key() {
-        let mut a = CountHll::<DefaultXxHasher>::default();
-        let mut b = CountHll::<DefaultXxHasher>::default();
+        let mut a = CountMinHll::<DefaultXxHasher>::default();
+        let mut b = CountMinHll::<DefaultXxHasher>::default();
         let k = key("user_A");
         for i in 0..1000u64 {
             a.insert(&k, &val(i));
@@ -448,8 +450,8 @@ mod tests {
 
     #[test]
     fn merge_rejects_a_different_shape_and_leaves_the_target_alone() {
-        let mut a = CountHll::<DefaultXxHasher>::with_dimensions(4, 32, 8);
-        let b = CountHll::<DefaultXxHasher>::with_dimensions(4, 64, 8);
+        let mut a = CountMinHll::<DefaultXxHasher>::with_dimensions(4, 32, 8);
+        let b = CountMinHll::<DefaultXxHasher>::with_dimensions(4, 64, 8);
         let k = key("user_A");
         for i in 0..300u64 {
             a.insert(&k, &val(i));
@@ -469,13 +471,13 @@ mod tests {
 
     #[test]
     fn serialize_round_trip_preserves_estimates() {
-        let mut sk = CountHll::<DefaultXxHasher>::with_dimensions(4, 32, 8);
+        let mut sk = CountMinHll::<DefaultXxHasher>::with_dimensions(4, 32, 8);
         let k = key("user_A");
         for i in 0..1500u64 {
             sk.insert(&k, &val(i));
         }
         let bytes = sk.serialize_to_bytes().expect("serialize");
-        let restored = CountHll::<DefaultXxHasher>::deserialize_from_bytes(&bytes).expect("decode");
+        let restored = CountMinHll::<DefaultXxHasher>::deserialize_from_bytes(&bytes).expect("decode");
 
         assert_eq!(sk.rows(), restored.rows());
         assert_eq!(sk.cols(), restored.cols());
@@ -490,12 +492,12 @@ mod tests {
         let vals: Vec<DataInput<'static>> = (0..500u64).map(val).collect();
         let pairs: Vec<(&DataInput, &DataInput)> = vals.iter().map(|v| (&k, v)).collect();
 
-        let mut sk_seq = CountHll::<DefaultXxHasher>::with_dimensions(4, 32, 8);
+        let mut sk_seq = CountMinHll::<DefaultXxHasher>::with_dimensions(4, 32, 8);
         for v in &vals {
             sk_seq.insert(&k, v);
         }
 
-        let mut sk_batch = CountHll::<DefaultXxHasher>::with_dimensions(4, 32, 8);
+        let mut sk_batch = CountMinHll::<DefaultXxHasher>::with_dimensions(4, 32, 8);
         sk_batch.insert_many(&pairs);
 
         assert_eq!(
@@ -509,13 +511,13 @@ mod tests {
     #[should_panic(expected = "exceeds the 128-bit packed column hash")]
     fn too_many_rows_for_col_bits_panics() {
         // cols=64 → column bits=6 → 22x6=132 > 128
-        CountHll::<DefaultXxHasher>::with_dimensions(22, 64, 8);
+        CountMinHll::<DefaultXxHasher>::with_dimensions(22, 64, 8);
     }
 
     #[test]
     fn max_rows_within_bit_capacity_is_accepted() {
         // cols=64 → column bits=6 → 21x6=126 <= 128
-        let sk = CountHll::<DefaultXxHasher>::with_dimensions(21, 64, 6);
+        let sk = CountMinHll::<DefaultXxHasher>::with_dimensions(21, 64, 6);
         assert_eq!(sk.rows(), 21);
     }
 
@@ -523,10 +525,10 @@ mod tests {
     fn deserialize_rejects_depth_mismatch() {
         // Build a valid sketch, then tamper with the backing storage to create
         // a depth that doesn't match 2^precision.
-        let sk = CountHll::<DefaultXxHasher>::with_dimensions(4, 32, 8);
+        let sk = CountMinHll::<DefaultXxHasher>::with_dimensions(4, 32, 8);
         let bytes = sk.serialize_to_bytes().expect("serialize");
         // Deserializing the untampered bytes must succeed.
-        CountHll::<DefaultXxHasher>::deserialize_from_bytes(&bytes).expect("decode");
+        CountMinHll::<DefaultXxHasher>::deserialize_from_bytes(&bytes).expect("decode");
         // Depth-mismatch detection is validated by the invariant check below.
         let expected_depth = 1usize << sk.precision();
         assert_eq!(sk.registers_per_bucket(), expected_depth);
@@ -534,9 +536,9 @@ mod tests {
 
     #[test]
     fn deserialize_recomputes_derived_fields() {
-        let sk = CountHll::<DefaultXxHasher>::with_dimensions(4, 32, 8);
+        let sk = CountMinHll::<DefaultXxHasher>::with_dimensions(4, 32, 8);
         let bytes = sk.serialize_to_bytes().expect("serialize");
-        let restored = CountHll::<DefaultXxHasher>::deserialize_from_bytes(&bytes).expect("decode");
+        let restored = CountMinHll::<DefaultXxHasher>::deserialize_from_bytes(&bytes).expect("decode");
         assert_eq!(restored.p_mask, (1u64 << 8) - 1);
         // Column routing is owned by the storage and rebuilt from `cols`.
         assert_eq!(restored.as_storage().get_mask_bits(), 5); // 32.ilog2()
