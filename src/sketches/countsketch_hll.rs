@@ -25,8 +25,8 @@
 //!   bits for all rows; a separate `hash64_seeded(distinct_value)` provides the
 //!   HLL register/rank. Total: **2 hash calls per insert**, regardless of row
 //!   count.
-//! - **Bit-mask column selection**: when `cols` is a power of two the modulo is
-//!   replaced by a bitmask (no division).
+//! - **Bit-mask column selection**: `cols` is required to be a power of two,
+//!   so a column index is a mask of the packed hash with no division.
 //! - **Branchless register update**: `u8::max` compiles to a conditional move,
 //!   avoiding unpredictable branches on dense streams.
 //! - **Single-pass bucket estimator**: `estimate_bucket` fuses the harmonic sum
@@ -73,16 +73,12 @@ pub struct CountHll<H: SketchHasher = DefaultXxHasher> {
     #[serde(skip)]
     p_mask: u64,
     #[serde(skip)]
-    col_mask_bits: u32,
-    #[serde(skip)]
-    col_mask: Option<usize>,
-    #[serde(skip)]
     _hasher: PhantomData<H>,
 }
 
 // Seed struct: only the two authoritative fields are read from the wire.
-// Derived fields (p_mask, col_mask_bits, col_mask) are recomputed on load,
-// so stale or tampered bytes can never produce internally inconsistent routing.
+// The derived p_mask is recomputed on load, and column routing is owned by
+// Vector3D, so stale or tampered bytes cannot produce inconsistent routing.
 #[derive(Deserialize)]
 struct CountHllSeed {
     buckets: Vector3D<u8>,
@@ -110,30 +106,23 @@ impl<'de, H: SketchHasher> Deserialize<'de> for CountHll<H> {
                 precision
             )));
         }
-        let p_mask = (1u64 << precision) - 1;
-        let col_mask_bits = if cols.is_power_of_two() {
-            cols.ilog2()
-        } else {
-            cols.ilog2() + 1
-        };
-        let required_bits = rows.saturating_mul(col_mask_bits as usize);
+        if !cols.is_power_of_two() {
+            return Err(serde::de::Error::custom(format!(
+                "cols ({cols}) must be a power of two"
+            )));
+        }
+        let col_bits = buckets.get_mask_bits() as usize;
+        let required_bits = rows.saturating_mul(col_bits);
         if required_bits > 128 {
             return Err(serde::de::Error::custom(format!(
-                "rows ({rows}) × col_mask_bits ({col_mask_bits}) = {required_bits} exceeds the \
+                "rows ({rows}) × column bits ({col_bits}) = {required_bits} exceeds the \
                  128-bit packed column hash; reduce rows or cols"
             )));
         }
-        let col_mask = if cols.is_power_of_two() {
-            Some(cols - 1)
-        } else {
-            None
-        };
         Ok(Self {
             buckets,
             precision,
-            p_mask,
-            col_mask_bits,
-            col_mask,
+            p_mask: (1u64 << precision) - 1,
             _hasher: PhantomData,
         })
     }
@@ -149,39 +138,35 @@ impl<H: SketchHasher> CountHll<H> {
     /// Creates a sketch with the requested grid size and per-bucket HLL precision.
     ///
     /// `precision` is the HyperLogLog precision `p`; each bucket holds `2^p`
-    /// registers. Panics if `precision` is not in `1..=18`.
+    /// registers.
+    ///
+    /// Panics if `precision` is not in `1..=18`, if `rows` is zero, if `cols`
+    /// is not a power of two, or if the per-row column bits do not fit the
+    /// 128-bit packed hash.
     pub fn with_dimensions(rows: usize, cols: usize, precision: u32) -> Self {
         assert!(
             (1..=18).contains(&precision),
             "precision must be in 1..=18, got {precision}"
         );
         assert!(rows > 0 && cols > 0, "rows and cols must be non-zero");
+        assert!(
+            cols.is_power_of_two(),
+            "cols must be a power of two, got {cols}"
+        );
         let depth = 1usize << precision;
         let mut buckets = Vector3D::init(rows, cols, depth);
         buckets.fill(0);
-        let p_mask = (1u64 << precision) - 1;
-        let col_mask_bits = if cols.is_power_of_two() {
-            cols.ilog2()
-        } else {
-            cols.ilog2() + 1
-        };
+        let col_bits = buckets.get_mask_bits() as usize;
         assert!(
-            rows.saturating_mul(col_mask_bits as usize) <= 128,
-            "rows ({rows}) × col_mask_bits ({col_mask_bits}) = {} exceeds the 128-bit packed \
+            rows.saturating_mul(col_bits) <= 128,
+            "rows ({rows}) × column bits ({col_bits}) = {} exceeds the 128-bit packed \
              column hash; reduce rows or cols",
-            rows * col_mask_bits as usize
+            rows * col_bits
         );
-        let col_mask = if cols.is_power_of_two() {
-            Some(cols - 1)
-        } else {
-            None
-        };
         Self {
             buckets,
             precision,
-            p_mask,
-            col_mask_bits,
-            col_mask,
+            p_mask: (1u64 << precision) - 1,
             _hasher: PhantomData,
         }
     }
@@ -216,19 +201,6 @@ impl<H: SketchHasher> CountHll<H> {
         &mut self.buckets
     }
 
-    /// Derives the column for `row` from a pre-computed packed column hash.
-    ///
-    /// Extracts `col_mask_bits` bits at the position for `row`, then reduces
-    /// modulo `cols` (or bit-masks when `cols` is a power of two).
-    #[inline(always)]
-    fn col_from_packed(&self, packed: u128, row: usize) -> usize {
-        let shifted = (packed >> (self.col_mask_bits as usize * row)) as usize;
-        match self.col_mask {
-            Some(mask) => shifted & mask,
-            None => shifted % self.buckets.cols(),
-        }
-    }
-
     /// Computes the HLL `(register_index, rank)` pair from the HLL hash.
     ///
     /// The seed used (`rows`) is distinct from the per-row column seeds (`0..rows`),
@@ -253,12 +225,14 @@ impl<H: SketchHasher> CountHll<H> {
         let col_hash = H::hash128_seeded(0, key);
         let hll_hash = H::hash64_seeded(rows, distinct_value);
         let (index, rank) = self.register_and_rank_from_hash(hll_hash);
-        for r in 0..rows {
-            let col = self.col_from_packed(col_hash, r);
-            // Branchless max: compiles to a conditional move on x86/ARM.
-            let bucket = self.buckets.bucket_slice_mut(r, col);
-            bucket[index] = bucket[index].max(rank);
-        }
+        self.buckets.fast_insert(
+            |registers, &(index, rank): &(usize, u8), _row| {
+                // Branchless max: compiles to a conditional move on x86/ARM.
+                registers[index] = registers[index].max(rank);
+            },
+            (index, rank),
+            &col_hash,
+        );
     }
 
     /// Inserts each `(key, distinct_value)` pair in the slice.
@@ -276,16 +250,11 @@ impl<H: SketchHasher> CountHll<H> {
     /// error is therefore one-sided and the minimum across rows is the
     /// tightest available estimate.
     pub fn estimate(&self, key: &DataInput) -> f64 {
-        let rows = self.buckets.rows();
         let col_hash = H::hash128_seeded(0, key);
-        (0..rows)
-            .map(|r| {
-                estimate_bucket(
-                    self.buckets
-                        .bucket_slice(r, self.col_from_packed(col_hash, r)),
-                )
+        self.buckets
+            .fast_query_min(&col_hash, |registers, _row, _hash| {
+                estimate_bucket(registers)
             })
-            .fold(f64::INFINITY, f64::min)
     }
 
     /// Merges another sketch by taking the element-wise register maximum.
@@ -352,7 +321,7 @@ fn estimate_bucket(registers: &[u8]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DataInput;
+    use crate::{DataInput, MatrixFastHash};
 
     fn key(s: &'static str) -> DataInput<'static> {
         DataInput::Str(s)
@@ -374,30 +343,53 @@ mod tests {
 
     #[test]
     fn with_dimensions_uses_custom_sizes() {
-        let sk = CountHll::<DefaultXxHasher>::with_dimensions(3, 17, 6);
+        let sk = CountHll::<DefaultXxHasher>::with_dimensions(3, 16, 6);
         assert_eq!(sk.rows(), 3);
-        assert_eq!(sk.cols(), 17);
+        assert_eq!(sk.cols(), 16);
         assert_eq!(sk.precision(), 6);
         assert_eq!(sk.registers_per_bucket(), 64);
-        assert_eq!(sk.as_storage().len(), 3 * 17 * 64);
+        assert_eq!(sk.as_storage().len(), 3 * 16 * 64);
     }
 
     #[test]
-    fn with_dimensions_power_of_two_cols_uses_bitmask() {
-        let sk = CountHll::<DefaultXxHasher>::with_dimensions(3, 64, 6);
+    #[should_panic(expected = "cols must be a power of two")]
+    fn with_dimensions_rejects_non_power_of_two_cols() {
+        CountHll::<DefaultXxHasher>::with_dimensions(3, 17, 6);
+    }
+
+    #[test]
+    fn every_column_is_reachable_and_no_row_repeats_another() {
+        // Power-of-two cols means the column index is a clean slice of the
+        // packed hash, so rows are independent and the load is flat. Check
+        // both: every column gets hit, and two rows disagree often.
+        let sk = CountHll::<DefaultXxHasher>::with_dimensions(4, 16, 4);
+        let hash_for = |i: u64| DefaultXxHasher::hash128_seeded(0, &DataInput::U64(i));
+        let mut seen = [0usize; 16];
+        let mut rows_disagree = 0usize;
+        for i in 0..4_000u64 {
+            let h = hash_for(i);
+            let c0 = MatrixFastHash::col_for_row(&h, 0, sk.cols());
+            let c1 = MatrixFastHash::col_for_row(&h, 1, sk.cols());
+            seen[c0] += 1;
+            if c0 != c1 {
+                rows_disagree += 1;
+            }
+        }
         assert!(
-            sk.col_mask.is_some(),
-            "expected bit-mask path for power-of-two cols"
+            seen.iter().all(|&n| n > 0),
+            "every column must be reachable: {seen:?}"
         );
-        assert_eq!(sk.col_mask, Some(63));
-    }
-
-    #[test]
-    fn with_dimensions_non_power_of_two_cols_uses_modulo() {
-        let sk = CountHll::<DefaultXxHasher>::with_dimensions(3, 17, 6);
+        // A flat 16-way split of 4000 keys puts ~250 in each column; allow a
+        // generous band, but nothing like the 2x a folded modulo would give.
         assert!(
-            sk.col_mask.is_none(),
-            "expected modulo path for non-power-of-two cols"
+            seen.iter().all(|&n| (150..400).contains(&n)),
+            "column load is lopsided: {seen:?}"
+        );
+        // Independent rows collide on 1/16 of keys; anything near 4000 would
+        // mean row 1 is a copy of row 0.
+        assert!(
+            rows_disagree > 3_000,
+            "rows 0 and 1 agree far too often ({rows_disagree} of 4000 differ)"
         );
     }
 
@@ -514,13 +506,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "exceeds the 128-bit packed column hash")]
     fn too_many_rows_for_col_bits_panics() {
-        // cols=64 → col_mask_bits=6 → 22×6=132 > 128
+        // cols=64 → column bits=6 → 22x6=132 > 128
         CountHll::<DefaultXxHasher>::with_dimensions(22, 64, 8);
     }
 
     #[test]
     fn max_rows_within_bit_capacity_is_accepted() {
-        // cols=64 → col_mask_bits=6 → 21×6=126 ≤ 128
+        // cols=64 → column bits=6 → 21x6=126 <= 128
         let sk = CountHll::<DefaultXxHasher>::with_dimensions(21, 64, 6);
         assert_eq!(sk.rows(), 21);
     }
@@ -544,7 +536,7 @@ mod tests {
         let bytes = sk.serialize_to_bytes().expect("serialize");
         let restored = CountHll::<DefaultXxHasher>::deserialize_from_bytes(&bytes).expect("decode");
         assert_eq!(restored.p_mask, (1u64 << 8) - 1);
-        assert_eq!(restored.col_mask_bits, 5); // 32.ilog2() = 5
-        assert_eq!(restored.col_mask, Some(31)); // 32 - 1
+        // Column routing is owned by the storage and rebuilt from `cols`.
+        assert_eq!(restored.as_storage().get_mask_bits(), 5); // 32.ilog2()
     }
 }
