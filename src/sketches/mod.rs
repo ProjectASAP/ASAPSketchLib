@@ -49,6 +49,9 @@ pub use coco::CocoBucket;
 pub mod countsketch;
 pub use countsketch::Count;
 
+pub mod bloom;
+pub use bloom::{BloomFilter, CountingBloomFilter};
+
 /// Hashing path markers for matrix-backed sketches.
 pub mod mode;
 pub use mode::{FastPath, RegularPath};
