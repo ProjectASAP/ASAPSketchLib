@@ -1,5 +1,6 @@
 //! E2E suites for feature-gated (`experimental`) sketches: KMV cardinality,
-//! UniformSampling's retention rate, and both tiers of EHUnivOptimized.
+//! UniformSampling's retention rate, both tiers of EHUnivOptimized, and
+//! CountMinHll's per-key distinct counts.
 //!
 //! CocoSketch and the Elastic sketch are a family of their own;
 //! `tests/e2e_heavy_hitters.rs` covers them.
@@ -14,9 +15,10 @@ use common::specs::{CardinalityConfidenceSpec, PrioritySampleSpec, Tally};
 use common::{FreqTruth, assert_between, uniform_u64, zipf_u64};
 
 use asap_sketchlib::{
-    DataInput, EHUnivOptimized, EHUnivQueryResult, HeapItem, KMV, UniformSampling,
+    CountMinHll, DataInput, DefaultXxHasher, EHUnivOptimized, EHUnivQueryResult, HeapItem, KMV,
+    MatrixFastHash, SketchHasher, UniformSampling,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------- KMV
 
@@ -1068,5 +1070,220 @@ mod documented_matrix {
         uniform_sampling_input_2_retains_its_documented_budget => 2;
         uniform_sampling_input_7_retains_its_documented_budget => 7;
         uniform_sampling_input_8_retains_its_documented_budget => 8;
+    }
+}
+
+// -------------------------------------------------------------- CountMinHll
+
+/// Gaussian quantile for the per-bucket HyperLogLog band.
+///
+/// Same `z = 4` as the KMV suite above: a two-sided tail of 6.3e-5 per check
+/// under the normal approximation to HyperLogLog's relative error.
+const CMHLL_Z: f64 = 4.0;
+
+/// The column `key` occupies in each row, computed the way the sketch
+/// computes it.
+///
+/// `CountMinHll::insert` hashes the key once with `hash128_seeded(0, ..)` and
+/// hands that value to `Vector3D`, which decodes one column per row through
+/// `MatrixFastHash`. Both calls are public, so a test can reproduce the
+/// routing exactly rather than guessing at it — which is what lets the
+/// assertions below separate a collision-free key from a collided one instead
+/// of quantifying over "probably clean".
+fn cmhll_columns(key: u64, rows: usize, cols: usize) -> Vec<usize> {
+    let packed = DefaultXxHasher::hash128_seeded(0, &DataInput::U64(key));
+    (0..rows)
+        .map(|row| MatrixFastHash::col_for_row(&packed, row, cols))
+        .collect()
+}
+
+/// For each key, the rows in which no other live key shares its column.
+fn cmhll_clean_rows(keys: &[u64], rows: usize, cols: usize) -> HashMap<u64, Vec<usize>> {
+    let routes: HashMap<u64, Vec<usize>> = keys
+        .iter()
+        .map(|&k| (k, cmhll_columns(k, rows, cols)))
+        .collect();
+    // occupancy[row][col] = how many live keys land there.
+    let mut occupancy = vec![vec![0usize; cols]; rows];
+    for cols_of_key in routes.values() {
+        for (row, &col) in cols_of_key.iter().enumerate() {
+            occupancy[row][col] += 1;
+        }
+    }
+    routes
+        .iter()
+        .map(|(&k, cols_of_key)| {
+            let clean = cols_of_key
+                .iter()
+                .enumerate()
+                .filter(|&(row, &col)| occupancy[row][col] == 1)
+                .map(|(row, _)| row)
+                .collect();
+            (k, clean)
+        })
+        .collect()
+}
+
+/// Fills a sketch with `keys`, giving key `i` a distinct-value set of its own,
+/// and returns the exact per-key distinct counts.
+fn cmhll_load(sk: &mut CountMinHll, keys: &[u64]) -> HashMap<u64, usize> {
+    let mut truth = HashMap::new();
+    for &key in keys {
+        // Distinct counts spread across HyperLogLog's linear-counting regime
+        // (below 2.5m) and its harmonic regime above it.
+        let n = 40 + key * 37;
+        let mut seen = HashSet::new();
+        for i in 0..n {
+            let value = key * 1_000_000 + i;
+            sk.insert(&DataInput::U64(key), &DataInput::U64(value));
+            seen.insert(value);
+        }
+        truth.insert(key, seen.len());
+    }
+    truth
+}
+
+/// A key whose rows are all collision-free is answered by its own
+/// HyperLogLog, so it is held to HyperLogLog's band and nothing looser.
+///
+/// The register index and rank of a value depend only on the value — not on
+/// which `(row, col)` bucket receives it — so a key writes the *same* register
+/// array into every bucket it touches. A bucket shared with no one therefore
+/// holds exactly that array, and a shared bucket holds it element-wise
+/// maximised with other keys' arrays, which can only raise the estimate. Two
+/// consequences are asserted here:
+///
+/// 1. A key with at least one clean row is answered by that row, because the
+///    minimum across rows cannot fall below it.
+/// 2. Two clean rows of the same key hold byte-identical buckets.
+///
+/// Neither is a tolerance anyone chose: the band comes from
+/// `CardinalityConfidenceSpec::hll` at the sketch's own precision, and the
+/// bucket equality is exact.
+#[test]
+fn count_min_hll_answers_a_collision_free_key_with_its_hyperloglog_alone() {
+    const ROWS: usize = 4;
+    const COLS: usize = 512;
+    const PRECISION: u32 = 10;
+
+    let keys: Vec<u64> = (0..120).collect();
+    let mut sk = CountMinHll::with_dimensions(ROWS, COLS, PRECISION);
+    let truth = cmhll_load(&mut sk, &keys);
+    let clean = cmhll_clean_rows(&keys, ROWS, COLS);
+    let spec = CardinalityConfidenceSpec::hll(PRECISION, CMHLL_Z);
+
+    // 120 keys over 512 columns leaves a key with no clean row at all in
+    // roughly 0.2% of cases; if the sketch were routing every row the same
+    // way, this count would collapse and the tight check below would silently
+    // stop running.
+    let with_clean_row = clean.values().filter(|rows| !rows.is_empty()).count();
+    assert!(
+        with_clean_row >= 108,
+        "only {with_clean_row} of {} keys have a collision-free row; routing is suspect",
+        keys.len()
+    );
+
+    for &key in &keys {
+        let clean_rows = &clean[&key];
+        if clean_rows.is_empty() {
+            continue;
+        }
+        let n = truth[&key];
+        let est = sk.estimate(&DataInput::U64(key));
+        if let Err(detail) = spec.check(est, n) {
+            panic!("key {key} has a collision-free row but {detail}");
+        }
+
+        // Every clean bucket of a key is the same bucket, byte for byte.
+        let cols_of_key = cmhll_columns(key, ROWS, COLS);
+        let first = sk
+            .as_storage()
+            .bucket_slice(clean_rows[0], cols_of_key[clean_rows[0]]);
+        for &row in &clean_rows[1..] {
+            assert_eq!(
+                sk.as_storage().bucket_slice(row, cols_of_key[row]),
+                first,
+                "key {key}: clean rows {} and {row} must hold identical registers",
+                clean_rows[0]
+            );
+        }
+    }
+}
+
+/// Collisions can only push an estimate up, so the sketch never reports
+/// materially fewer distinct values than a key really has — even when every
+/// row of every key is contended.
+///
+/// This is the one-sided guarantee the module documents, and it is what
+/// justifies taking a minimum across rows. The configuration is deliberately
+/// too small: 200 keys over 32 columns leaves essentially no key with a clean
+/// row, so the only thing holding the answer up is the guarantee itself.
+#[test]
+fn count_min_hll_never_under_reports_under_heavy_collision() {
+    const ROWS: usize = 4;
+    const COLS: usize = 32;
+    const PRECISION: u32 = 10;
+
+    let keys: Vec<u64> = (0..200).collect();
+    let mut sk = CountMinHll::with_dimensions(ROWS, COLS, PRECISION);
+    let truth = cmhll_load(&mut sk, &keys);
+    let spec = CardinalityConfidenceSpec::hll(PRECISION, CMHLL_Z);
+
+    // Sanity that this configuration really is the contended one it claims.
+    let clean = cmhll_clean_rows(&keys, ROWS, COLS);
+    let with_clean_row = clean.values().filter(|rows| !rows.is_empty()).count();
+    assert!(
+        with_clean_row <= 20,
+        "{with_clean_row} of {} keys still have a clean row; this is not the \
+         heavy-collision regime the test means to exercise",
+        keys.len()
+    );
+
+    for &key in &keys {
+        let n = truth[&key];
+        let est = sk.estimate(&DataInput::U64(key));
+        let floor = n as f64 * (1.0 - spec.tolerance_at(n));
+        assert!(
+            est >= floor,
+            "key {key}: estimate {est:.1} fell below {floor:.1}, the HyperLogLog \
+             lower band at n={n}; collisions must only raise an estimate"
+        );
+    }
+}
+
+/// A merge is a register-wise maximum, so it answers exactly as a single
+/// sketch fed both halves would.
+#[test]
+fn count_min_hll_merge_reproduces_a_single_pass_over_both_halves() {
+    const ROWS: usize = 4;
+    const COLS: usize = 256;
+    const PRECISION: u32 = 10;
+
+    let keys: Vec<u64> = (0..60).collect();
+    let mut left: CountMinHll = CountMinHll::with_dimensions(ROWS, COLS, PRECISION);
+    let mut right: CountMinHll = CountMinHll::with_dimensions(ROWS, COLS, PRECISION);
+    let mut single: CountMinHll = CountMinHll::with_dimensions(ROWS, COLS, PRECISION);
+
+    for &key in &keys {
+        for i in 0..500u64 {
+            let value = key * 1_000_000 + i;
+            let target = if i % 2 == 0 { &mut left } else { &mut right };
+            target.insert(&DataInput::U64(key), &DataInput::U64(value));
+            single.insert(&DataInput::U64(key), &DataInput::U64(value));
+        }
+    }
+
+    left.merge(&right).expect("same shape");
+    assert_eq!(
+        left.as_storage().as_slice(),
+        single.as_storage().as_slice(),
+        "a register-wise max merge must reproduce the single pass exactly"
+    );
+    for &key in &keys {
+        assert_eq!(
+            left.estimate(&DataInput::U64(key)),
+            single.estimate(&DataInput::U64(key)),
+            "key {key}: merged and single-pass estimates must agree"
+        );
     }
 }
