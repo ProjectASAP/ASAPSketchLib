@@ -25,6 +25,8 @@ A Rust library for **streaming data sketches** — compact data structures that 
 | Subpopulation queries | `Hydra` | Filtered sketch queries | Answers sketch queries over arbitrary subpopulations without maintaining per-group sketches | No direct equivalent — requires per-group aggregation |
 | Universal monitoring | `UnivMon` | G-sum queries (L1/L2 norms, cardinality, entropy) | Estimates a broad class of streaming statistics in a single pass | No direct equivalent — requires custom multi-pass pipelines |
 | Universal monitoring + quantiles | `UnivMonQ` (experimental) | One mergeable structure for frequencies, F0/F2/compatible g-sums, entropy, heavy hitters, ranks, and quantiles | Extends a terminal-stratum UnivMon core with an adaptively assisted occurrence sample | No direct equivalent — requires multiple aggregations |
+| Sliding-window frequency | `MicroCM` (experimental) | Per-key counts over the last W items or W time units, in fixed memory | Keeps `T+2` narrow counters and one shared zoom exponent per cell, rescaling instead of widening | `df.filter(pl.col("ts") > cutoff).group_by("key").agg(pl.len())` — exact, but stores the window |
+| Grouped distinct counts | `CountMinHll` (experimental) | Distinct values per key, without a sketch per key | A Count-Min grid whose cells are HyperLogLogs, in one contiguous register plane | `df.group_by("key").agg(pl.col("value").n_unique())` |
 | Update acceleration | `NitroBatch` | Batch-accelerated sketch updates | Speeds up sketch insertions by batching updates | No direct equivalent |
 
 Full sketch status and API details: [APIs Index](./docs/apis.md).

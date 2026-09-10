@@ -10,7 +10,7 @@
 //! rescales itself when a pixel is about to overflow. The counters stay
 //! narrow; the exponent buys the range.
 //!
-//! [`cell`] holds the record layout and the per-cell algorithm, on `&[u8]`
+//! [`cell`](crate::sketches::microscope::cell) holds the record layout and the per-cell algorithm, on `&[u8]`
 //! and nothing else. [`MicroCM`] puts a Count-Min-shaped grid of those cells
 //! behind a hash: `rows` independent rows, one cell per row per key, and the
 //! minimum across rows as the answer.
@@ -194,7 +194,7 @@ impl SubWindowClock {
 /// across rows, because a cell can only be inflated by the other keys that
 /// share it.
 ///
-/// See the [module docs](self) for the layout rationale and the current
+/// See the [module docs](crate::sketches::microscope) for the layout rationale and the current
 /// status of this implementation.
 #[derive(Clone, Debug, Serialize)]
 #[serde(bound = "")]

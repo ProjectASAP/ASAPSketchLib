@@ -10,6 +10,47 @@ signals a backwards-compatible change.
 
 ## [Unreleased]
 
+### Added
+
+- **`Vector3D<T>`**, filled in from a stub. A `rows x cols` grid whose every
+  cell is a contiguous `depth`-length record, addressed by the same
+  `MatrixFastHash` machinery as `Vector2D`. Reach for it when a cell is made
+  of several mutually coupled fields — when the estimator or the update reads
+  or writes them as a unit. `Vector2D<[T; N]>` has the identical memory
+  layout; what `Vector3D` adds is a `depth` chosen at run time, which is what
+  a HyperLogLog precision or a sub-window count needs and what a const generic
+  cannot express. See
+  [Common Structures](docs/api/api_common_structures.md#when-to-reach-for-vector3d-instead-of-vector2d).
+- **`CountMinHll`** (`experimental` feature). Grouped distinct counting: given
+  a stream of `(key, distinct_value)` pairs, how many distinct values has this
+  key seen? A Count-Min-shaped grid whose every cell is a small HyperLogLog,
+  held in one contiguous `Vector3D<u8>` register plane. `Hydra` with
+  `HydraCounter::HLL` answers the same query on a stable API, with one
+  heap-allocated HLL per cell.
+- **`MicroCM`** (`experimental` feature), a sliding-window frequency sketch
+  following MicroscopeSketch (Zhao et al., KDD 2023). Each cell holds `T + 2`
+  byte-wide pixels and one shared zoom exponent, so the counters stay narrow
+  and the exponent buys the range instead of the counters being widened for
+  the largest count they might ever hold. Count-based and time-based windows
+  are one `SubWindowClock` type. Not yet checked against the paper's published
+  measurements.
+
+### Changed
+
+- **`Vector3D`'s dimensions changed meaning, and so did its `serde` shape.**
+  The stub took `init(layer, row, col)` and serialized `layer`/`row`/`col`;
+  it now takes `init(rows, cols, depth)` and serializes `rows`/`cols`/`depth`.
+  The arity is unchanged, so existing calls still compile while meaning
+  something different, and previously serialized bytes will not decode. The
+  stub had no callers in this crate and no sketch used it, but the type was
+  publicly exported, so this is a breaking change to a public API.
+- `Vector3D::init` now rejects a zero dimension instead of building a
+  container whose bucket accessors panic on first use, and deserialization
+  rejects a payload whose data length disagrees with `rows * cols * depth`.
+- `HyperLogLog`'s classic estimator body is now a shared function that
+  `CountMinHll` also uses, so the two cannot drift. HyperLogLog's own numbers
+  are unchanged.
+
 ## [0.3.0] - 2026-09-07
 
 Breaking release. Adds `Bloom` and `SpaceSaving`, completes ASAPv1 wire

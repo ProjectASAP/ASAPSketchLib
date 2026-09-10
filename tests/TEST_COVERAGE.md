@@ -81,6 +81,17 @@ Feature-gated behind `--features experimental`.
     - k = 32: relative error 73%
     - k = 128: relative error 36%
     - reasoning: theoretical error bound is a probability, to simplify the result, use this arbitrary number
+- CountMinHll
+  - Configuration: row 4, col 512, HLL precision 10 (clean run); row 4, col 32 (contended run); row 4, col 256 (merge)
+  - Input: 120 keys with 40 ~ 4443 distinct values each, spanning HyperLogLog's linear-counting regime and its harmonic regime
+  - which rows are collision-free is computed from the sketch's own routing (`hash128_seeded` plus `MatrixFastHash::col_for_row`), not assumed
+  - error bound:
+    - a key with at least one collision-free row: `CardinalityConfidenceSpec::hll(10, z=4)`, i.e. HyperLogLog's own register model and nothing looser
+    - reasoning: a value's register index and rank do not depend on the bucket, so a key writes the same register array into every bucket it touches; an unshared bucket therefore holds exactly that array, and the minimum across rows cannot fall below it
+    - two collision-free rows of one key hold byte-identical buckets -- exact, no tolerance
+    - contended run (200 keys over 32 columns, essentially no clean rows): every estimate stays above HyperLogLog's lower band, since a collision can only raise an estimate
+  - both runs assert their own occupancy, so a routing regression that made the rows track each other fails rather than silently skipping the checks
+  - merge: register-wise maximum reproduces a single pass over both halves byte for byte
 
 ## e2e_frameworks
 
@@ -1085,6 +1096,15 @@ Feature-gated behind `--features experimental`.
     - every variant selects the documented merge norm, and can merge into its own kind
     - buckets past the window expire, the retained span is reported, and expiry follows the window length the histogram was last given
     - a custom bucket update matches repeated inserts
+- MicroCM (feature-gated behind `--features experimental`)
+  - Configuration: row 4, col 1024, T=8, c=2, count-based clock of 1000 items per sub-window
+  - Input: 40K zipf i64, s=1.1, key-size=4096
+  - reference window: `DeltaStrategy::Over` charges sub-windows `n-T ..= n` in full, and a count-based clock puts item `i` in sub-window `i / L`, so the exact window is items `[(n-T) * L, seen)` -- no tolerance is spent on granularity
+  - error bound: the CountMin model over that exact window, one-sided, at the simultaneous additive bound for row 4, col 1024
+    - the load is sized to stay at zoom 0 and the test asserts it, because a zoom adds rounding the CountMin contract does not model
+  - other properties:
+    - `Under <= Linear <= Over` for all 4096 keys, measured part-way through a sub-window where the three policies differ
+    - a key that stops appearing leaves the window: what remains is bounded by what collisions from the filler traffic alone can account for, since expiry comes from the sub-window boundary sweep rather than from writes to that key's cells
 
 ## e2e_wire
 

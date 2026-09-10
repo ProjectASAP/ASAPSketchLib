@@ -64,11 +64,25 @@ API references: [`docs/api/api_hashlayer.md`](./api/api_hashlayer.md), [`docs/ap
 
 `EHUnivOptimized` is an experimental two-tier EH that integrates `UnivMon` with sketch memory reuse (currently `Unstable`).
 
+**Alternative: `MicroCM`**
+
+`MicroCM` (MicroscopeSketch) puts the window *inside* the cells instead of
+wrapping whole sketches in buckets. Each cell holds `T+2` byte-wide counters —
+one per sub-window — plus a shared zoom exponent that rescales the whole cell
+when a counter is about to overflow, so the counters never have to be widened
+for the largest count they might see. There is one sketch, not a sequence of
+them, and expiry is a single sequential pass at each sub-window boundary.
+
+The trade is coverage: EH wraps any mergeable sketch and answers whatever that
+sketch answers, while `MicroCM` answers frequency only. `MicroCM` is
+`Experimental` and behind the `experimental` feature.
+
 **When to use which**:
 
 | Use Case | Recommended |
 | --- | --- |
 | Sliding window, standard memory | `ExponentialHistogram` + any mergeable sketch |
+| Sliding window, frequency only, tight memory | `MicroCM` (Experimental) |
 | Sliding window + universal monitoring | `EHUnivOptimized` (Unstable) |
 
-API references: [`docs/api/api_exponential_histogram.md`](./api/api_exponential_histogram.md), [`docs/api/api_ehsketchlist.md`](./api/api_ehsketchlist.md)
+API references: [`docs/api/api_exponential_histogram.md`](./api/api_exponential_histogram.md), [`docs/api/api_ehsketchlist.md`](./api/api_ehsketchlist.md), [`docs/api/api_microscope.md`](./api/api_microscope.md)

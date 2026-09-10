@@ -30,6 +30,11 @@ This is the canonical API entry point for `asap_sketchlib`.
 - [UniformSampling](./api/api_uniform_sampling.md) - `Unstable`
 - [KMV](./api/api_kmv.md) - `Unstable`
   - Reference: "On synopses for distinct-value estimation under multiset operations." [https://dl.acm.org/doi/10.1145/1247480.1247504](https://dl.acm.org/doi/10.1145/1247480.1247504)
+- [CountMinHll](./api/api_countminsketch_hll.md) - `Experimental`
+  - Per-key distinct counts from a Count-Min grid of per-cell HyperLogLogs. Behind the `experimental` feature; `Hydra` with `HydraCounter::HLL` answers the same query on a stable API.
+- [MicroCM (MicroscopeSketch)](./api/api_microscope.md) - `Experimental`
+  - Sliding-window frequency estimation with adaptive zoom. Behind the `experimental` feature; not yet checked against the paper's published measurements.
+  - Reference: Zhao et al., "MicroscopeSketch: Accurate Sliding Estimation Using Adaptive Zooming," KDD 2023. [https://dl.acm.org/doi/10.1145/3580305.3599432](https://dl.acm.org/doi/10.1145/3580305.3599432)
 
 ## Framework APIs
 
