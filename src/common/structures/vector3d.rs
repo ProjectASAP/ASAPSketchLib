@@ -307,7 +307,9 @@ mod tests {
                 }
             }
         }
-        let expected: Vec<u16> = (1..=15u16).flat_map(|m| std::iter::repeat_n(m, 4)).collect();
+        let expected: Vec<u16> = (1..=15u16)
+            .flat_map(|m| std::iter::repeat_n(m, 4))
+            .collect();
         assert_eq!(v.as_slice(), expected.as_slice());
         // First and last buckets land where the index arithmetic says.
         assert_eq!(v.bucket_slice(0, 0), &[1, 1, 1, 1]);
@@ -396,7 +398,8 @@ mod tests {
         let err = rmp_serde::from_slice::<Vector3D<u8>>(&bytes)
             .expect_err("a short payload must be rejected");
         assert!(
-            err.to_string().contains("does not match rows * cols * depth"),
+            err.to_string()
+                .contains("does not match rows * cols * depth"),
             "unexpected error: {err}"
         );
     }
@@ -417,8 +420,8 @@ mod tests {
             depth: 3,
         };
         let bytes = rmp_serde::to_vec_named(&forged).expect("serialize");
-        let err = rmp_serde::from_slice::<Vector3D<u8>>(&bytes)
-            .expect_err("zero cols must be rejected");
+        let err =
+            rmp_serde::from_slice::<Vector3D<u8>>(&bytes).expect_err("zero cols must be rejected");
         assert!(
             err.to_string().contains("must all be non-zero"),
             "unexpected error: {err}"

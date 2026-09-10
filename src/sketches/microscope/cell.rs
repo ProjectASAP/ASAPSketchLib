@@ -36,6 +36,7 @@
 //! per byte halves the record and is a later change; the layout type already
 //! hides every offset from callers, so it is contained here.
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cell::Cell;
 
 /// The largest value an 8-bit pixel can hold.
@@ -67,7 +68,7 @@ pub enum DeltaStrategy {
 }
 
 /// Configuration of a MicroscopeSketch cell.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MicroParams {
     /// Number of sub-windows the sliding window is split into.
     pub t: usize,
@@ -202,12 +203,28 @@ pub struct Rounding {
     state: Cell<u64>,
 }
 
+impl Serialize for Rounding {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(self.state.get())
+    }
+}
+
+impl<'de> Deserialize<'de> for Rounding {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::new(u64::deserialize(deserializer)?))
+    }
+}
+
 impl Rounding {
     /// Seeds the generator. A zero seed is replaced, since xorshift is stuck
     /// at zero.
     pub fn new(seed: u64) -> Self {
         Self {
-            state: Cell::new(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed }),
+            state: Cell::new(if seed == 0 {
+                0x9E37_79B9_7F4A_7C15
+            } else {
+                seed
+            }),
         }
     }
 
@@ -267,25 +284,20 @@ fn zoom_out(cell: &mut [u8], layout: &MicroLayout, rounding: &Rounding) -> bool 
 
 /// Records one item in sub-window `n`.
 ///
-/// Three things happen, in this order:
+/// Two things happen:
 ///
-/// 1. The pixel that sub-window `n+1` will reuse is cleared. Doing it here,
-///    one store per insert, spreads the cost of expiry instead of paying it
-///    in a burst at the sub-window boundary.
-/// 2. The shutter advances. It only rolls into the current pixel once it
+/// 1. The shutter advances. It only rolls into the current pixel once it
 ///    reaches `c^Z`, which is what makes a pixel worth `c^Z` items.
-/// 3. If that roll would take the pixel past what 8 bits hold, the cell
+/// 2. If that roll would take the pixel past what 8 bits hold, the cell
 ///    zooms out first and the increment lands on the halved value.
 ///
-/// Step 3 differs from a literal reading of "increment, then zoom if the
+/// Step 2 differs from a literal reading of "increment, then zoom if the
 /// pixel reached `2^l`": an 8-bit pixel cannot hold 256 even transiently, so
 /// the overflow is caught on the increment that would cause it.
+///
+/// Expiry is *not* done here — see [`enter_sub_window`].
 pub fn insert(cell: &mut [u8], layout: &MicroLayout, n: u64, rounding: &Rounding) {
-    // 1. Clear the slot the next sub-window will take over.
-    let clearing = layout.pixel_at(n + 1);
-    cell[clearing] = 0;
-
-    // 2. Advance the shutter.
+    // Advance the shutter.
     let z = cell[layout.zoom_at];
     let unit = (layout.params.c as u64).pow(z as u32);
     let next_shutter = shutter(cell, layout) as u64 + 1;
@@ -294,16 +306,56 @@ pub fn insert(cell: &mut [u8], layout: &MicroLayout, n: u64, rounding: &Rounding
         return;
     }
 
-    // 3. The shutter closed: roll it into the current pixel.
+    // The shutter closed: roll it into the current pixel.
     set_shutter(cell, layout, 0);
     let current = layout.pixel_at(n);
-    if cell[current] == PIXEL_MAX {
-        if !zoom_out(cell, layout, rounding) {
-            // At the zoom cap; saturate rather than wrap.
-            return;
-        }
+    if cell[current] == PIXEL_MAX && !zoom_out(cell, layout, rounding) {
+        // At the zoom cap; saturate rather than wrap.
+        return;
     }
     cell[current] += 1;
+}
+
+/// Moves the cell into sub-window `new_n`, having crossed `crossed`
+/// boundaries to get there.
+///
+/// This is where a cell forgets. The pixel ring is indexed by sub-window
+/// number, so the slot a new sub-window lands on still holds the count of
+/// the sub-window `T + 2` before it; unless it is cleared on the way in,
+/// that stale count is read back as if it belonged to the new sub-window.
+///
+/// Clearing has to happen for **every** cell at a boundary, not for the cell
+/// an insert happens to touch. A cell whose key stops appearing receives no
+/// inserts, and is exactly the cell whose stale pixels would otherwise be
+/// re-read as recent ones — so a key that went quiet would keep reporting
+/// its old count forever. Since a boundary already walks the whole table to
+/// offer each cell a zoom-in, the clearing rides along at no extra pass.
+///
+/// A jump of `T + 2` or more sub-windows has left nothing behind, so the
+/// cell is reset outright rather than cleared slot by slot.
+pub fn enter_sub_window(cell: &mut [u8], layout: &MicroLayout, new_n: u64, crossed: u64) {
+    if crossed == 0 {
+        return;
+    }
+    if crossed >= layout.pixels as u64 {
+        for slot in cell.iter_mut().take(layout.pixels) {
+            *slot = 0;
+        }
+        // The shutter held a partial unit of a sub-window that is now gone.
+        set_shutter(cell, layout, 0);
+    } else {
+        // Clear each slot entered on the way, oldest of them first.
+        for step in (0..crossed).rev() {
+            let entered = new_n - step;
+            cell[layout.pixel_at(entered)] = 0;
+        }
+    }
+    // One chance to reclaim resolution per boundary crossed.
+    for _ in 0..crossed.min(layout.pixels as u64) {
+        if !try_zoom_in(cell, layout) {
+            break;
+        }
+    }
 }
 
 /// Restores resolution when the cell has room for it: if every pixel would
@@ -364,6 +416,78 @@ pub fn estimate(cell: &[u8], layout: &MicroLayout, n: u64, strategy: DeltaStrate
     total
 }
 
+/// Divides `value` by `c` `steps` times, unbiased at each step.
+#[inline]
+fn scale_down(mut value: u32, steps: u8, c: u32, rounding: &Rounding) -> u32 {
+    for _ in 0..steps {
+        value = unbiased_div(value, c, rounding);
+    }
+    value
+}
+
+/// Merges `src` into `dst`, both positioned at sub-window `n`.
+///
+/// The paper does not define a merge, so this one is chosen to preserve the
+/// only thing a merge can be asked to preserve here: the estimate of the
+/// union. Three steps.
+///
+/// 1. **Agree on a zoom.** Pixels are only comparable at the same `Z`, so
+///    both sides are brought to `max(Z_dst, Z_src)` — never to the smaller
+///    one, which would have to invent resolution neither side has. The
+///    rescaling is the same unbiased division a zoom-out uses.
+/// 2. **Add pixel-wise**, in `u32` so a sum cannot wrap, then zoom the result
+///    out until every pixel fits a byte again.
+/// 3. **Add the shutters.** They are raw item counts, not scaled by `Z`, so
+///    they add directly; whole `c^Z` units of the sum carry into the current
+///    sub-window's pixel and the remainder stays in the shutter.
+///
+/// Both cells must sit at the same sub-window: the pixel ring is indexed by
+/// sub-window number, so merging cells at different `n` would add unrelated
+/// sub-windows together. The grid enforces that; this function assumes it.
+pub fn merge_cells(dst: &mut [u8], src: &[u8], layout: &MicroLayout, n: u64, rounding: &Rounding) {
+    let c = layout.params.c;
+    let z_dst = zoom(dst, layout);
+    let z_src = zoom(src, layout);
+    let mut target = z_dst.max(z_src);
+
+    let mut sums: Vec<u32> = (0..layout.pixels)
+        .map(|i| {
+            scale_down(dst[i] as u32, target - z_dst, c, rounding)
+                + scale_down(src[i] as u32, target - z_src, c, rounding)
+        })
+        .collect();
+
+    // Shutters are item counts below one unit each, so their sum is below two
+    // units and carries at most once — but compute it generally.
+    let combined = shutter(dst, layout) as u64 + shutter(src, layout) as u64;
+    let unit = (c as u64).pow(target as u32);
+    sums[layout.pixel_at(n)] += (combined / unit) as u32;
+    let mut remainder = combined % unit;
+
+    let cap = layout.max_zoom();
+    while sums.iter().any(|&v| v > PIXEL_MAX as u32) {
+        if target >= cap {
+            for value in sums.iter_mut() {
+                *value = (*value).min(PIXEL_MAX as u32);
+            }
+            break;
+        }
+        target += 1;
+        for value in sums.iter_mut() {
+            *value = unbiased_div(*value, c, rounding);
+        }
+        // The remainder was below the old unit, so it is below the new one
+        // too and needs no adjustment.
+    }
+
+    for (slot, value) in dst.iter_mut().take(layout.pixels).zip(sums) {
+        *slot = value as u8;
+    }
+    dst[layout.zoom_at] = target;
+    remainder = remainder.min(u32::MAX as u64);
+    set_shutter(dst, layout, remainder as u32);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,7 +502,7 @@ mod tests {
         for i in 0..items {
             if i > 0 && i % per_sub_window == 0 {
                 n += 1;
-                try_zoom_in(&mut cell, layout);
+                enter_sub_window(&mut cell, layout, n, 1);
             }
             insert(&mut cell, layout, n, &rounding);
         }
@@ -479,17 +603,34 @@ mod tests {
             insert(&mut cell, &layout, n, &rounding);
         }
         assert!(estimate(&cell, &layout, n, DeltaStrategy::Under) > 0.0);
-        // Advance past the burst with a single item per sub-window, which is
-        // what actually drives the clearing.
+        // Advance past the burst with a single item per sub-window.
         for _ in 0..=(layout.params().t + 1) {
             n += 1;
-            try_zoom_in(&mut cell, &layout);
+            enter_sub_window(&mut cell, &layout, n, 1);
             insert(&mut cell, &layout, n, &rounding);
         }
         let est = estimate(&cell, &layout, n, DeltaStrategy::Over);
         assert!(
             est <= (layout.params().t + 2) as f64,
             "only the trickle should remain, got {est}"
+        );
+
+        // And a cell that receives nothing at all still forgets, because the
+        // boundary is what clears it.
+        let mut idle = vec![0u8; layout.depth];
+        let mut m = 0u64;
+        for _ in 0..300 {
+            insert(&mut idle, &layout, m, &rounding);
+        }
+        assert!(estimate(&idle, &layout, m, DeltaStrategy::Under) > 0.0);
+        for _ in 0..=(layout.params().t + 1) {
+            m += 1;
+            enter_sub_window(&mut idle, &layout, m, 1);
+        }
+        assert_eq!(
+            estimate(&idle, &layout, m, DeltaStrategy::Over),
+            0.0,
+            "an idle cell must be emptied by the boundary sweep alone"
         );
     }
 
