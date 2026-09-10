@@ -10,6 +10,12 @@
 //! rescales itself when a pixel is about to overflow. The counters stay
 //! narrow; the exponent buys the range.
 //!
+//! Where this implementation departs from the authors' released code: a
+//! zoom-out rounds the other pixels **probabilistically**, which is the
+//! method the paper describes, whereas the released code always rounds up
+//! (its probabilistic branch is commented out). The same holds for the
+//! partial shutter a sub-window boundary closes out.
+//!
 //! [`cell`](crate::sketches::microscope::cell) holds the record layout and the per-cell algorithm, on `&[u8]`
 //! and nothing else. [`MicroCM`] puts a Count-Min-shaped grid of those cells
 //! behind a hash: `rows` independent rows, one cell per row per key, and the
@@ -47,11 +53,12 @@ pub mod cell;
 
 pub use cell::{DeltaStrategy, MicroLayout, MicroParams, Rounding};
 
-use crate::{DataInput, DefaultXxHasher, SketchHasher, Vector3D};
+use crate::{DataInput, DefaultXxHasher, MatrixFastHash, SketchHasher, Vector3D};
 use rmp_serde::{
     decode::Error as RmpDecodeError, encode::Error as RmpEncodeError, from_slice, to_vec_named,
 };
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::marker::PhantomData;
 
 /// What advances the sub-window number, and how far into the current
@@ -371,8 +378,11 @@ impl<H: SketchHasher> MicroCM<H> {
     fn enter_sub_window(&mut self, crossed: u64) {
         let layout = self.layout;
         let n = self.clock.n();
+        // Borrowed as a shared reference so the rounding state advances in
+        // place; cloning it here would replay the same draws every boundary.
+        let rounding = &self.rounding;
         for record in self.cells.as_mut_slice().chunks_exact_mut(layout.depth()) {
-            cell::enter_sub_window(record, &layout, n, crossed);
+            cell::enter_sub_window(record, &layout, n, crossed, rounding);
         }
     }
 
@@ -423,17 +433,56 @@ impl<H: SketchHasher> MicroCM<H> {
 
     /// Estimates with an explicit policy for the oldest sub-window.
     ///
-    /// [`DeltaStrategy::Over`] never under-reports and
-    /// [`DeltaStrategy::Under`] never over-reports *the window*; both are
-    /// still subject to the Count-Min inflation that other keys sharing a
-    /// cell cause, which the minimum across rows reduces but cannot remove.
+    /// The minimum across rows is taken **per sub-window**, and those minima
+    /// are then summed — not the other way round. Both are valid Count-Min
+    /// reductions, but `sum(min) <= min(sum)`: taking the minimum first lets
+    /// a different row supply each sub-window, so a collision that inflates
+    /// one row's sub-window is discarded even when that row is the cleanest
+    /// overall. Reducing whole-cell estimates instead would keep it.
+    ///
+    /// While the cell has not zoomed the answer is exact up to that
+    /// Count-Min inflation, which is one-sided upward. Once `Z > 0` the
+    /// probabilistic rounding of a zoom makes the per-pixel error two-sided,
+    /// bounded by `c^Z` per pixel — so `Over` and `Under` bracket the window
+    /// only up to that rounding, not absolutely.
     pub fn estimate_with(&self, key: &DataInput, strategy: DeltaStrategy) -> f64 {
         let packed = H::hash128_seeded(0, key);
         let n = self.clock.n();
         let layout = self.layout;
-        self.cells.fast_query_min(&packed, |record, _row, _hash| {
-            cell::estimate(record, &layout, n, strategy)
-        })
+        let t = self.params.t as u64;
+        let cols = self.cells.cols();
+        let columns: SmallVec<[usize; 8]> = (0..self.cells.rows())
+            .map(|row| MatrixFastHash::col_for_row(&packed, row, cols))
+            .collect();
+        let record = |row: usize| self.cells.bucket_slice(row, columns[row]);
+        let across_rows = |f: &dyn Fn(&[u8]) -> f64| {
+            (0..columns.len())
+                .map(|row| f(record(row)))
+                .fold(f64::INFINITY, f64::min)
+        };
+
+        // The current sub-window carries the shutter, so the two are reduced
+        // together: they are one row's view of the same span.
+        let mut total = across_rows(&|rec| {
+            cell::shutter(rec, &layout) as f64 + cell::scaled_pixel(rec, &layout, n)
+        });
+        // The sub-windows wholly inside the window.
+        for back in 1..t {
+            let Some(sub_window) = n.checked_sub(back) else {
+                break;
+            };
+            total += across_rows(&|rec| cell::scaled_pixel(rec, &layout, sub_window));
+        }
+        // The partially expired oldest one, weighted by the policy.
+        if let Some(sub_window) = n.checked_sub(t) {
+            let oldest = across_rows(&|rec| cell::scaled_pixel(rec, &layout, sub_window));
+            total += match strategy {
+                DeltaStrategy::Over => oldest,
+                DeltaStrategy::Under => 0.0,
+                DeltaStrategy::Linear(fraction) => fraction.clamp(0.0, 1.0) * oldest,
+            };
+        }
+        total
     }
 
     /// Merges `other` into `self`, cell by cell.
@@ -464,14 +513,18 @@ impl<H: SketchHasher> MicroCM<H> {
         }
         let layout = self.layout;
         let n = self.clock.n();
-        let rounding = self.rounding.clone();
+        // A shared borrow, not a clone: `Rounding` keeps its state in a
+        // `Cell`, so a clone would take every draw on a copy and leave the
+        // sketch's own stream untouched — successive merges would then
+        // replay identical rounding instead of being independent.
+        let rounding = &self.rounding;
         for (dst, src) in self
             .cells
             .as_mut_slice()
             .chunks_exact_mut(layout.depth())
             .zip(other.cells.as_slice().chunks_exact(layout.depth()))
         {
-            cell::merge_cells(dst, src, &layout, n, &rounding);
+            cell::merge_cells(dst, src, &layout, n, rounding);
         }
         Ok(())
     }
@@ -669,6 +722,32 @@ mod tests {
         );
         // And the merge is one-sided in the same direction as the sketch.
         assert!(merged >= 700.0, "merge lost too much: {merged}");
+    }
+
+    /// A merge takes its rounding draws from the sketch's own stream, so two
+    /// successive merges do not replay identical rounding.
+
+    #[test]
+    fn merge_advances_the_rounding_stream() {
+        let mut a = sketch(2, 32, 4, 4_000);
+        let mut b = sketch(2, 32, 4, 4_000);
+        // The two sides must disagree about the zoom level of a cell that is
+        // non-empty on both, since bringing them to a common Z is what makes
+        // the merge round and rounding is what takes the draws — an all-zero
+        // pixel divides exactly and never draws. Equal item counts keep the
+        // two clocks in step.
+        for i in 0..40_000u64 {
+            a.insert(&key(1));
+            b.insert(&key(if i % 4 == 0 { 9 } else { 1 }));
+        }
+        let before = a.rounding.state();
+        a.merge(&b).expect("same shape and clock");
+        assert_ne!(
+            a.rounding.state(),
+            before,
+            "the merge consumed rounding draws but left the sketch's stream \
+             untouched, so every merge would replay the same rounding"
+        );
     }
 
     #[test]
