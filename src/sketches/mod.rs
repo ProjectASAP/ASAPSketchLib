@@ -57,7 +57,9 @@ pub mod countsketch;
 pub use countsketch::Count;
 
 /// Count-Min-shaped grid with a per-bucket HyperLogLog (distinct-count) sketch.
+#[cfg(feature = "experimental")]
 pub mod countminsketch_hll;
+#[cfg(feature = "experimental")]
 pub use countminsketch_hll::CountMinHll;
 
 /// Hashing path markers for matrix-backed sketches.

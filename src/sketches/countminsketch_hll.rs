@@ -34,6 +34,12 @@
 //! - **Single-pass bucket estimator**: the shared classic estimator fuses the
 //!   harmonic sum and the zero-count into one loop traversal.
 //!
+//! # Status
+//!
+//! Experimental: behind the `experimental` cargo feature, and its API and
+//! wire form may change without a major version bump. For a per-key distinct
+//! count on a stable API today, reach for `Hydra` with `HydraCounter::HLL`.
+//!
 //! # Related sketches
 //!
 //! - [`crate::sketches::hll`] — a single HyperLogLog for total-stream distinct
