@@ -2,10 +2,9 @@
 
 Status: `Experimental`
 
-> Warning: Behind the `experimental` cargo feature. The algorithm follows
-> Zhao et al. (KDD 2023), but this implementation has not been checked against
-> the paper's published measurements; the accuracy it reaches is corroborated
-> only by this repository's property tests.
+> Warning: Behind the `experimental` cargo feature. The accuracy this
+> implementation reaches has not been measured against the figures the paper
+> reports; what is established is the set of properties its tests assert.
 
 ## Purpose
 
@@ -44,7 +43,8 @@ fn SubWindowClock::time_based(sub_window_len: u64, epoch: u64) -> SubWindowClock
 
 `cols` must be a power of two and at least 2 — a single column would route
 every row to the same cell — and `rows * log2(cols)` must not exceed 128.
-`T` must be in `1..=4096`. `rounding_seed` seeds the probabilistic rounding a
+`T` must be in `1..=4096` and `c` in `2..=256`; above 256 a single zoom-out
+would collapse every byte-wide pixel to 0 or 1. `rounding_seed` seeds the probabilistic rounding a
 zoom-out uses; a fixed value makes a run reproducible.
 
 `MicroCM::default()` is a 4 x 1024 grid at `T = 12`, `c = 2`, over
@@ -139,9 +139,9 @@ up to a multiple of four: 20 bytes at `T = 12`, 8 bytes at `T = 1`.
   shutter, which is rounded into the sub-window that just ended and reset.
 - A count-based sketch only ages when something is inserted. A time-based
   one can be aged with `advance_to`.
-- This implementation rounds a zoom-out probabilistically, which is the
-  method the paper describes; the authors' released code always rounds up
-  (its probabilistic branch is commented out).
+- A zoom-out rounds probabilistically, as does the partial shutter a
+  boundary closes out: each is carried up with probability equal to its
+  fractional part, so neither introduces a directional bias.
 
 ## See Also
 
@@ -178,6 +178,5 @@ assert!(sk.estimate_with(&DataInput::U64(7), DeltaStrategy::Over) >= 50.0);
 
 `Experimental`. Behind the `experimental` cargo feature; the API and the wire
 form may change without a major version bump, and no ASAPv1 `kind_id` is
-allocated for it. The algorithm follows Zhao et al., checked against the
-authors' released reference implementation, but this implementation has not
-been compared against the paper's published measurements.
+allocated for it. The accuracy it reaches has not been measured against the
+figures the paper reports.

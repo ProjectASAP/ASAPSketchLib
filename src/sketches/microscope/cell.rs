@@ -84,6 +84,12 @@ pub struct MicroParams {
     pub c: u32,
 }
 
+/// Upper bound on the zoom base.
+///
+/// A pixel is one byte, so a single zoom-out at `c > 256` collapses every
+/// pixel to 0 or 1 and the cell carries no information below the exponent.
+pub const MAX_ZOOM_BASE: u32 = 256;
+
 /// Upper bound on `T`, so a record stays a sane size and `T + 2` cannot
 /// overflow while a layout is being derived from untrusted bytes.
 ///
@@ -95,7 +101,8 @@ impl MicroParams {
     ///
     /// Panics if `t` is zero or above
     /// [`MAX_SUB_WINDOWS`](crate::sketches::microscope::MAX_SUB_WINDOWS), or
-    /// if `c` is below 2.
+    /// if `c` is outside
+    /// `2..=`[`MAX_ZOOM_BASE`](crate::sketches::microscope::MAX_ZOOM_BASE).
     pub fn new(t: usize, c: u32) -> Self {
         Self::checked(t, c).unwrap_or_else(|detail| panic!("{detail}"))
     }
@@ -107,8 +114,10 @@ impl MicroParams {
                 "t (sub-windows per window) must be in 1..={MAX_SUB_WINDOWS}, got {t}"
             ));
         }
-        if c < 2 {
-            return Err(format!("zoom base c must be at least 2, got {c}"));
+        if !(2..=MAX_ZOOM_BASE).contains(&c) {
+            return Err(format!(
+                "zoom base c must be in 2..={MAX_ZOOM_BASE}, got {c}"
+            ));
         }
         Ok(Self { t, c })
     }
@@ -128,9 +137,9 @@ impl Default for MicroParams {
 ///
 /// Every field is read and written a byte at a time, so nothing here needs
 /// an alignment guarantee; the padding only keeps the record size a round
-/// number. The reference implementation packs the same state tighter — a
-/// `32 - l` bit shutter and a `ceil(5 - log2 c)` bit zoom sharing a word —
-/// which this trades away for byte-addressable fields.
+/// number. Packing the zoom and the shutter into the bits they actually
+/// need would shrink a record further, at the cost of byte-addressable
+/// fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MicroLayout {
     params: MicroParams,
@@ -159,7 +168,7 @@ impl MicroLayout {
             zoom_at,
             shutter_at,
             depth,
-            zoom_in_ceiling: (PIXEL_MAX as u32 + 1) / params.c,
+            zoom_in_ceiling: PIXEL_MAX as u32 / params.c,
         }
     }
 
@@ -375,10 +384,14 @@ fn credit_pixel(cell: &mut [u8], layout: &MicroLayout, at: usize, rounding: &Rou
 /// Records one item in sub-window `n`.
 ///
 /// The shutter advances by one and rolls a whole `c^Z` unit into the current
-/// pixel each time it reaches one. It is *decremented* by the unit rather
-/// than zeroed, and the test is a loop, because crediting the pixel may zoom
-/// the cell out: the unit then doubles, and the remainder that is still
-/// pending has to be measured against the new unit rather than thrown away.
+/// pixel when it reaches one, carrying the remainder rather than discarding
+/// it.
+///
+/// The loop is a guard, not a path: `shutter < c^Z` holds everywhere, so
+/// `pending` starts at no more than one unit and the body runs at most
+/// once. It is written as a loop because crediting a pixel may raise `Z`,
+/// and a remainder measured against the old unit would then be wrong — the
+/// shape stays correct if a future change ever lets the shutter grow.
 ///
 /// Expiry is not done here — see [`enter_sub_window`].
 pub fn insert(cell: &mut [u8], layout: &MicroLayout, n: u64, rounding: &Rounding) {
@@ -474,12 +487,12 @@ pub fn try_zoom_in(cell: &mut [u8], layout: &MicroLayout) -> bool {
     if z == 0 {
         return false;
     }
+    // `p * c <= 255` is the condition; comparing against `255 / c` says the
+    // same thing without a multiply, and — unlike `256 / c` — never rounds
+    // to zero, which would have made the test vacuously true for every cell
+    // and left a zoomed-out cell unable to ever zoom back in.
     let ceiling = layout.zoom_in_ceiling;
-    if cell
-        .iter()
-        .take(layout.pixels)
-        .any(|&p| p as u32 >= ceiling)
-    {
+    if cell.iter().take(layout.pixels).any(|&p| p as u32 > ceiling) {
         return false;
     }
     let c = layout.params.c;
@@ -821,6 +834,93 @@ mod tests {
         assert!(!try_zoom_in(&mut cell, &layout));
         assert_eq!(zoom(&cell, &layout), 2);
         assert_eq!(pixel(&cell, &layout, 1), 200);
+    }
+
+    /// The shutter a boundary closes out is credited to the sub-window that
+    /// just ended, and credited at the right odds: `S / c^Z`.
+    ///
+    /// This is the mechanism that stops a partial unit being reported for
+    /// the rest of a cell's life, and dropping it is invisible to a test
+    /// that only checks the shutter reaches zero — resetting it without
+    /// crediting does that too, while biasing every zoomed cell down by
+    /// half a unit per boundary. Measuring the rate catches both halves.
+    #[test]
+    fn the_boundary_credits_the_shutter_it_closes_out_at_the_right_odds() {
+        const SEEDS: u64 = 4_000;
+        let layout = MicroLayout::new(MicroParams::new(4, 2));
+        // Z = 3, so one unit is 8 items and a shutter of S must be carried
+        // S times in 8.
+        for pending in [0u32, 1, 6, 7] {
+            let mut credited = 0u64;
+            for seed in 0..SEEDS {
+                let rounding = Rounding::new(0xA11CE ^ seed);
+                let mut cell = vec![0u8; layout.depth()];
+                cell[layout.zoom_at] = 3;
+                cell[layout.pixel_at(0)] = 10;
+                set_shutter(&mut cell, &layout, pending);
+                // `scaled_pixel` is invariant under the zoom-in the boundary
+                // then performs, so it measures the credit and nothing else.
+                let before = scaled_pixel(&cell, &layout, 0);
+                enter_sub_window(&mut cell, &layout, 1, 1, &rounding);
+                let gained = scaled_pixel(&cell, &layout, 0) - before;
+                assert!(
+                    gained == 0.0 || gained == 8.0,
+                    "S={pending}: a boundary credits nothing or one unit, got {gained}"
+                );
+                if gained > 0.0 {
+                    credited += 1;
+                }
+                assert_eq!(shutter(&cell, &layout), 0, "S={pending}: not reset");
+            }
+            let rate = credited as f64 / SEEDS as f64;
+            let expected = pending as f64 / 8.0;
+            assert!(
+                (rate - expected).abs() < 0.03,
+                "S={pending}: carried {rate} of the time, expected {expected}"
+            );
+        }
+    }
+
+    /// A jump of more than one but fewer than `T + 2` sub-windows clears
+    /// exactly the slots it entered, and leaves the rest alone.
+    ///
+    /// The only multi-boundary path otherwise exercised is a jump past the
+    /// whole ring, which takes the full-reset branch instead.
+    #[test]
+    fn a_multi_sub_window_jump_clears_only_what_it_entered() {
+        let layout = MicroLayout::new(MicroParams::new(4, 2));
+        let rounding = Rounding::new(4_242);
+        let mut cell = vec![0u8; layout.depth()];
+        // Distinct marks so a wrong slot is visible, in sub-windows 0..=5.
+        for n in 0..6u64 {
+            cell[layout.pixel_at(n)] = (n as u8 + 1) * 10;
+        }
+        let before: Vec<u8> = cell[..layout.pixels()].to_vec();
+
+        // Standing in sub-window 5, jump three to sub-window 8: that enters
+        // 6, 7 and 8, and nothing else may change.
+        enter_sub_window(&mut cell, &layout, 8, 3, &rounding);
+
+        for n in 0..9u64 {
+            let entered = (6..=8).contains(&n);
+            let slot = layout.pixel_at(n);
+            if entered {
+                assert_eq!(
+                    cell[slot], 0,
+                    "sub-window {n} was entered and must have been cleared"
+                );
+            }
+        }
+        // The three slots the jump did not touch keep their marks, scaled by
+        // whatever zoom-in the boundary performed (Z was 0, so unchanged).
+        assert_eq!(zoom(&cell, &layout), 0);
+        for n in 3..=5u64 {
+            let slot = layout.pixel_at(n);
+            assert_eq!(
+                cell[slot], before[slot],
+                "sub-window {n} was not entered and must be untouched"
+            );
+        }
     }
 
     /// The boundary drives zoom-in to a fixed point, so a cell that empties

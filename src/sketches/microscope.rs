@@ -10,11 +10,11 @@
 //! rescales itself when a pixel is about to overflow. The counters stay
 //! narrow; the exponent buys the range.
 //!
-//! Where this implementation departs from the authors' released code: a
-//! zoom-out rounds the other pixels **probabilistically**, which is the
-//! method the paper describes, whereas the released code always rounds up
-//! (its probabilistic branch is commented out). The same holds for the
-//! partial shutter a sub-window boundary closes out.
+//! A zoom-out rounds the divided pixels **probabilistically**, and so does
+//! the partial shutter a sub-window boundary closes out: each is carried up
+//! with probability equal to its fractional part. Rounding either one in a
+//! fixed direction would bias every zoomed cell by up to half a unit per
+//! pixel per zoom, compounding as a cell zooms further.
 //!
 //! The `cell` module holds the record layout and the per-cell algorithm,
 //! on `&[u8]` and nothing else. [`MicroCM`] puts a Count-Min-shaped grid of those cells
@@ -38,10 +38,10 @@
 //!
 //! # Status
 //!
-//! Experimental: behind the `experimental` cargo feature. The algorithm
-//! follows Zhao et al., but this implementation has not been checked against
-//! the paper's published measurements, so the accuracy it achieves is
-//! corroborated only by the property tests in this repository.
+//! Experimental: behind the `experimental` cargo feature. The accuracy this
+//! implementation reaches has not been measured against the figures the
+//! paper reports; what is established is the set of properties its tests
+//! assert.
 //!
 //! # References
 //!
@@ -55,7 +55,7 @@
 /// re-exported below.
 pub(crate) mod cell;
 
-pub use cell::{DeltaStrategy, MAX_SUB_WINDOWS, MicroLayout, MicroParams, Rounding};
+pub use cell::{DeltaStrategy, MAX_SUB_WINDOWS, MAX_ZOOM_BASE, MicroLayout, MicroParams, Rounding};
 
 use crate::{DataInput, DefaultXxHasher, MatrixFastHash, SketchHasher, Vector3D};
 use rmp_serde::{
@@ -446,12 +446,20 @@ impl<H: SketchHasher> MicroCM<H> {
 
     /// Records one occurrence of `key` against a count-based clock.
     ///
+    /// The item is recorded against the sub-window the clock is *already*
+    /// in, and only then does the clock advance. That is what puts item `i`
+    /// of the stream in sub-window `i / L` and gives every sub-window
+    /// exactly `L` items — ticking first would leave the first sub-window
+    /// one short and shift every item one place late, which also puts a
+    /// count-based clock out of phase with a time-based one fed the matching
+    /// timestamps.
+    ///
     /// Panics if this sketch's clock is time-based; use [`Self::insert_at`].
     pub fn insert(&mut self, key: &DataInput) {
+        self.record(key);
         if self.clock.tick() {
             self.enter_sub_window(1);
         }
-        self.record(key);
     }
 
     /// Records one occurrence of `key` at `timestamp`, against a time-based
@@ -636,7 +644,9 @@ mod tests {
         }
         assert_eq!(sk.sub_window(), 0, "nine of ten items is still window 0");
         sk.insert(&key(1));
-        assert_eq!(sk.sub_window(), 1);
+        assert_eq!(sk.sub_window(), 1, "the tenth item fills sub-window 0");
+        // Sub-window 0 holds exactly L items, not L-1.
+        assert_eq!(sk.estimate_with(&key(1), DeltaStrategy::Under), 10.0);
     }
 
     /// A count-based and a time-based clock fed equivalent inputs walk the
@@ -646,14 +656,15 @@ mod tests {
         let mut counted = SubWindowClock::count_based(10);
         let mut timed = SubWindowClock::time_based(10, 0);
         for i in 0..95u64 {
-            counted.tick();
-            timed.advance_to(i + 1);
+            // Item `i` is recorded at timestamp `i`, before either clock
+            // moves past it, so the two must agree on its sub-window.
+            timed.advance_to(i);
             assert_eq!(
                 counted.n(),
                 timed.n(),
-                "clocks diverged after {} items",
-                i + 1
+                "clocks disagree about which sub-window item {i} belongs to"
             );
+            counted.tick();
         }
     }
 
@@ -842,11 +853,14 @@ mod tests {
         }
     }
 
-    /// A payload whose parameters imply a different record size than the
-    /// stored cells have must be refused, not decoded into a sketch that
-    /// reads fields out of the wrong bytes.
+    /// Every guard in `deserialize` gets a payload that trips it.
+    ///
+    /// Two of these — the zoom exponent and the shutter — are per-record
+    /// values the layout cannot constrain, so a crafted pair decodes into a
+    /// sketch that panics or wraps on first use rather than one that is
+    /// merely wrong.
     #[test]
-    fn deserialize_rejects_params_that_contradict_the_cell_depth() {
+    fn deserialize_rejects_every_state_the_sketch_cannot_represent() {
         #[derive(Serialize)]
         struct Forged {
             cells: Vector3D<u8>,
@@ -854,50 +868,139 @@ mod tests {
             clock: SubWindowClock,
             rounding: u64,
         }
-        let sk = sketch(2, 16, 4, 100);
-        // t=4 gives 6 pixels + 1 + 4 = 11 bytes, padded to 12; t=9 wants 16.
-        let forged = Forged {
-            cells: sk.as_storage().clone(),
-            params: MicroParams { t: 9, c: 2 },
-            clock: SubWindowClock::count_based(100),
-            rounding: 1,
-        };
-        let bytes = rmp_serde::to_vec_named(&forged).expect("serialize");
-        let err = MicroCM::<DefaultXxHasher>::deserialize_from_bytes(&bytes)
-            .expect_err("a depth the layout disagrees with must be refused");
-        assert!(
-            err.to_string().contains("does not match"),
-            "unexpected error: {err}"
-        );
-    }
 
-    /// A payload whose column count is not a power of two is refused, the
-    /// same way the constructor refuses one.
-    #[test]
-    fn deserialize_rejects_non_power_of_two_cols() {
-        #[derive(Serialize)]
-        struct Forged {
-            cells: Vector3D<u8>,
-            params: MicroParams,
-            clock: SubWindowClock,
-            rounding: u64,
+        fn cells_for(rows: usize, cols: usize, depth: usize) -> Vector3D<u8> {
+            let mut cells: Vector3D<u8> = Vector3D::init(rows, cols, depth);
+            cells.fill(0);
+            cells
         }
-        let params = MicroParams::new(4, 2);
-        let depth = MicroLayout::new(params).depth();
-        let mut cells: Vector3D<u8> = Vector3D::init(2, 17, depth);
-        cells.fill(0);
-        let forged = Forged {
-            cells,
-            params,
-            clock: SubWindowClock::count_based(100),
-            rounding: 1,
-        };
-        let bytes = rmp_serde::to_vec_named(&forged).expect("serialize");
-        let err = MicroCM::<DefaultXxHasher>::deserialize_from_bytes(&bytes)
-            .expect_err("a non-power-of-two width must be refused");
-        assert!(
-            err.to_string().contains("power of two"),
-            "unexpected error: {err}"
+        fn attempt(cells: Vector3D<u8>, params: MicroParams, clock: SubWindowClock) -> String {
+            let forged = Forged {
+                cells,
+                params,
+                clock,
+                rounding: 1,
+            };
+            let bytes = rmp_serde::to_vec_named(&forged).expect("encode");
+            MicroCM::<DefaultXxHasher>::deserialize_from_bytes(&bytes)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        }
+
+        let good = MicroParams::new(4, 2);
+        let depth = MicroLayout::new(good).depth();
+        let clock = SubWindowClock::count_based(100);
+
+        // A sane payload decodes, so each case below fails for its own
+        // reason rather than because the shape was wrong to begin with.
+        assert_eq!(
+            attempt(cells_for(2, 16, depth), good, clock),
+            "",
+            "the control payload must decode"
         );
+
+        // A record whose zoom exponent is past the cap: `c^Z` overflows.
+        let mut zoomed = cells_for(2, 16, depth);
+        zoomed.as_mut_slice()[MicroLayout::new(good).pixels()] = 200;
+        // A record whose shutter is not below one unit: the merge carry it
+        // bounds can then overflow the pixel sum.
+        let mut loose = cells_for(2, 16, depth);
+        {
+            let layout = MicroLayout::new(good);
+            let slice = loose.as_mut_slice();
+            slice[layout.pixels()] = 3; // Z = 3, so one unit is 8
+            slice[layout.pixels() + 1] = 99; // shutter low byte
+        }
+
+        for (label, err, want) in [
+            (
+                "t past the cap",
+                attempt(
+                    cells_for(2, 16, depth),
+                    MicroParams {
+                        t: usize::MAX,
+                        c: 2,
+                    },
+                    clock,
+                ),
+                "must be in 1..=",
+            ),
+            (
+                "zoom base below 2",
+                attempt(cells_for(2, 16, depth), MicroParams { t: 4, c: 1 }, clock),
+                "zoom base c must be in",
+            ),
+            (
+                "zoom base past a byte pixel",
+                attempt(
+                    cells_for(2, 16, depth),
+                    MicroParams { t: 4, c: 1_000 },
+                    clock,
+                ),
+                "zoom base c must be in",
+            ),
+            (
+                "depth the layout disagrees with",
+                attempt(cells_for(2, 16, depth + 4), good, clock),
+                "does not match",
+            ),
+            (
+                "cols not a power of two",
+                attempt(cells_for(2, 17, depth), good, clock),
+                "power of two",
+            ),
+            (
+                "single column",
+                attempt(cells_for(2, 1, depth), good, clock),
+                "at least 2",
+            ),
+            (
+                // 22 rows x 6 column bits = 132 > 128.
+                "rows past the packed hash",
+                attempt(cells_for(22, 64, depth), good, clock),
+                "exceeds the",
+            ),
+            (
+                "zero-length sub-window",
+                attempt(
+                    cells_for(2, 16, depth),
+                    good,
+                    SubWindowClock::CountBased {
+                        items_per_sub_window: 0,
+                        seen: 0,
+                    },
+                ),
+                "must be non-zero",
+            ),
+            (
+                "zero-length time sub-window",
+                attempt(
+                    cells_for(2, 16, depth),
+                    good,
+                    SubWindowClock::TimeBased {
+                        sub_window_len: 0,
+                        epoch: 0,
+                        now: 0,
+                    },
+                ),
+                "must be non-zero",
+            ),
+            (
+                "zoom exponent past the cap",
+                attempt(zoomed, good, clock),
+                "exceeds the maximum",
+            ),
+            (
+                "shutter at or above one unit",
+                attempt(loose, good, clock),
+                "not below one unit",
+            ),
+        ] {
+            assert!(
+                err.contains(want),
+                "{label}: expected an error containing {want:?}, got {err:?}"
+            );
+        }
     }
 }
