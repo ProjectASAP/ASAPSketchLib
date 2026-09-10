@@ -16,10 +16,12 @@
 //! fixed direction would bias every zoomed cell by up to half a unit per
 //! pixel per zoom, compounding as a cell zooms further.
 //!
-//! The `cell` module holds the record layout and the per-cell algorithm,
-//! on `&[u8]` and nothing else. [`MicroCM`] puts a Count-Min-shaped grid of those cells
-//! behind a hash: `rows` independent rows, one cell per row per key, and the
-//! minimum across rows as the answer.
+//! The `cell` module holds the record layout and the per-cell algorithm, on
+//! `&[u8]` and nothing else. [`MicroCM`] puts a Count-Min-shaped grid of
+//! those cells behind a hash: `rows` independent rows, one cell per row per
+//! key, and a minimum across rows taken **per sub-window** and summed over
+//! the window — `sum(min) <= min(sum)`, so letting a different row supply
+//! each sub-window is the tighter of the two reductions.
 //!
 //! # Why the fields share a record
 //!
@@ -33,8 +35,9 @@
 //!
 //! The sub-window number is sketch-wide, not per cell, so an insert needs no
 //! per-cell timestamp and touches only the one record it hashes to. The one
-//! whole-table pass is the zoom-in sweep at a sub-window boundary, which runs
-//! once per sub-window and walks the storage sequentially.
+//! whole-table pass is the sub-window boundary, which closes out each cell's
+//! shutter, clears the slots the new sub-windows land on and reclaims
+//! resolution — once per sub-window, walking the storage sequentially.
 //!
 //! # Status
 //!

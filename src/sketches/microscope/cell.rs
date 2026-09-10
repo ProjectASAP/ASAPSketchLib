@@ -147,10 +147,12 @@ pub struct MicroLayout {
     zoom_at: usize,
     shutter_at: usize,
     depth: usize,
-    /// A zoom-in is refused when any pixel is `>= 256 / c`, since multiplying
-    /// it by `c` would not fit a byte. The test is conservative for a `c`
-    /// that does not divide 256: at `c = 3` it refuses 85, whose product 255
-    /// would in fact have fitted.
+    /// The largest pixel a zoom-in may keep: `255 / c`, so a zoom-in is
+    /// refused once any pixel would exceed a byte when multiplied by `c`.
+    ///
+    /// Deliberately not `256 / c`, which is zero for `c > 256` and would
+    /// make the refusal vacuously true for every cell — including an empty
+    /// one — leaving a cell that zoomed out unable to ever zoom back in.
     zoom_in_ceiling: u32,
 }
 
@@ -820,6 +822,52 @@ mod tests {
         // Already at Z=0: zooming in again is refused, not an underflow.
         assert!(!try_zoom_in(&mut cell, &layout));
         assert_eq!(zoom(&cell, &layout), 0);
+    }
+
+    /// The zoom-in ceiling admits exactly the pixels whose product fits a
+    /// byte, and never degenerates to refusing everything.
+    ///
+    /// At `256 / c` the ceiling is zero for any `c > 256`, which makes the
+    /// refusal vacuously true for every cell — an all-zero one included — so
+    /// a cell that zoomed out could never zoom back in and every later count
+    /// was reported at the coarse unit. That is a downward one-sided error,
+    /// the opposite of what the estimator promises.
+    #[test]
+    fn the_zoom_in_ceiling_admits_exactly_what_fits_a_byte() {
+        for c in [2u32, 3, 5, 16, 255, 256] {
+            let layout = MicroLayout::new(MicroParams::new(4, c));
+            let mut cell = vec![0u8; layout.depth()];
+            for p in 0..=PIXEL_MAX {
+                for slot in cell.iter_mut().take(layout.pixels()) {
+                    *slot = 0;
+                }
+                cell[layout.zoom_at] = 1;
+                cell[layout.pixel_at(0)] = p;
+                let fits = p as u32 * c <= PIXEL_MAX as u32;
+                assert_eq!(
+                    try_zoom_in(&mut cell, &layout),
+                    fits,
+                    "c={c}, pixel={p}: product {} against a byte",
+                    p as u32 * c
+                );
+            }
+            // An empty cell can always reclaim resolution, whatever `c` is.
+            for slot in cell.iter_mut().take(layout.pixels()) {
+                *slot = 0;
+            }
+            cell[layout.zoom_at] = 1;
+            assert!(
+                try_zoom_in(&mut cell, &layout),
+                "c={c}: an empty cell must be able to zoom back in"
+            );
+            assert_eq!(zoom(&cell, &layout), 0);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "zoom base c must be in 2..=256")]
+    fn a_zoom_base_past_a_byte_pixel_is_refused() {
+        MicroParams::new(4, 257);
     }
 
     /// A zoom-in is refused while any pixel would overflow, so it can never
