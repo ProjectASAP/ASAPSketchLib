@@ -32,11 +32,17 @@ use crate::MatrixFastHash;
 ///
 /// # Layout
 ///
-/// The layout is array-of-structs. Per-item paths (insert, query) touch every
-/// field of one bucket, so one bucket is one cache line's worth of work; a
-/// full-table sweep over `as_mut_slice().chunks_exact_mut(depth)` stays
-/// sequential. A sketch whose hot path instead touches *one* field across
-/// *all* cells is not a fit for this type.
+/// The layout is array-of-structs: a bucket's elements are adjacent, and
+/// consecutive buckets are adjacent to each other. A per-item path touches
+/// one bucket, and a full-table sweep over
+/// `as_mut_slice().chunks_exact_mut(depth)` walks the storage in order.
+///
+/// How much of a bucket a per-item path actually reads is the sketch's
+/// business, not this type's — one caller here rewrites the whole record on
+/// every insert, the other touches a single byte of a 256-byte one. What
+/// the layout guarantees is contiguity, not that a bucket fits a cache line.
+/// A sketch whose hot path touches *one* field across *all* cells is not a
+/// fit either way.
 #[derive(Clone, Debug, Serialize)]
 pub struct Vector3D<T> {
     data: Vec<T>,

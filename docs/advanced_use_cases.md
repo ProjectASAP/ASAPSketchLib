@@ -67,10 +67,11 @@ API references: [`docs/api/api_hashlayer.md`](./api/api_hashlayer.md), [`docs/ap
 **Alternative: `MicroCM`**
 
 `MicroCM` (MicroscopeSketch) puts the window *inside* the cells instead of
-wrapping whole sketches in buckets. Each cell holds `T+2` byte-wide counters —
-one per sub-window — plus a shared zoom exponent that rescales the whole cell
-when a counter is about to overflow, so the counters never have to be widened
-for the largest count they might see. There is one sketch, not a sequence of
+wrapping whole sketches in buckets. Each cell holds `T+2` byte-wide counters — enough
+for the `T` sub-windows of the window, the one partially expired behind it,
+and the one being cleared ahead — plus a shared zoom exponent that rescales
+the whole cell when a counter is about to overflow, so the counters never
+have to be widened for the largest count they might see. There is one sketch, not a sequence of
 them, and expiry is a single sequential pass at each sub-window boundary.
 
 The trade is coverage: EH wraps any mergeable sketch and answers whatever that

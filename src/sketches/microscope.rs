@@ -16,8 +16,8 @@
 //! (its probabilistic branch is commented out). The same holds for the
 //! partial shutter a sub-window boundary closes out.
 //!
-//! [`cell`](crate::sketches::microscope::cell) holds the record layout and the per-cell algorithm, on `&[u8]`
-//! and nothing else. [`MicroCM`] puts a Count-Min-shaped grid of those cells
+//! The `cell` module holds the record layout and the per-cell algorithm,
+//! on `&[u8]` and nothing else. [`MicroCM`] puts a Count-Min-shaped grid of those cells
 //! behind a hash: `rows` independent rows, one cell per row per key, and the
 //! minimum across rows as the answer.
 //!
@@ -55,7 +55,7 @@
 /// re-exported below.
 pub(crate) mod cell;
 
-pub use cell::{DeltaStrategy, MicroLayout, MicroParams, Rounding};
+pub use cell::{DeltaStrategy, MAX_SUB_WINDOWS, MicroLayout, MicroParams, Rounding};
 
 use crate::{DataInput, DefaultXxHasher, MatrixFastHash, SketchHasher, Vector3D};
 use rmp_serde::{
@@ -547,7 +547,7 @@ impl<H: SketchHasher> MicroCM<H> {
     /// ring is indexed by sub-window number, so merging two sketches whose
     /// clocks disagree would add unrelated sub-windows together and produce
     /// a sketch whose estimates mean nothing. The paper does not define a
-    /// merge; see [`cell::merge_cells`] for what this one preserves.
+    /// merge; the cell-level `merge_cells` documents what this one preserves.
     ///
     /// `self` is left untouched when the two do not line up.
     pub fn merge(&mut self, other: &Self) -> Result<(), String> {

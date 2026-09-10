@@ -42,9 +42,13 @@ fn SubWindowClock::count_based(items_per_sub_window: u64) -> SubWindowClock
 fn SubWindowClock::time_based(sub_window_len: u64, epoch: u64) -> SubWindowClock
 ```
 
-`cols` must be a power of two and `rows * log2(cols)` must not exceed 128.
-`rounding_seed` seeds the probabilistic rounding a zoom-out uses; a fixed
-value makes a run reproducible.
+`cols` must be a power of two and at least 2 — a single column would route
+every row to the same cell — and `rows * log2(cols)` must not exceed 128.
+`T` must be in `1..=4096`. `rounding_seed` seeds the probabilistic rounding a
+zoom-out uses; a fixed value makes a run reproducible.
+
+`MicroCM::default()` is a 4 x 1024 grid at `T = 12`, `c = 2`, over
+count-based sub-windows of 4096 items.
 
 ## Insert/Update
 
@@ -66,6 +70,32 @@ The window ends part-way through a sub-window, so the oldest sub-window is
 partially expired and `DeltaStrategy` says what to charge for it: `Over` all
 of it, `Under` none of it, `Linear(p)` the fraction `p` still inside.
 `estimate` uses the fraction the clock reports.
+
+The minimum across rows is taken **per sub-window** and those minima summed,
+not the other way round: `sum(min) <= min(sum)`, so letting a different row
+supply each sub-window is the tighter of the two reductions.
+
+`Over` and `Under` bracket the **span**, and while no cell has zoomed
+(`max_zoom() == 0`) the count is exact up to Count-Min inflation, which is
+one-sided upward. Past a zoom, a pixel has been through probabilistic
+rounding and the error is two-sided, bounded by `c^Z` per sub-window read.
+
+## Accessors
+
+```rust
+fn rows(&self) -> usize
+fn cols(&self) -> usize
+fn params(&self) -> MicroParams
+fn cell_bytes(&self) -> usize
+fn sub_window(&self) -> u64
+fn residual_fraction(&self) -> f64
+fn max_zoom(&self) -> u8
+fn advance_to(&mut self, timestamp: u64)     // time-based clocks only
+fn as_storage(&self) -> &Vector3D<u8>
+```
+
+`advance_to` ages a time-based sketch without recording anything. Without it
+an idle stream would answer for the window that ended at the last insert.
 
 ## Merge
 
@@ -105,11 +135,49 @@ up to a multiple of four: 20 bytes at `T = 12`, 8 bytes at `T = 1`.
 - `l = 8`: one pixel is one byte. Packing two 4-bit pixels per byte would
   halve the record and is not implemented.
 - Deletion (the decay a HeavyGuardian-style variant needs) is not implemented.
-- Expiry happens at sub-window boundaries, for every cell. A sketch that is
-  never inserted into never advances its clock, and so never forgets.
+- Expiry happens at sub-window boundaries, for every cell — including the
+  shutter, which is rounded into the sub-window that just ended and reset.
+- A count-based sketch only ages when something is inserted. A time-based
+  one can be aged with `advance_to`.
+- This implementation rounds a zoom-out probabilistically, which is the
+  method the paper describes; the authors' released code always rounds up
+  (its probabilistic branch is commented out).
 
 ## See Also
 
 - [ExponentialHistogram](./api_exponential_histogram.md) — sliding windows by
   wrapping whole sketches in buckets, rather than inside the cells.
 - [Common Structures](./api_common_structures.md) — `Vector3D`.
+
+## Examples
+
+```rust
+use asap_sketchlib::sketches::microscope::{DeltaStrategy, MicroCM, MicroParams, SubWindowClock};
+use asap_sketchlib::DataInput;
+
+// A window of 8 sub-windows of 1000 items: the last ~8000 items.
+let mut sk: MicroCM = MicroCM::with_dimensions(
+    4,
+    1024,
+    MicroParams::new(8, 2),
+    SubWindowClock::count_based(1_000),
+    /* rounding seed */ 42,
+);
+
+for i in 0..5_000u64 {
+    sk.insert(&DataInput::U64(i % 100));
+}
+
+// Nothing has expired yet and nothing has zoomed, so the only error left
+// is Count-Min's, which is one-sided upward.
+assert_eq!(sk.max_zoom(), 0);
+assert!(sk.estimate_with(&DataInput::U64(7), DeltaStrategy::Over) >= 50.0);
+```
+
+## Status
+
+`Experimental`. Behind the `experimental` cargo feature; the API and the wire
+form may change without a major version bump, and no ASAPv1 `kind_id` is
+allocated for it. The algorithm follows Zhao et al., checked against the
+authors' released reference implementation, but this implementation has not
+been compared against the paper's published measurements.

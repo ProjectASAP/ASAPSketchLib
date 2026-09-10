@@ -43,7 +43,6 @@ fn update_by_row<F, V>(&mut self, row: usize, hashed: u128, op: F, value: V)
 
 // Vector3D — the closure receives a whole `depth`-length bucket
 fn fast_insert<Hash, F, V>(&mut self, op: F, value: V, hashed_val: &Hash)
-fn bucket_slice_mut(&mut self, row: usize, col: usize) -> &mut [T]
 fn as_mut_slice(&mut self) -> &mut [T]
 
 // BitMatrix
@@ -77,7 +76,7 @@ fn depth(&self) -> usize
 fn bucket_slice(&self, row: usize, col: usize) -> &[T]
 fn as_slice(&self) -> &[T]
 fn get_mask_bits(&self) -> u32
-fn fast_query_min<Hash, F, R>(&self, hashed_val: &Hash, op: F) -> R
+fn fast_query_min<Hash, F, R>(&self, hashed_val: &Hash, op: F) -> R  // op: Fn(&[T], usize)
 
 // BitMatrix
 fn rows(&self) -> usize
@@ -139,10 +138,14 @@ which is what both callers need: a HyperLogLog precision and a sub-window
 count are configuration values, also read back from deserialized bytes, and a
 const generic cannot express either.
 
-The layout is array-of-structs. Per-item paths touch every field of one cell,
-so a cell is one cache line's worth of work; a periodic whole-table pass over
-`as_mut_slice().chunks_exact_mut(depth())` stays sequential. A sketch whose
-*hot* path instead touches one field across all cells is not a fit.
+The layout is array-of-structs: a cell's elements are adjacent and
+consecutive cells follow one another, so a per-item path touches one
+contiguous run and a whole-table pass over
+`as_mut_slice().chunks_exact_mut(depth())` walks the storage in order. How
+much of a cell a given sketch reads per item is its own business — `MicroCM`
+rewrites the record, `CountMinHll` touches one byte of a 256-byte one. A
+sketch whose *hot* path instead touches one field across all cells is not a
+fit either way.
 
 ## Caveats
 

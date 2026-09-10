@@ -86,13 +86,16 @@ pub struct MicroParams {
 
 /// Upper bound on `T`, so a record stays a sane size and `T + 2` cannot
 /// overflow while a layout is being derived from untrusted bytes.
+///
+/// Re-exported as [`crate::sketches::microscope::MAX_SUB_WINDOWS`].
 pub const MAX_SUB_WINDOWS: usize = 4096;
 
 impl MicroParams {
     /// Builds parameters, rejecting the values the layout cannot represent.
     ///
-    /// Panics if `t` is zero or above [`MAX_SUB_WINDOWS`], or if `c` is
-    /// below 2.
+    /// Panics if `t` is zero or above
+    /// [`MAX_SUB_WINDOWS`](crate::sketches::microscope::MAX_SUB_WINDOWS), or
+    /// if `c` is below 2.
     pub fn new(t: usize, c: u32) -> Self {
         Self::checked(t, c).unwrap_or_else(|detail| panic!("{detail}"))
     }
