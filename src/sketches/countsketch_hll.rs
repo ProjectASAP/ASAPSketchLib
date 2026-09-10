@@ -16,8 +16,9 @@
 //! `rows × cols × 2^precision`: the third dimension is the HLL register array
 //! for each `(row, col)` bucket.
 //!
-//! The HyperLogLog register/rank math mirrors [`crate::sketches::hll`] (classic
-//! estimator with small/large-range corrections).
+//! The HyperLogLog register/rank math is [`crate::sketches::hll`]'s: the same
+//! rank derivation, and literally the same classic estimator applied to each
+//! bucket's register slice.
 //!
 //! # Performance notes
 //!
@@ -29,8 +30,8 @@
 //!   so a column index is a mask of the packed hash with no division.
 //! - **Branchless register update**: `u8::max` compiles to a conditional move,
 //!   avoiding unpredictable branches on dense streams.
-//! - **Single-pass bucket estimator**: `estimate_bucket` fuses the harmonic sum
-//!   and zero-count into one loop traversal.
+//! - **Single-pass bucket estimator**: the shared classic estimator fuses the
+//!   harmonic sum and the zero-count into one loop traversal.
 //!
 //! # Related sketches
 //!
@@ -48,6 +49,7 @@
 //! - Flajolet, Fusy, Gandouet & Meunier, "HyperLogLog: the analysis of a
 //!   near-optimal cardinality estimation algorithm," 2007.
 
+use crate::sketches::hll::classic_estimate;
 use crate::{DataInput, DefaultXxHasher, SketchHasher, Vector3D};
 use rmp_serde::{
     decode::Error as RmpDecodeError, encode::Error as RmpEncodeError, from_slice, to_vec_named,
@@ -253,7 +255,7 @@ impl<H: SketchHasher> CountHll<H> {
         let col_hash = H::hash128_seeded(0, key);
         self.buckets
             .fast_query_min(&col_hash, |registers, _row, _hash| {
-                estimate_bucket(registers)
+                classic_estimate(registers)
             })
     }
 
@@ -285,37 +287,6 @@ impl<H: SketchHasher> CountHll<H> {
     pub fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self, RmpDecodeError> {
         from_slice(bytes)
     }
-}
-
-/// Classic HyperLogLog cardinality estimate over a single register slice.
-///
-/// Mirrors [`crate::sketches::hll`]'s classic estimator, including the
-/// small-range linear-counting and large-range corrections.
-///
-/// Fuses the harmonic-sum accumulation and zero-count into a single pass over
-/// the register slice, halving cache pressure vs. two separate traversals.
-#[inline]
-fn estimate_bucket(registers: &[u8]) -> f64 {
-    let m = registers.len() as f64;
-    let alpha_m = 0.7213 / (1.0 + 1.079 / m);
-    let mut z = 0.0;
-    let mut zero_count: usize = 0;
-    for &reg_val in registers {
-        z += 2f64.powi(-(reg_val as i32));
-        if reg_val == 0 {
-            zero_count += 1;
-        }
-    }
-    let mut est = alpha_m * m * m / z;
-    if est <= m * 5.0 / 2.0 {
-        if zero_count != 0 {
-            est = m * (m / zero_count as f64).ln();
-        }
-    } else if est > 143_165_576.533 {
-        let correction_aux = i32::MAX as f64;
-        est = -correction_aux * (1.0 - est / correction_aux).ln();
-    }
-    est
 }
 
 #[cfg(test)]
