@@ -261,13 +261,22 @@ impl<H: SketchHasher> CountHll<H> {
 
     /// Merges another sketch by taking the element-wise register maximum.
     ///
-    /// Both sketches must share the same grid dimensions and precision.
-    pub fn merge(&mut self, other: &Self) {
-        assert_eq!(
-            (self.buckets.rows(), self.buckets.cols(), self.precision),
-            (other.buckets.rows(), other.buckets.cols(), other.precision),
-            "dimension/precision mismatch while merging CountHll sketches"
-        );
+    /// Both sketches must share the same grid dimensions and precision, so
+    /// that a given `(key, distinct_value)` pair would have landed in the same
+    /// register of the same bucket in either one. Merging mismatched sketches
+    /// would silently mix unrelated registers, so it returns an error rather
+    /// than producing a sketch whose estimates mean nothing.
+    ///
+    /// `self` is left untouched when the dimensions do not line up.
+    pub fn merge(&mut self, other: &Self) -> Result<(), String> {
+        let mine = (self.buckets.rows(), self.buckets.cols(), self.precision);
+        let theirs = (other.buckets.rows(), other.buckets.cols(), other.precision);
+        if mine != theirs {
+            return Err(format!(
+                "cannot merge sketches of different shape: \
+                 (rows, cols, precision) is {mine:?} against {theirs:?}"
+            ));
+        }
         for (reg, other_reg) in self
             .buckets
             .as_mut_slice()
@@ -276,6 +285,7 @@ impl<H: SketchHasher> CountHll<H> {
         {
             *reg = (*reg).max(other_reg);
         }
+        Ok(())
     }
 
     /// Serializes the sketch into MessagePack bytes.
@@ -423,7 +433,7 @@ mod tests {
         for i in 1000..2000u64 {
             b.insert(&k, &val(i));
         }
-        a.merge(&b);
+        a.merge(&b).expect("same shape merges");
         let merged = a.estimate(&k);
         assert!(
             merged > est_a,
@@ -433,6 +443,27 @@ mod tests {
         assert!(
             rel_err < 0.25,
             "merged estimate {merged} too far from 2000 (rel_err {rel_err})"
+        );
+    }
+
+    #[test]
+    fn merge_rejects_a_different_shape_and_leaves_the_target_alone() {
+        let mut a = CountHll::<DefaultXxHasher>::with_dimensions(4, 32, 8);
+        let b = CountHll::<DefaultXxHasher>::with_dimensions(4, 64, 8);
+        let k = key("user_A");
+        for i in 0..300u64 {
+            a.insert(&k, &val(i));
+        }
+        let before = a.as_storage().as_slice().to_vec();
+        let err = a.merge(&b).expect_err("mismatched cols must not merge");
+        assert!(
+            err.contains("different shape"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            a.as_storage().as_slice(),
+            before.as_slice(),
+            "a rejected merge must not touch the target"
         );
     }
 
