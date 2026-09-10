@@ -1264,3 +1264,150 @@ mod documented_matrix {
         eh_input_14_interval_counts_and_expiry => 14, eh_documented_string_input;
     }
 }
+
+// ---------------------------------------------------------------- MicroCM
+
+/// MicroscopeSketch's Count-Min grid over a sliding window.
+///
+/// The window machinery here is inside the sketch rather than wrapped around
+/// it, so there is no bucket span to read a reference off. What replaces it
+/// is that `DeltaStrategy::Over` has an exactly known span: at sub-window `n`
+/// it charges sub-windows `n-T ..= n` in full, and a count-based clock of `L`
+/// items per sub-window puts item `i` in sub-window `i / L`. So the reference
+/// window is items `[(n-T) * L, seen)` — exact, with no tolerance spent on
+/// granularity.
+#[cfg(feature = "experimental")]
+mod microscope {
+    use super::common::specs::CountMinSpec;
+    use super::common::{FreqTruth, zipf_u64};
+    use asap_sketchlib::DataInput;
+    use asap_sketchlib::sketches::microscope::cell;
+    use asap_sketchlib::sketches::microscope::{
+        DeltaStrategy, MicroCM, MicroLayout, MicroParams, SubWindowClock,
+    };
+
+    const ROWS: usize = 4;
+    const COLS: usize = 1024;
+    const T: usize = 8;
+    const PER_SUB_WINDOW: u64 = 1_000;
+    const ITEMS: usize = 40_000;
+
+    fn fresh() -> MicroCM {
+        MicroCM::with_dimensions(
+            ROWS,
+            COLS,
+            MicroParams::new(T, 2),
+            SubWindowClock::count_based(PER_SUB_WINDOW),
+            0x5EED_1234,
+        )
+    }
+
+    /// Whether any cell has zoomed. A run that stays at `Z = 0` counts every
+    /// item individually, so the only error left is Count-Min's.
+    fn max_zoom(sk: &MicroCM, params: MicroParams) -> u8 {
+        let layout = MicroLayout::new(params);
+        sk.as_storage()
+            .as_slice()
+            .chunks_exact(layout.depth())
+            .map(|record| cell::zoom(record, &layout))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Over-charging the oldest sub-window gives a Count-Min sketch of an
+    /// exactly known window, so it is held to the Count-Min contract over
+    /// that window's exact contents — one-sided, with the simultaneous
+    /// additive bound at the sketch's own dimensions.
+    #[test]
+    fn over_holds_the_count_min_contract_on_the_window_it_covers() {
+        let stream = zipf_u64(ITEMS, 4096, 1.1, 20_250_909);
+        let mut sk = fresh();
+        for key in &stream {
+            sk.insert(&DataInput::U64(*key));
+        }
+
+        let n = sk.sub_window();
+        assert_eq!(
+            n,
+            ITEMS as u64 / PER_SUB_WINDOW,
+            "the clock should have advanced once per {PER_SUB_WINDOW} items"
+        );
+        assert_eq!(
+            max_zoom(&sk, MicroParams::new(T, 2)),
+            0,
+            "this load is sized to stay below a zoom, so the only error under \
+             test is Count-Min's; a zoom here means the test is measuring \
+             something looser than it claims"
+        );
+
+        // The exact contents of the span `Over` charges: sub-windows n-T..=n.
+        let first = (n.saturating_sub(T as u64) * PER_SUB_WINDOW) as usize;
+        let mut truth = FreqTruth::default();
+        for key in &stream[first..] {
+            truth.observe(*key as i64);
+        }
+
+        let spec = CountMinSpec::new(ROWS, COLS);
+        spec.assert_contract(
+            "MicroCM/Over",
+            &truth,
+            |key| sk.estimate_with(&DataInput::U64(key as u64), DeltaStrategy::Over),
+            &format!("zipf(4096, 1.1) x {ITEMS}, window = {T} x {PER_SUB_WINDOW} items"),
+        );
+    }
+
+    /// `Under` charges none of the partially expired sub-window and `Over`
+    /// charges all of it, so the default `Linear` weighting sits between
+    /// them, for every key.
+    #[test]
+    fn under_linear_and_over_stay_ordered_for_every_key() {
+        let stream = zipf_u64(ITEMS, 4096, 1.1, 4_242);
+        let mut sk = fresh();
+        for key in &stream {
+            sk.insert(&DataInput::U64(*key));
+        }
+        // Land part-way into a sub-window so the three policies differ.
+        for key in stream.iter().take(377) {
+            sk.insert(&DataInput::U64(*key));
+        }
+        for key in 0..4096u64 {
+            let probe = DataInput::U64(key);
+            let under = sk.estimate_with(&probe, DeltaStrategy::Under);
+            let over = sk.estimate_with(&probe, DeltaStrategy::Over);
+            let linear = sk.estimate(&probe);
+            assert!(
+                under <= linear && linear <= over,
+                "key {key}: Under {under} <= Linear {linear} <= Over {over} violated"
+            );
+        }
+    }
+
+    /// A key that stops appearing leaves the window, even though nothing
+    /// writes to its cells again — the sub-window boundary clears every cell,
+    /// not just the ones being inserted into.
+    #[test]
+    fn a_key_that_goes_quiet_leaves_the_window() {
+        let mut sk = fresh();
+        let loud = DataInput::U64(11);
+        for _ in 0..3 * PER_SUB_WINDOW {
+            sk.insert(&loud);
+        }
+        assert!(sk.estimate_with(&loud, DeltaStrategy::Under) > 0.0);
+
+        // Push the window past the burst with traffic that avoids key 11.
+        let filler = zipf_u64(((T + 2) as u64 * PER_SUB_WINDOW) as usize, 4096, 1.1, 77);
+        for key in &filler {
+            sk.insert(&DataInput::U64(key.wrapping_add(1_000_000)));
+        }
+        let est = sk.estimate_with(&loud, DeltaStrategy::Over);
+        // Whatever is left is other keys' traffic colliding into the same
+        // cells, bounded by Count-Min over the filler, not by key 11.
+        let bound = CountMinSpec::new(ROWS, COLS).marginal_bound(filler.len() as f64, 0.0)
+            * CountMinSpec::new(ROWS, COLS).simultaneous_factor(4096, 1e-3);
+        assert!(
+            est <= bound,
+            "key 11 should have aged out; {est} exceeds the {bound} that \
+             collisions alone can account for"
+        );
+    }
+}
