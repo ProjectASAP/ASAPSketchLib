@@ -49,7 +49,11 @@
 //!   Accurate Sliding Estimation Using Adaptive Zooming," KDD 2023.
 
 /// The per-cell record layout and algorithm.
-pub mod cell;
+///
+/// Crate-private, like every other sketch's sub-module here: the record
+/// operations are an implementation detail, and the types callers need are
+/// re-exported below.
+pub(crate) mod cell;
 
 pub use cell::{DeltaStrategy, MicroLayout, MicroParams, Rounding};
 
@@ -235,15 +239,9 @@ impl<'de, H: SketchHasher> Deserialize<'de> for MicroCM<H> {
             clock,
             rounding,
         } = MicroCMSeed::deserialize(deserializer)?;
-        if params.t == 0 {
-            return Err(serde::de::Error::custom("t must be non-zero"));
-        }
-        if params.c < 2 {
-            return Err(serde::de::Error::custom(format!(
-                "zoom base c ({}) must be at least 2",
-                params.c
-            )));
-        }
+        // Validate before deriving the layout: `MicroLayout::new` computes
+        // `t + 2`, which a crafted `t` could overflow.
+        MicroParams::checked(params.t, params.c).map_err(serde::de::Error::custom)?;
         let layout = MicroLayout::new(params);
         if cells.depth() != layout.depth() {
             return Err(serde::de::Error::custom(format!(
@@ -255,9 +253,9 @@ impl<'de, H: SketchHasher> Deserialize<'de> for MicroCM<H> {
             )));
         }
         let cols = cells.cols();
-        if !cols.is_power_of_two() {
+        if cols < 2 || !cols.is_power_of_two() {
             return Err(serde::de::Error::custom(format!(
-                "cols ({cols}) must be a power of two"
+                "cols ({cols}) must be a power of two and at least 2"
             )));
         }
         let rows = cells.rows();
@@ -285,6 +283,12 @@ impl<'de, H: SketchHasher> Deserialize<'de> for MicroCM<H> {
             }
             _ => {}
         }
+        // Each record carries a zoom exponent and a shutter that the layout
+        // cannot constrain; a crafted pair panics or wraps on first use.
+        for (index, record) in cells.as_slice().chunks_exact(layout.depth()).enumerate() {
+            cell::validate(record, &layout)
+                .map_err(|detail| serde::de::Error::custom(format!("cell {index}: {detail}")))?;
+        }
         Ok(Self {
             cells,
             params,
@@ -293,6 +297,20 @@ impl<'de, H: SketchHasher> Deserialize<'de> for MicroCM<H> {
             layout,
             _hasher: PhantomData,
         })
+    }
+}
+
+impl Default for MicroCM<DefaultXxHasher> {
+    /// A 4 x 1024 grid at `T = 12`, `c = 2`, over count-based sub-windows of
+    /// 4096 items — a sliding window of roughly 49k items.
+    fn default() -> Self {
+        Self::with_dimensions(
+            4,
+            1024,
+            MicroParams::default(),
+            SubWindowClock::count_based(4096),
+            0,
+        )
     }
 }
 
@@ -312,10 +330,12 @@ impl<H: SketchHasher> MicroCM<H> {
         clock: SubWindowClock,
         rounding_seed: u64,
     ) -> Self {
-        assert!(rows > 0 && cols > 0, "rows and cols must be non-zero");
+        assert!(rows > 0, "rows must be non-zero");
         assert!(
-            cols.is_power_of_two(),
-            "cols must be a power of two, got {cols}"
+            cols >= 2 && cols.is_power_of_two(),
+            "cols must be a power of two and at least 2, got {cols}; a single \
+             column would route every row to the same cell and collapse the \
+             minimum across rows to one counter"
         );
         let layout = MicroLayout::new(params);
         let mut cells = Vector3D::init(rows, cols, layout.depth());
@@ -357,9 +377,47 @@ impl<H: SketchHasher> MicroCM<H> {
         self.layout.depth()
     }
 
+    /// The highest zoom exponent any cell has reached.
+    ///
+    /// A sketch still at zero has counted every item individually and its
+    /// answers carry no rounding; past zero, each pixel has been through a
+    /// probabilistic division and the estimate is accurate to within `c^Z`
+    /// per sub-window read. Useful for deciding whether a configuration has
+    /// enough pixels for its load.
+    pub fn max_zoom(&self) -> u8 {
+        let layout = self.layout;
+        self.cells
+            .as_slice()
+            .chunks_exact(layout.depth())
+            .map(|record| cell::zoom(record, &layout))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The current sub-window number.
     pub fn sub_window(&self) -> u64 {
         self.clock.n()
+    }
+
+    /// The fraction of the oldest sub-window still inside the window, which
+    /// is the weight [`Self::estimate`] gives it.
+    pub fn residual_fraction(&self) -> f64 {
+        self.clock.residual_fraction()
+    }
+
+    /// Moves a time-based clock to `timestamp` without recording anything.
+    ///
+    /// Without this a time-based sketch only ages when something is inserted,
+    /// so a query made long after the last insert would answer for the window
+    /// that ended then. Call it before querying an idle stream.
+    ///
+    /// Panics if this sketch's clock is count-based, where the window is
+    /// defined by item count and there is nothing to advance.
+    pub fn advance_to(&mut self, timestamp: u64) {
+        let crossed = self.clock.advance_to(timestamp);
+        if crossed > 0 {
+            self.enter_sub_window(crossed);
+        }
     }
 
     /// Exposes the backing storage for inspection and testing.
@@ -401,10 +459,7 @@ impl<H: SketchHasher> MicroCM<H> {
     ///
     /// Panics if this sketch's clock is count-based; use [`Self::insert`].
     pub fn insert_at(&mut self, key: &DataInput, timestamp: u64) {
-        let crossed = self.clock.advance_to(timestamp);
-        if crossed > 0 {
-            self.enter_sub_window(crossed);
-        }
+        self.advance_to(timestamp);
         self.record(key);
     }
 
@@ -694,34 +749,35 @@ mod tests {
         sk.insert_at(&key(1), 5);
     }
 
-    /// A merge of two halves recovers what a single pass over both would
-    /// have counted, up to the rounding a zoom introduces.
+    /// A merge of two halves recovers exactly what a single pass over both
+    /// would have counted.
+    ///
+    /// The load is sized so no cell ever zooms — on either side or after the
+    /// merge — which makes the arithmetic exact and the assertion an
+    /// equality rather than a band. `merge_advances_the_rounding_stream`
+    /// covers the zoomed path.
     #[test]
-    fn merge_recovers_the_combined_count() {
-        let mut left = sketch(2, 32, 4, 400);
-        let mut right = sketch(2, 32, 4, 400);
-        let mut single = sketch(2, 32, 4, 400);
-        // Both halves must end at the same sub-window, so feed each the same
-        // number of items and pad the single sketch to match by feeding it
-        // both halves' items.
-        for i in 0..800u64 {
+    fn merge_recovers_the_combined_count_exactly_below_a_zoom() {
+        const PER_SUB_WINDOW: u64 = 200;
+        let mut left = sketch(2, 32, 4, PER_SUB_WINDOW);
+        let mut right = sketch(2, 32, 4, PER_SUB_WINDOW);
+        // Key 3 takes every other item on both sides: 100 per sub-window
+        // each, so the merged pixel is 200 and still fits a byte.
+        for i in 0..4 * PER_SUB_WINDOW {
             left.insert(&key(if i % 2 == 0 { 3 } else { 4 }));
             right.insert(&key(if i % 2 == 0 { 3 } else { 5 }));
         }
-        for i in 0..800u64 {
-            single.insert(&key(if i % 2 == 0 { 3 } else { 4 }));
-            single.insert(&key(if i % 2 == 0 { 3 } else { 5 }));
-        }
         assert_eq!(left.sub_window(), right.sub_window());
+        assert_eq!(left.max_zoom(), 0, "the load must stay below a zoom");
+        assert_eq!(right.max_zoom(), 0, "the load must stay below a zoom");
+
         left.merge(&right).expect("same shape and clock");
-        // Key 3 was inserted 400 times into each half.
-        let merged = left.estimate_with(&key(3), DeltaStrategy::Over);
-        assert!(
-            (merged - 800.0).abs() <= 800.0 * 0.05,
-            "merged estimate {merged} is not within 5% of 800"
+        assert_eq!(left.max_zoom(), 0, "the merge must not have zoomed");
+        assert_eq!(
+            left.estimate_with(&key(3), DeltaStrategy::Over),
+            800.0,
+            "400 inserts on each side, none expired, no rounding anywhere"
         );
-        // And the merge is one-sided in the same direction as the sketch.
-        assert!(merged >= 700.0, "merge lost too much: {merged}");
     }
 
     /// A merge takes its rounding draws from the sketch's own stream, so two

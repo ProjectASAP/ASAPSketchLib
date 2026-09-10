@@ -69,6 +69,11 @@ const DEFAULT_ROW_NUM: usize = 4;
 const DEFAULT_COL_NUM: usize = 64;
 const DEFAULT_PRECISION: u32 = 8;
 
+/// Seed index for the value hash. Any non-zero index works; what matters is
+/// that it is not the column hash's seed 0 and does not depend on `rows`,
+/// since `SEEDLIST` indices wrap at [`MATRIX_MAX_ROWS`].
+const HLL_SEED: usize = 1;
+
 /// A Count-Min-shaped grid whose cells are per-bucket HyperLogLog sketches.
 ///
 /// `rows` independent hash rows each route an item to one of `cols` columns; the
@@ -105,9 +110,6 @@ impl<'de, H: SketchHasher> Deserialize<'de> for CountMinHll<H> {
                 "precision {precision} out of range 1..=18"
             )));
         }
-        if rows == 0 || cols == 0 {
-            return Err(serde::de::Error::custom("rows and cols must be non-zero"));
-        }
         let expected_depth = 1usize << precision;
         if buckets.depth() != expected_depth {
             return Err(serde::de::Error::custom(format!(
@@ -116,9 +118,9 @@ impl<'de, H: SketchHasher> Deserialize<'de> for CountMinHll<H> {
                 precision
             )));
         }
-        if !cols.is_power_of_two() {
+        if cols < 2 || !cols.is_power_of_two() {
             return Err(serde::de::Error::custom(format!(
-                "cols ({cols}) must be a power of two"
+                "cols ({cols}) must be a power of two and at least 2"
             )));
         }
         let col_bits = buckets.get_mask_bits() as usize;
@@ -158,10 +160,12 @@ impl<H: SketchHasher> CountMinHll<H> {
             (1..=18).contains(&precision),
             "precision must be in 1..=18, got {precision}"
         );
-        assert!(rows > 0 && cols > 0, "rows and cols must be non-zero");
+        assert!(rows > 0, "rows must be non-zero");
         assert!(
-            cols.is_power_of_two(),
-            "cols must be a power of two, got {cols}"
+            cols >= 2 && cols.is_power_of_two(),
+            "cols must be a power of two and at least 2, got {cols}; a single \
+             column would route every row to the same bucket and collapse the \
+             minimum across rows to one HyperLogLog"
         );
         let depth = 1usize << precision;
         let mut buckets = Vector3D::init(rows, cols, depth);
@@ -206,15 +210,7 @@ impl<H: SketchHasher> CountMinHll<H> {
         &self.buckets
     }
 
-    /// Mutable access used internally for testing scenarios.
-    pub fn as_storage_mut(&mut self) -> &mut Vector3D<u8> {
-        &mut self.buckets
-    }
-
     /// Computes the HLL `(register_index, rank)` pair from the HLL hash.
-    ///
-    /// The seed used (`rows`) is distinct from the per-row column seeds (`0..rows`),
-    /// so column placement and register selection are independent.
     #[inline(always)]
     fn register_and_rank_from_hash(&self, hll_hash: u64) -> (usize, u8) {
         let register_bits = 64 - self.precision;
@@ -226,14 +222,19 @@ impl<H: SketchHasher> CountMinHll<H> {
     /// Records that `distinct_value` was observed for `key`.
     ///
     /// Uses **2 hash calls** regardless of row count:
-    /// 1. `hash128_seeded(0, key)` → packed column bits for all rows.
-    /// 2. `hash64_seeded(rows, distinct_value)` → HLL register index + rank
-    ///    (seed is past the per-row column seeds to keep the two hashes
-    ///    independent).
+    /// 1. `hash128_seeded(0, key)` → one 128-bit value that `Vector3D` slices
+    ///    into a column index per row.
+    /// 2. `hash64_seeded(HLL_SEED, distinct_value)` → HLL register index and
+    ///    rank.
+    ///
+    /// The two use different seeds, so column placement and register
+    /// selection are independent. The HLL seed is a fixed constant rather
+    /// than a function of `rows`: `SEEDLIST` has `MATRIX_MAX_ROWS` entries
+    /// and the index wraps, so a row count equal to that length would have
+    /// selected seed 0 — the column seed — and tied the two together.
     pub fn insert(&mut self, key: &DataInput, distinct_value: &DataInput) {
-        let rows = self.buckets.rows();
         let col_hash = H::hash128_seeded(0, key);
-        let hll_hash = H::hash64_seeded(rows, distinct_value);
+        let hll_hash = H::hash64_seeded(HLL_SEED, distinct_value);
         let (index, rank) = self.register_and_rank_from_hash(hll_hash);
         self.buckets.fast_insert(
             |registers, &(index, rank): &(usize, u8), _row| {
@@ -262,9 +263,7 @@ impl<H: SketchHasher> CountMinHll<H> {
     pub fn estimate(&self, key: &DataInput) -> f64 {
         let col_hash = H::hash128_seeded(0, key);
         self.buckets
-            .fast_query_min(&col_hash, |registers, _row, _hash| {
-                classic_estimate(registers)
-            })
+            .fast_query_min(&col_hash, |registers, _row| classic_estimate(registers))
     }
 
     /// Merges another sketch by taking the element-wise register maximum.
@@ -314,6 +313,17 @@ mod tests {
 
     fn key(s: &'static str) -> DataInput<'static> {
         DataInput::Str(s)
+    }
+
+    /// HyperLogLog's own relative-error band at this precision: `z` standard
+    /// errors of `1.04 / sqrt(m)`. Derived from the sketch's configuration
+    /// rather than chosen, so it moves when the configuration does.
+    ///
+    /// `z = 4` is a two-sided tail of 6.3e-5 under the normal approximation,
+    /// matching what the E2E suites use.
+    fn hll_band(precision: u32, z: f64) -> f64 {
+        let m = (1u32 << precision) as f64;
+        z * 1.04 / m.sqrt()
     }
 
     fn val(n: u64) -> DataInput<'static> {
@@ -391,7 +401,15 @@ mod tests {
             sk.insert(&k, &v);
         }
         let est = sk.estimate(&k);
-        assert!(est < 3.0, "expected near-1 distinct estimate, got {est}");
+        // One distinct value leaves exactly one register set, so every
+        // bucket takes the linear-counting branch and the answer is the
+        // closed form m * ln(m / (m - 1)) — no sampling error to allow for.
+        let m = (1u32 << DEFAULT_PRECISION) as f64;
+        let exact = m * (m / (m - 1.0)).ln();
+        assert!(
+            (est - exact).abs() < 1e-9,
+            "expected the linear-counting value {exact}, got {est}"
+        );
     }
 
     #[test]
@@ -404,9 +422,11 @@ mod tests {
         }
         let est = sk.estimate(&k);
         let rel_err = (est - n as f64).abs() / n as f64;
+        let band = hll_band(8, 4.0);
         assert!(
-            rel_err < 0.25,
-            "estimate {est} too far from {n} (rel_err {rel_err})"
+            rel_err < band,
+            "estimate {est} against {n} is {rel_err} off, past HyperLogLog's \
+             own band of {band} at precision 8"
         );
     }
 
@@ -420,12 +440,14 @@ mod tests {
             sk.insert(&ka, &val(i));
         }
         let est_b = sk.estimate(&kb);
-        // key_B shares a bucket with key_A only by collision; with 64 cols the
-        // collision probability is low, and taking the minimum across rows
-        // discards any row where such a collision happened.
-        assert!(
-            est_b < 50.0,
-            "key_B estimate {est_b} should be near zero (no inserts for key_B)"
+        // key_B shares a bucket with key_A only by collision, and the
+        // minimum across rows discards any row where that happened. A bucket
+        // no one has touched is all zeros, which takes the linear-counting
+        // branch to m * ln(m/m) = 0 — so this is exact, not a tolerance.
+        assert_eq!(
+            est_b, 0.0,
+            "key_B had no inserts and at least one clean row, so its estimate \
+             must be exactly zero"
         );
     }
 
@@ -448,9 +470,11 @@ mod tests {
             "merged estimate {merged} should exceed single-sketch {est_a}"
         );
         let rel_err = (merged - 2000.0).abs() / 2000.0;
+        let band = hll_band(DEFAULT_PRECISION, 4.0);
         assert!(
-            rel_err < 0.25,
-            "merged estimate {merged} too far from 2000 (rel_err {rel_err})"
+            rel_err < band,
+            "merged estimate {merged} against 2000 is {rel_err} off, past \
+             HyperLogLog's own band of {band}"
         );
     }
 
@@ -525,17 +549,56 @@ mod tests {
         assert_eq!(sk.rows(), 21);
     }
 
+    /// Every guard in `deserialize` gets a payload that trips it.
+    ///
+    /// These are forged, not merely decoded: the point is that a crafted
+    /// payload cannot produce a sketch whose accessors read out of bounds or
+    /// whose routing shifts past the packed hash. A test that decodes valid
+    /// bytes and asserts an invariant of the *constructor* proves nothing
+    /// about the decoder.
     #[test]
-    fn deserialize_rejects_depth_mismatch() {
-        // Build a valid sketch, then tamper with the backing storage to create
-        // a depth that doesn't match 2^precision.
-        let sk = CountMinHll::<DefaultXxHasher>::with_dimensions(4, 32, 8);
-        let bytes = sk.serialize_to_bytes().expect("serialize");
-        // Deserializing the untampered bytes must succeed.
-        CountMinHll::<DefaultXxHasher>::deserialize_from_bytes(&bytes).expect("decode");
-        // Depth-mismatch detection is validated by the invariant check below.
-        let expected_depth = 1usize << sk.precision();
-        assert_eq!(sk.registers_per_bucket(), expected_depth);
+    fn deserialize_rejects_every_state_the_sketch_cannot_represent() {
+        #[derive(Serialize)]
+        struct Forged {
+            buckets: Vector3D<u8>,
+            precision: u32,
+        }
+        fn attempt(rows: usize, cols: usize, depth: usize, precision: u32) -> String {
+            let mut buckets: Vector3D<u8> = Vector3D::init(rows, cols, depth);
+            buckets.fill(0);
+            let bytes = rmp_serde::to_vec_named(&Forged { buckets, precision }).expect("encode");
+            CountMinHll::<DefaultXxHasher>::deserialize_from_bytes(&bytes)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        }
+
+        // A sane payload decodes, so the cases below fail for their own
+        // reason and not because the shape was wrong to begin with.
+        assert_eq!(
+            attempt(4, 32, 256, 8),
+            "",
+            "the control payload must decode"
+        );
+
+        for (label, err, want) in [
+            ("precision 0", attempt(4, 32, 1, 0), "out of range"),
+            ("precision 19", attempt(4, 32, 1, 19), "out of range"),
+            ("depth mismatch", attempt(4, 32, 128, 8), "does not match"),
+            (
+                "cols not a power of two",
+                attempt(4, 17, 256, 8),
+                "power of two",
+            ),
+            ("single column", attempt(4, 1, 256, 8), "at least 2"),
+            // 22 rows x 6 column bits = 132 > 128.
+            ("rows past the hash", attempt(22, 64, 256, 8), "exceeds the"),
+        ] {
+            assert!(
+                err.contains(want),
+                "{label}: expected an error containing {want:?}, got {err:?}"
+            );
+        }
     }
 
     #[test]

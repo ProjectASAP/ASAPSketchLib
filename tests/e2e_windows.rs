@@ -1280,11 +1280,10 @@ mod documented_matrix {
 mod microscope {
     use super::common::specs::CountMinSpec;
     use super::common::{FreqTruth, zipf_u64};
-    use asap_sketchlib::DataInput;
-    use asap_sketchlib::sketches::microscope::cell;
     use asap_sketchlib::sketches::microscope::{
-        DeltaStrategy, MicroCM, MicroLayout, MicroParams, SubWindowClock,
+        DeltaStrategy, MicroCM, MicroParams, SubWindowClock,
     };
+    use asap_sketchlib::{DataInput, DefaultXxHasher, MatrixFastHash, SketchHasher};
 
     const ROWS: usize = 4;
     const COLS: usize = 1024;
@@ -1300,18 +1299,6 @@ mod microscope {
             SubWindowClock::count_based(PER_SUB_WINDOW),
             0x5EED_1234,
         )
-    }
-
-    /// Whether any cell has zoomed. A run that stays at `Z = 0` counts every
-    /// item individually, so the only error left is Count-Min's.
-    fn max_zoom(sk: &MicroCM, params: MicroParams) -> u8 {
-        let layout = MicroLayout::new(params);
-        sk.as_storage()
-            .as_slice()
-            .chunks_exact(layout.depth())
-            .map(|record| cell::zoom(record, &layout))
-            .max()
-            .unwrap_or(0)
     }
 
     /// Over-charging the oldest sub-window gives a Count-Min sketch of an
@@ -1333,7 +1320,7 @@ mod microscope {
             "the clock should have advanced once per {PER_SUB_WINDOW} items"
         );
         assert_eq!(
-            max_zoom(&sk, MicroParams::new(T, 2)),
+            sk.max_zoom(),
             0,
             "this load is sized to stay below a zoom, so the only error under \
              test is Count-Min's; a zoom here means the test is measuring \
@@ -1356,58 +1343,111 @@ mod microscope {
         );
     }
 
-    /// `Under` charges none of the partially expired sub-window and `Over`
-    /// charges all of it, so the default `Linear` weighting sits between
-    /// them, for every key.
+    /// The three `DeltaStrategy` policies differ by exactly the weight they
+    /// put on the oldest sub-window, and `Linear` uses the clock's residual
+    /// fraction as that weight.
+    ///
+    /// The ordering `Under <= Linear <= Over` alone is not worth asserting:
+    /// the three scale one non-negative quantity by 0, `p` and 1, so it holds
+    /// for any cell contents whatsoever and would survive an implementation
+    /// that never expired anything. What has content is the *spacing* — that
+    /// `Linear` sits exactly `p` of the way, and that the gap is non-zero for
+    /// the keys that actually have an oldest sub-window.
     #[test]
-    fn under_linear_and_over_stay_ordered_for_every_key() {
+    fn linear_sits_exactly_at_the_clocks_residual_fraction() {
         let stream = zipf_u64(ITEMS, 4096, 1.1, 4_242);
         let mut sk = fresh();
         for key in &stream {
             sk.insert(&DataInput::U64(*key));
         }
-        // Land part-way into a sub-window so the three policies differ.
+        // Land part-way into a sub-window so the residual is strictly between
+        // 0 and 1 and the three policies genuinely differ.
         for key in stream.iter().take(377) {
             sk.insert(&DataInput::U64(*key));
         }
+        let p = sk.residual_fraction();
+        assert!(
+            (0.05..0.95).contains(&p),
+            "the clock should be mid-sub-window, got residual {p}"
+        );
+
+        let mut with_a_gap = 0usize;
         for key in 0..4096u64 {
             let probe = DataInput::U64(key);
             let under = sk.estimate_with(&probe, DeltaStrategy::Under);
             let over = sk.estimate_with(&probe, DeltaStrategy::Over);
             let linear = sk.estimate(&probe);
+            let expected = under + p * (over - under);
             assert!(
-                under <= linear && linear <= over,
-                "key {key}: Under {under} <= Linear {linear} <= Over {over} violated"
+                (linear - expected).abs() <= 1e-9 * over.max(1.0),
+                "key {key}: Linear {linear} is not {p} of the way from Under \
+                 {under} to Over {over} (expected {expected})"
             );
+            if over > under {
+                with_a_gap += 1;
+            }
         }
+        // The oldest sub-window holds PER_SUB_WINDOW items, so at most that
+        // many distinct keys can appear in it, and under this Zipf far fewer
+        // do. This floor is an empirical guard, not a bound: it exists so the
+        // spacing assertion above cannot pass by every key having an empty
+        // oldest sub-window. Measured on this seed: 388.
+        assert!(
+            with_a_gap >= 200,
+            "only {with_a_gap} of 4096 keys had a non-empty oldest \
+             sub-window (measured 388 on this seed); the spacing assertion \
+             above would then be vacuous for nearly all of them"
+        );
     }
 
-    /// A key that stops appearing leaves the window, even though nothing
-    /// writes to its cells again — the sub-window boundary clears every cell,
-    /// not just the ones being inserted into.
+    /// The columns a key occupies, computed the way the sketch computes them.
+    fn columns_of(key: u64, rows: usize, cols: usize) -> Vec<usize> {
+        let packed = DefaultXxHasher::hash128_seeded(0, &DataInput::U64(key));
+        (0..rows)
+            .map(|row| MatrixFastHash::col_for_row(&packed, row, cols))
+            .collect()
+    }
+
+    /// A key that stops appearing leaves the window **completely**, even
+    /// though nothing ever writes to its cells again.
+    ///
+    /// Expiry comes from the sub-window boundary sweep, which visits every
+    /// cell, not from writes to the cell in question — a quiet key's cells
+    /// are exactly the ones no insert touches. To make this an equality
+    /// rather than a bound, the filler traffic is filtered to keys that
+    /// provably share no cell with the quiet key, so there is nothing left
+    /// for collisions to explain.
     #[test]
-    fn a_key_that_goes_quiet_leaves_the_window() {
+    fn a_key_that_goes_quiet_leaves_the_window_entirely() {
+        const QUIET: u64 = 11;
         let mut sk = fresh();
-        let loud = DataInput::U64(11);
+        let loud = DataInput::U64(QUIET);
         for _ in 0..3 * PER_SUB_WINDOW {
             sk.insert(&loud);
         }
         assert!(sk.estimate_with(&loud, DeltaStrategy::Under) > 0.0);
 
-        // Push the window past the burst with traffic that avoids key 11.
-        let filler = zipf_u64(((T + 2) as u64 * PER_SUB_WINDOW) as usize, 4096, 1.1, 77);
-        for key in &filler {
-            sk.insert(&DataInput::U64(key.wrapping_add(1_000_000)));
+        let occupied = columns_of(QUIET, ROWS, COLS);
+        let needed = (T + 2) as u64 * PER_SUB_WINDOW;
+        let mut pushed = 0u64;
+        let mut candidate = 1_000_000u64;
+        while pushed < needed {
+            let disjoint = columns_of(candidate, ROWS, COLS)
+                .iter()
+                .zip(&occupied)
+                .all(|(a, b)| a != b);
+            if disjoint {
+                sk.insert(&DataInput::U64(candidate));
+                pushed += 1;
+            }
+            candidate += 1;
         }
-        let est = sk.estimate_with(&loud, DeltaStrategy::Over);
-        // Whatever is left is other keys' traffic colliding into the same
-        // cells, bounded by Count-Min over the filler, not by key 11.
-        let bound = CountMinSpec::new(ROWS, COLS).marginal_bound(filler.len() as f64, 0.0)
-            * CountMinSpec::new(ROWS, COLS).simultaneous_factor(4096, 1e-3);
-        assert!(
-            est <= bound,
-            "key 11 should have aged out; {est} exceeds the {bound} that \
-             collisions alone can account for"
+
+        assert_eq!(
+            sk.estimate_with(&loud, DeltaStrategy::Over),
+            0.0,
+            "the burst aged out and no filler key shares a cell with it, so \
+             nothing should remain"
         );
     }
 }

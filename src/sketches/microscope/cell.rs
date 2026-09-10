@@ -84,14 +84,30 @@ pub struct MicroParams {
     pub c: u32,
 }
 
+/// Upper bound on `T`, so a record stays a sane size and `T + 2` cannot
+/// overflow while a layout is being derived from untrusted bytes.
+pub const MAX_SUB_WINDOWS: usize = 4096;
+
 impl MicroParams {
     /// Builds parameters, rejecting the values the layout cannot represent.
     ///
-    /// Panics if `t` is zero or if `c` is below 2.
+    /// Panics if `t` is zero or above [`MAX_SUB_WINDOWS`], or if `c` is
+    /// below 2.
     pub fn new(t: usize, c: u32) -> Self {
-        assert!(t > 0, "t (sub-windows per window) must be at least 1");
-        assert!(c >= 2, "zoom base c must be at least 2, got {c}");
-        Self { t, c }
+        Self::checked(t, c).unwrap_or_else(|detail| panic!("{detail}"))
+    }
+
+    /// [`Self::new`] as a `Result`, for validating deserialized values.
+    pub fn checked(t: usize, c: u32) -> Result<Self, String> {
+        if t == 0 || t > MAX_SUB_WINDOWS {
+            return Err(format!(
+                "t (sub-windows per window) must be in 1..={MAX_SUB_WINDOWS}, got {t}"
+            ));
+        }
+        if c < 2 {
+            return Err(format!("zoom base c must be at least 2, got {c}"));
+        }
+        Ok(Self { t, c })
     }
 }
 
@@ -186,6 +202,32 @@ pub fn zoom(cell: &[u8], layout: &MicroLayout) -> u8 {
     cell[layout.zoom_at]
 }
 
+/// Checks the two invariants a cell's own bytes must satisfy, for use on
+/// deserialized records.
+///
+/// Neither is expressible in the layout, so a crafted payload can carry a
+/// record that decodes cleanly and then misbehaves on first use:
+///
+/// - `Z` above the cap makes `c^Z` overflow, which panics in a debug build
+///   and silently wraps to a nonsense unit in a release one.
+/// - a shutter at or above `c^Z` breaks the assumption that a shutter holds
+///   less than one unit, which is what bounds the carry a merge computes.
+pub fn validate(cell: &[u8], layout: &MicroLayout) -> Result<(), String> {
+    let z = cell[layout.zoom_at];
+    let cap = layout.max_zoom();
+    if z > cap {
+        return Err(format!("zoom exponent {z} exceeds the maximum {cap}"));
+    }
+    let unit = (layout.params.c as u64).pow(z as u32);
+    let s = shutter(cell, layout) as u64;
+    if s >= unit {
+        return Err(format!(
+            "shutter {s} is not below one unit (c^Z = {unit}) at zoom {z}"
+        ));
+    }
+    Ok(())
+}
+
 /// A cell's shutter.
 ///
 /// Read and written through `to_le_bytes`/`from_le_bytes` rather than a cast,
@@ -200,12 +242,6 @@ pub fn shutter(cell: &[u8], layout: &MicroLayout) -> u32 {
 fn set_shutter(cell: &mut [u8], layout: &MicroLayout, value: u32) {
     let at = layout.shutter_at;
     cell[at..at + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-/// The pixel value for sub-window `n`.
-#[inline(always)]
-pub fn pixel(cell: &[u8], layout: &MicroLayout, n: u64) -> u8 {
-    cell[layout.pixel_at(n)]
 }
 
 /// The count sub-window `n` holds in this cell, in items rather than pixel
@@ -451,38 +487,6 @@ pub fn try_zoom_in(cell: &mut [u8], layout: &MicroLayout) -> bool {
     true
 }
 
-/// Estimates the cell's count over the sliding window ending inside
-/// sub-window `n`.
-///
-/// The sum is the shutter, plus the `T` sub-windows `n-T+1 ..= n` that lie
-/// wholly inside the window, plus whatever `strategy` charges for the
-/// partially expired sub-window `n-T`.
-pub fn estimate(cell: &[u8], layout: &MicroLayout, n: u64, strategy: DeltaStrategy) -> f64 {
-    let z = cell[layout.zoom_at];
-    let unit = (layout.params.c as f64).powi(z as i32);
-    let t = layout.params.t as u64;
-
-    let mut total = shutter(cell, layout) as f64;
-    for back in 0..t {
-        // Sub-windows before the stream began contributed nothing, and their
-        // pixels are still zero, so a missing index is simply skipped.
-        if let Some(sub_window) = n.checked_sub(back) {
-            total += pixel(cell, layout, sub_window) as f64 * unit;
-        }
-    }
-
-    let oldest = n
-        .checked_sub(t)
-        .map(|sub_window| pixel(cell, layout, sub_window) as f64 * unit)
-        .unwrap_or(0.0);
-    total += match strategy {
-        DeltaStrategy::Over => oldest,
-        DeltaStrategy::Under => 0.0,
-        DeltaStrategy::Linear(fraction) => fraction.clamp(0.0, 1.0) * oldest,
-    };
-    total
-}
-
 /// Divides `value` by `c` `steps` times, unbiased at each step.
 #[inline]
 fn scale_down(mut value: u32, steps: u8, c: u32, rounding: &Rounding) -> u32 {
@@ -558,6 +562,38 @@ pub fn merge_cells(dst: &mut [u8], src: &[u8], layout: &MicroLayout, n: u64, rou
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pixel value for sub-window `n`.
+    fn pixel(cell: &[u8], layout: &MicroLayout, n: u64) -> u8 {
+        cell[layout.pixel_at(n)]
+    }
+
+    /// A single cell's window count, which is what a one-row sketch would
+    /// answer.
+    ///
+    /// The grid does not go through this: it reduces across rows per
+    /// sub-window and sums the minima, which is tighter than summing a cell
+    /// and then reducing. This is the per-cell reference the property tests
+    /// below are written against.
+    fn estimate(cell: &[u8], layout: &MicroLayout, n: u64, strategy: DeltaStrategy) -> f64 {
+        let t = layout.params.t as u64;
+        let mut total = shutter(cell, layout) as f64;
+        for back in 0..t {
+            if let Some(sub_window) = n.checked_sub(back) {
+                total += scaled_pixel(cell, layout, sub_window);
+            }
+        }
+        let oldest = n
+            .checked_sub(t)
+            .map(|sub_window| scaled_pixel(cell, layout, sub_window))
+            .unwrap_or(0.0);
+        total += match strategy {
+            DeltaStrategy::Over => oldest,
+            DeltaStrategy::Under => 0.0,
+            DeltaStrategy::Linear(fraction) => fraction.clamp(0.0, 1.0) * oldest,
+        };
+        total
+    }
 
     /// Drives a cell through `items` inserts spread over sub-windows of
     /// `per_sub_window` items each, calling `try_zoom_in` at every boundary
@@ -872,11 +908,17 @@ mod tests {
         );
         let over = estimate(&cell, &layout, n, DeltaStrategy::Over);
         let truth = truth_over(items, 8, per_sub_window, n) as f64;
-        let rel = (over - truth).abs() / truth;
+        // A zoom rounds each pixel by less than one unit, and the estimate
+        // reads T+2 of them, so that product is the slack the arithmetic
+        // itself allows. It moves with the load and the parameters, unlike a
+        // percentage.
+        let unit = 2f64.powi(zoom(&cell, &layout) as i32);
+        let slack = unit * (layout.pixels() as f64);
         assert!(
-            rel < 0.05,
-            "zoomed estimate {over} against {truth} is {:.2}% off",
-            rel * 100.0
+            (over - truth).abs() <= slack,
+            "zoomed estimate {over} against {truth} is off by more than the \
+             {slack} that {} pixels of unit {unit} can round away",
+            layout.pixels()
         );
     }
 }

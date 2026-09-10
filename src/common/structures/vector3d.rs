@@ -206,14 +206,6 @@ impl<T> Vector3D<T> {
         &self.data[start..start + self.depth]
     }
 
-    /// Mutable sibling of [`Self::bucket_slice`].
-    #[inline(always)]
-    pub fn bucket_slice_mut(&mut self, row: usize, col: usize) -> &mut [T] {
-        debug_assert!(row < self.rows && col < self.cols, "bucket out of bounds");
-        let start = self.bucket_start(row, col);
-        &mut self.data[start..start + self.depth]
-    }
-
     /// Returns the bit width needed to represent one column index.
     ///
     /// A packed fast-path hash carries `rows * get_mask_bits()` bits of column
@@ -249,19 +241,19 @@ impl<T> Vector3D<T> {
     /// Queries every row through a hashed column selection and returns the
     /// minimum of the per-row results.
     ///
-    /// The closure receives the bucket slice, the row index, and the hash.
+    /// The closure receives the bucket slice and the row index.
     #[inline(always)]
     pub fn fast_query_min<Hash, F, R>(&self, hashed_val: &Hash, op: F) -> R
     where
         Hash: MatrixFastHash,
-        F: Fn(&[T], usize, &Hash) -> R,
+        F: Fn(&[T], usize) -> R,
         R: PartialOrd,
     {
         let c0 = self.col_for_row(hashed_val, 0);
-        let mut min = op(self.bucket_slice(0, c0), 0, hashed_val);
+        let mut min = op(self.bucket_slice(0, c0), 0);
         for row in 1..self.rows {
             let col = self.col_for_row(hashed_val, row);
-            let candidate = op(self.bucket_slice(row, col), row, hashed_val);
+            let candidate = op(self.bucket_slice(row, col), row);
             if candidate < min {
                 min = candidate;
             }
@@ -299,12 +291,10 @@ mod tests {
         v.fill(0);
         // Stamp each bucket with a unique marker through the bucket accessor,
         // then verify the flat storage is exactly the expected tiling.
-        for r in 0..3 {
-            for c in 0..5 {
-                let marker = (r * 5 + c) as u16 + 1;
-                for slot in v.bucket_slice_mut(r, c) {
-                    *slot = marker;
-                }
+        let depth = v.depth();
+        for (index, bucket) in v.as_mut_slice().chunks_exact_mut(depth).enumerate() {
+            for slot in bucket.iter_mut() {
+                *slot = index as u16 + 1;
             }
         }
         let expected: Vec<u16> = (1..=15u16)
@@ -322,10 +312,8 @@ mod tests {
     fn depth_one_degenerates_to_a_plain_matrix() {
         let mut v: Vector3D<i32> = Vector3D::init(2, 3, 1);
         v.fill(0);
-        for r in 0..2 {
-            for c in 0..3 {
-                v.bucket_slice_mut(r, c)[0] = (r * 3 + c) as i32;
-            }
+        for (index, slot) in v.as_mut_slice().iter_mut().enumerate() {
+            *slot = index as i32;
         }
         // With depth 1 the flat storage is exactly the row-major matrix.
         assert_eq!(v.as_slice(), &[0, 1, 2, 3, 4, 5]);
@@ -356,9 +344,9 @@ mod tests {
             &hash,
         );
         // The minimum over the same hash sees exactly what was written.
-        let min_first: u32 = v.fast_query_min(&hash, |bucket, _, _| bucket[0]);
+        let min_first: u32 = v.fast_query_min(&hash, |bucket, _| bucket[0]);
         assert_eq!(min_first, 7);
-        let min_row: u32 = v.fast_query_min(&hash, |bucket, _, _| bucket[1]);
+        let min_row: u32 = v.fast_query_min(&hash, |bucket, _| bucket[1]);
         assert_eq!(min_row, 0, "row 0's marker is the smallest");
         // Exactly one bucket per row was touched.
         let touched = v.as_slice().chunks_exact(2).filter(|b| b[0] == 7).count();
@@ -369,7 +357,8 @@ mod tests {
     fn serde_round_trip_preserves_shape_and_contents() {
         let mut v: Vector3D<u8> = Vector3D::init(2, 8, 3);
         v.fill(0);
-        v.bucket_slice_mut(1, 5)[2] = 200;
+        let at = (8 + 5) * 3 + 2; // bucket (1, 5), slot 2
+        v.as_mut_slice()[at] = 200;
         let bytes = rmp_serde::to_vec_named(&v).expect("serialize");
         let back: Vector3D<u8> = rmp_serde::from_slice(&bytes).expect("deserialize");
         assert_eq!((back.rows(), back.cols(), back.depth()), (2, 8, 3));
