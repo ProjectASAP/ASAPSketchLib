@@ -111,6 +111,14 @@ pub enum UnivMonDeltaFidelity {
 }
 
 impl UnivMon {
+    /// Whether this state accepts standard updates and standard-state merges.
+    /// Empty states have not selected an update strategy yet.
+    pub fn accepts_standard_updates(&self) -> bool {
+        matches!(
+            self.update_mode,
+            UnivMonUpdateMode::Unset | UnivMonUpdateMode::Standard
+        )
+    }
     /// Creates a UnivMon instance with explicit dimensions.
     pub fn init_univmon(
         heap_size: usize,
@@ -549,6 +557,25 @@ mod tests {
     use core::f64;
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use std::collections::HashMap;
+
+    /// Persisted terminal states must be distinguishable before standard ingestion.
+    #[test]
+    fn standard_update_compatibility_survives_roundtrip_and_reset() {
+        let mut sketch = UnivMon::init_univmon(4, 3, 16, 2);
+        assert!(sketch.accepts_standard_updates());
+        sketch.insert(&DataInput::U64(1), 1);
+        assert!(sketch.accepts_standard_updates());
+        let standard =
+            UnivMon::deserialize_from_bytes(&sketch.serialize_to_bytes().unwrap()).unwrap();
+        assert!(standard.accepts_standard_updates());
+        sketch.free();
+        sketch.fast_insert(&DataInput::U64(1), 1);
+        let mut terminal =
+            UnivMon::deserialize_from_bytes(&sketch.serialize_to_bytes().unwrap()).unwrap();
+        assert!(!terminal.accepts_standard_updates());
+        terminal.free();
+        assert!(terminal.accepts_standard_updates());
+    }
 
     #[test]
     fn univmon_round_trip_serialization() {
