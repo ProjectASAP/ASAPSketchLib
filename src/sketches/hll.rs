@@ -62,6 +62,33 @@ pub struct HyperLogLogImpl<
     _hasher: PhantomData<H>,
 }
 
+/// Classic HyperLogLog cardinality estimate over a raw register slice.
+///
+/// This is the estimator body shared by [`HyperLogLogImpl<Classic, _, _>`] and
+/// by any sketch that keeps HyperLogLog registers in storage of its own. The
+/// harmonic sum and the zero-register count are accumulated in one pass.
+///
+/// Ranks are drawn from a 64-bit hash, so only the small-range (linear
+/// counting) correction applies; there is no 32-bit large-range correction.
+#[inline]
+pub(crate) fn classic_estimate(registers: &[u8]) -> f64 {
+    let m = registers.len() as f64;
+    let alpha_m = 0.7213 / (1.0 + 1.079 / m);
+    let mut z = 0.0;
+    let mut zero_count: usize = 0;
+    for &reg_val in registers {
+        z += 2f64.powi(-(reg_val as i32));
+        if reg_val == 0 {
+            zero_count += 1;
+        }
+    }
+    let mut est = alpha_m * m * m / z;
+    if est <= m * 5.0 / 2.0 && zero_count != 0 {
+        est = m * (m / zero_count as f64).ln();
+    }
+    est
+}
+
 /// Marker type selecting the classic HyperLogLog estimation algorithm.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct Classic;
@@ -210,21 +237,7 @@ impl<Registers: HllRegisterStorage, H: SketchHasher> HyperLogLogImpl<Classic, Re
     /// algorithm with the small-range correction. Ranks are drawn from a
     /// 64-bit hash, so the estimate needs no large-range correction.
     pub fn estimate(&self) -> usize {
-        let m = Registers::NUM_REGISTERS as f64;
-        let alpha_m = 0.7213 / (1.0 + 1.079 / m);
-        let mut est = alpha_m * m * m * self.indicator();
-        if est <= m * 5.0 / 2.0 {
-            let mut zero_count = 0;
-            for &reg_val in self.registers.as_slice() {
-                if reg_val == 0 {
-                    zero_count += 1;
-                }
-            }
-            if zero_count != 0 {
-                est = m * (m / zero_count as f64).ln();
-            }
-        }
-        est as usize
+        classic_estimate(self.registers.as_slice()) as usize
     }
 }
 

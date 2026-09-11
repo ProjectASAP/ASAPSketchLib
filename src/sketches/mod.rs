@@ -56,6 +56,18 @@ pub use bloom::{
 pub mod countsketch;
 pub use countsketch::Count;
 
+/// Count-Min-shaped grid with a per-bucket HyperLogLog (distinct-count) sketch.
+#[cfg(feature = "experimental")]
+pub mod countminsketch_hll;
+#[cfg(feature = "experimental")]
+pub use countminsketch_hll::CountMinHll;
+
+/// Sliding-window frequency estimation with adaptive zoom (MicroscopeSketch).
+#[cfg(feature = "experimental")]
+pub mod microscope;
+#[cfg(feature = "experimental")]
+pub use microscope::MicroCM;
+
 /// Hashing path markers for matrix-backed sketches.
 pub mod mode;
 pub use mode::{FastPath, RegularPath};

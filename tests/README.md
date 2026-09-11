@@ -21,14 +21,14 @@ its theorem.
 | `e2e_frequency.rs` / `e2e_cardinality.rs` / `e2e_quantiles.rs` | Deep per-family suites, each against its own theorem |
 | `e2e_matrix_instances.rs` | Every built-in `(storage, hashing path)` instance of CountMin / Count / CMSHeap / CSHeap, plus counter-width edges |
 | `e2e_numeric_types.rs` | Every `NumericalValue` type through `KLL<T>`, `KLLDynamic<T>` and `DDSketch::add<T>` |
-| `e2e_windows.rs` | Every `EHSketchList` variant in an `ExponentialHistogram`, and every `TumblingWindow` payload |
+| `e2e_windows.rs` | Every `EHSketchList` variant in an `ExponentialHistogram`, every `TumblingWindow` payload, and `MicroCM`'s in-cell sliding window |
 | `e2e_composition.rs` | `HashSketchEnsemble`, `UnivMonQ`'s config surface, and the portable sketch+heap facade |
 | `e2e_nitro.rs` | Every Nitro ingestion path — row-level `CountMin`/`Count`, `NitroBatch::insert` / `insert_cached_step`, and the bare `Vector2D<u32>` target — under one sampling model, plus merge, seeding, saturation and serde/context continuation. **All Nitro E2E behaviour lives here**; the sampler's own structural tests are unit tests in `src/common/structure_utils.rs` and `src/sketch_framework/nitro.rs`, where the cursor and skip counter are visible without a public accessor |
 | `e2e_frameworks.rs` | Hydra's subpopulation lattice and UnivMon composition |
 | `e2e_heavy_hitters.rs` | Space-Saving's error sandwich, `min_count` ceiling and Stream-Summary lists under sustained eviction, plus CocoSketch and Elastic through the batteries and the heavy-hitter properties no battery models |
 | `e2e_membership.rs` | Bloom: no false negative, exact union, and the delivered false-positive rate against its own sizing |
 | `e2e_octo.rs` | OctoSketch delta-promotion invariants, the `octo-runtime` pipeline, and conformance to the paper's Theorems 1-4 and its sketch-merge baseline |
-| `e2e_experimental.rs` | The remaining `feature = "experimental"` sketches: KMV, UniformSampling, EHUnivOptimized |
+| `e2e_experimental.rs` | The remaining `feature = "experimental"` sketches: KMV, UniformSampling, EHUnivOptimized, CountMinHll |
 | `bug_verification.rs` | Regression tests for fixed wrong-query-results bugs |
 | `spec_self_tests.rs` | The specs checking themselves — the median's bad-row threshold, the binomial tails it selects, the four-row counter-example behind it, and the simultaneous `kappa` search. Its own binary because a `#[test]` in `common/specs.rs` runs once per suite that says `mod common;` |
 

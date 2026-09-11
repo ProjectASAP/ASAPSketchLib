@@ -754,3 +754,98 @@ fn uniform_sampling_at_full_rate_passes_quantile_conformance() {
     )
     .assert_ok();
 }
+
+// --------------------------------------------------------------- MicroCM
+
+/// MicroscopeSketch's Count-Min grid, run at a configuration where it is
+/// exact.
+///
+/// Two conditions have to hold for the Count-Min contract to be the right
+/// one to hold it to, and the test asserts both rather than assuming them:
+///
+/// - **Nothing expires.** `DeltaStrategy::Over` charges sub-windows
+///   `n-T ..= n`, so a window of `T` sub-windows that the whole stream fits
+///   inside makes the reference the full per-key truth, exactly as for a
+///   plain Count-Min.
+/// - **Nothing zooms.** The one-sided guarantee is about the span; once a
+///   cell zooms, its pixels have been through probabilistic rounding and the
+///   error is two-sided. `T = 64` at 1000 items per sub-window keeps the
+///   hottest key's per-sub-window count well inside a byte, on both halves
+///   of the merge split and on their sum.
+#[cfg(feature = "experimental")]
+struct MicroCmAdapter(asap_sketchlib::sketches::microscope::MicroCM);
+
+#[cfg(feature = "experimental")]
+impl MicroCmAdapter {
+    const ROWS: usize = 4;
+    const COLS: usize = 4096;
+    const T: usize = 64;
+    const PER_SUB_WINDOW: u64 = 1_000;
+
+    fn new() -> Self {
+        use asap_sketchlib::sketches::microscope::{MicroCM, MicroParams, SubWindowClock};
+        Self(MicroCM::with_dimensions(
+            Self::ROWS,
+            Self::COLS,
+            MicroParams::new(Self::T, 2),
+            SubWindowClock::count_based(Self::PER_SUB_WINDOW),
+            0x9001,
+        ))
+    }
+}
+
+#[cfg(feature = "experimental")]
+impl FrequencyOps<i64> for MicroCmAdapter {
+    fn ingest(&mut self, key: &i64) {
+        self.0.insert(&DataInput::I64(*key));
+    }
+    fn estimate(&self, key: &i64) -> f64 {
+        use asap_sketchlib::sketches::microscope::DeltaStrategy;
+        self.0
+            .estimate_with(&DataInput::I64(*key), DeltaStrategy::Over)
+    }
+}
+
+#[cfg(feature = "experimental")]
+impl MergeOps for MicroCmAdapter {
+    fn merge_from(&mut self, other: &Self) {
+        self.0
+            .merge(&other.0)
+            .expect("both halves have the same shape and item count");
+    }
+}
+
+#[cfg(feature = "experimental")]
+#[test]
+fn micro_cm_passes_frequency_and_merge_conformance() {
+    let stream = zipf_stream();
+    let truth = stream_truth(&stream);
+    let spec = conformance::FrequencySpec {
+        one_sided: true,
+        rel_tol: 0.01,
+        abs_tol: 4.0,
+    };
+
+    // The premises the contract rests on, checked rather than assumed.
+    let mut probe = MicroCmAdapter::new();
+    for key in &stream {
+        probe.ingest(key);
+    }
+    assert_eq!(
+        probe.0.max_zoom(),
+        0,
+        "this load must stay below a zoom; past one, the rounding makes the \
+         error two-sided and `one_sided: true` is the wrong contract"
+    );
+    assert!(
+        probe.0.sub_window() <= MicroCmAdapter::T as u64,
+        "the stream must fit inside one window, or the reference truth is \
+         not the full per-key count"
+    );
+
+    conformance::frequency_battery("MicroCM", MicroCmAdapter::new, &stream, &truth, spec)
+        .assert_ok();
+
+    conformance::merge_equivalence_battery("MicroCM", MicroCmAdapter::new, &stream, spec)
+        .assert_ok();
+}
