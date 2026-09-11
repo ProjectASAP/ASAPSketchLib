@@ -29,8 +29,8 @@
 //!   count.
 //! - **Bit-mask column selection**: `cols` is required to be a power of two,
 //!   so a column index is a mask of the packed hash with no division.
-//! - **Branchless register update**: `u8::max` compiles to a conditional move,
-//!   avoiding unpredictable branches on dense streams.
+//! - **Single-byte register update**: an insert reads and writes one register
+//!   per row and leaves the rest of the bucket untouched.
 //! - **Single-pass bucket estimator**: the shared classic estimator fuses the
 //!   harmonic sum and the zero-count into one loop traversal.
 //!
@@ -46,8 +46,8 @@
 //!   counting (no per-key breakdown).
 //! - [`crate::sketch_framework::hydra`] (`Hydra` with `HydraCounter::HLL`) —
 //!   also answers per-key distinct-count queries, but stores one heap-allocated
-//!   HLL object per grid cell. `CountMinHll` flattens all registers into a single
-//!   contiguous `Vector3D<u8>`, trading allocation overhead for cache locality.
+//!   HLL object per grid cell. `CountMinHll` holds every register in a single
+//!   contiguous `Vector3D<u8>`, so the whole grid is one allocation.
 //!
 //! # References
 //!
@@ -129,6 +129,18 @@ impl<'de, H: SketchHasher> Deserialize<'de> for CountMinHll<H> {
             return Err(serde::de::Error::custom(format!(
                 "rows ({rows}) × column bits ({col_bits}) = {required_bits} exceeds the \
                  128-bit packed column hash; reduce rows or cols"
+            )));
+        }
+        // A register holds a rank drawn from the 64 - precision bits below the
+        // register index, so `64 - precision + 1` is the largest an insert can
+        // write. Above that is a state no stream produces, and it skews the
+        // harmonic sum the estimator builds. `hll/wire.rs` holds the standalone
+        // sketch to the same bound.
+        let max_rank = (64 - precision + 1) as u8;
+        if let Some(&rank) = buckets.as_slice().iter().find(|&&rank| rank > max_rank) {
+            return Err(serde::de::Error::custom(format!(
+                "register value {rank} exceeds the maximum rank {max_rank} at \
+                 precision {precision}"
             )));
         }
         Ok(Self {
@@ -238,7 +250,6 @@ impl<H: SketchHasher> CountMinHll<H> {
         let (index, rank) = self.register_and_rank_from_hash(hll_hash);
         self.buckets.fast_insert(
             |registers, &(index, rank): &(usize, u8), _row| {
-                // Branchless max: compiles to a conditional move on x86/ARM.
                 registers[index] = registers[index].max(rank);
             },
             (index, rank),
@@ -598,6 +609,47 @@ mod tests {
                 err.contains(want),
                 "{label}: expected an error containing {want:?}, got {err:?}"
             );
+        }
+    }
+
+    /// A register holds a rank of at most `64 - precision + 1`. A byte above
+    /// that is a state no insert produces, and it skews the harmonic sum every
+    /// estimate over that bucket is built from. `hll/wire.rs` holds the
+    /// standalone sketch to the same bound.
+    #[test]
+    fn deserialize_rejects_a_register_holding_an_impossible_rank() {
+        #[derive(Serialize)]
+        struct Forged {
+            buckets: Vector3D<u8>,
+            precision: u32,
+        }
+        fn attempt(precision: u32, rank: u8) -> Option<String> {
+            let depth = 1usize << precision;
+            let mut buckets: Vector3D<u8> = Vector3D::init(4, 32, depth);
+            buckets.fill(0);
+            buckets.as_mut_slice()[0] = rank;
+            let bytes = rmp_serde::to_vec_named(&Forged { buckets, precision }).expect("encode");
+            CountMinHll::<DefaultXxHasher>::deserialize_from_bytes(&bytes)
+                .err()
+                .map(|e| e.to_string())
+        }
+
+        for precision in [1u32, 8, 18] {
+            let max_rank = (64 - precision + 1) as u8;
+            assert!(
+                attempt(precision, max_rank).is_none(),
+                "precision {precision}: the largest rank an insert can write must decode"
+            );
+            let err = attempt(precision, max_rank + 1).unwrap_or_else(|| {
+                panic!(
+                    "precision {precision}: rank {} must be rejected",
+                    max_rank + 1
+                )
+            });
+            assert!(err.contains("exceeds the maximum rank"), "{err}");
+            let err = attempt(precision, u8::MAX)
+                .unwrap_or_else(|| panic!("precision {precision}: rank 255 must be rejected"));
+            assert!(err.contains("exceeds the maximum rank"), "{err}");
         }
     }
 
