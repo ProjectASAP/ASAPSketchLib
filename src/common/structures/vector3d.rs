@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use super::matrix_storage::cols_mask_bits;
 use crate::MatrixFastHash;
 
 /// Shared thin wrapper over `Vec<T>` for sketches whose every matrix cell is a
@@ -43,7 +44,7 @@ use crate::MatrixFastHash;
 /// the layout guarantees is contiguity, not that a bucket fits a cache line.
 /// A sketch whose hot path touches *one* field across *all* cells is not a
 /// fit either way.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct Vector3D<T> {
     data: Vec<T>,
     rows: usize,
@@ -53,9 +54,22 @@ pub struct Vector3D<T> {
     mask: u128,
 }
 
-// Deserialization reads only the stored fields; `mask_bits` and `mask` are
-// derived from `cols` so tampered bytes cannot produce inconsistent routing.
+// Only the stored fields travel, in both directions; `mask_bits` and `mask`
+// are functions of `cols` and are recomputed on decode, so tampered bytes
+// cannot produce inconsistent routing. The two field sets must match: a
+// self-describing encoding ignores the extra keys, but the compact one is
+// positional and would reject its own output.
+#[derive(Serialize)]
+#[serde(rename = "Vector3D")]
+struct Vector3DSer<'a, T> {
+    data: &'a [T],
+    rows: usize,
+    cols: usize,
+    depth: usize,
+}
+
 #[derive(Deserialize)]
+#[serde(rename = "Vector3D")]
 struct Vector3DDeserialize<T> {
     data: Vec<T>,
     rows: usize,
@@ -63,12 +77,15 @@ struct Vector3DDeserialize<T> {
     depth: usize,
 }
 
-#[inline]
-fn mask_bits_for_cols(cols: usize) -> u32 {
-    if cols.is_power_of_two() {
-        cols.ilog2()
-    } else {
-        cols.ilog2() + 1
+impl<T: Serialize> Serialize for Vector3D<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Vector3DSer {
+            data: &self.data,
+            rows: self.rows,
+            cols: self.cols,
+            depth: self.depth,
+        }
+        .serialize(serializer)
     }
 }
 
@@ -97,7 +114,7 @@ where
                 input.data.len()
             )));
         }
-        let mask_bits = mask_bits_for_cols(input.cols);
+        let mask_bits = cols_mask_bits(input.cols);
         Ok(Self {
             data: input.data,
             rows: input.rows,
@@ -116,15 +133,25 @@ impl<T> Vector3D<T> {
     /// The bucket accessors are only valid once [`Self::fill`] has populated
     /// the storage; until then [`Self::len`] reports `0`.
     ///
-    /// Panics if any dimension is zero.
+    /// Panics if any dimension is zero, or if `rows * cols * depth` overflows
+    /// `usize`.
     pub fn init(rows: usize, cols: usize, depth: usize) -> Self {
         assert!(
             rows > 0 && cols > 0 && depth > 0,
             "Vector3D dimensions must be non-zero, got rows={rows}, cols={cols}, depth={depth}"
         );
-        let mask_bits = mask_bits_for_cols(cols);
+        let len = rows
+            .checked_mul(cols)
+            .and_then(|n| n.checked_mul(depth))
+            .unwrap_or_else(|| {
+                panic!(
+                    "Vector3D rows * cols * depth overflows usize, got \
+                     rows={rows}, cols={cols}, depth={depth}"
+                )
+            });
+        let mask_bits = cols_mask_bits(cols);
         Self {
-            data: Vec::with_capacity(rows * cols * depth),
+            data: Vec::with_capacity(len),
             rows,
             cols,
             depth,
@@ -139,8 +166,11 @@ impl<T> Vector3D<T> {
     where
         T: Clone,
     {
+        // The product is checked in `init`, which is the only way to set these
+        // three fields.
+        let len = self.rows * self.cols * self.depth;
         self.data.clear();
-        self.data.resize(self.rows * self.cols * self.depth, value);
+        self.data.resize(len, value);
     }
 
     #[inline(always)]
@@ -204,10 +234,19 @@ impl<T> Vector3D<T> {
         &mut self.data
     }
 
-    /// Returns the `(row, col)` bucket slice, debug-asserting bounds.
+    /// Returns the `(row, col)` bucket slice.
+    ///
+    /// Panics if either index is out of range. The slice index below does not
+    /// catch it: an out-of-range `col` still lands inside `data` and would
+    /// hand back a different row's bucket.
     #[inline(always)]
     pub fn bucket_slice(&self, row: usize, col: usize) -> &[T] {
-        debug_assert!(row < self.rows && col < self.cols, "bucket out of bounds");
+        assert!(
+            row < self.rows && col < self.cols,
+            "bucket ({row}, {col}) out of bounds for a {} x {} grid",
+            self.rows,
+            self.cols
+        );
         let start = self.bucket_start(row, col);
         &self.data[start..start + self.depth]
     }
@@ -371,6 +410,40 @@ mod tests {
         assert_eq!(back.as_slice(), v.as_slice());
         // Derived routing state is recomputed, not carried on the wire.
         assert_eq!(back.get_mask_bits(), v.get_mask_bits());
+    }
+
+    /// The compact encoding is positional, so `Serialize` and `Deserialize`
+    /// must agree on the field set exactly. A self-describing encoding hides a
+    /// mismatch by ignoring the extra keys; this one rejects its own output.
+    #[test]
+    fn serde_round_trip_also_holds_for_the_compact_encoding() {
+        let mut v: Vector3D<u8> = Vector3D::init(2, 8, 3);
+        v.fill(0);
+        v.as_mut_slice()[(8 + 5) * 3 + 2] = 200;
+        let bytes = rmp_serde::to_vec(&v).expect("serialize");
+        let back: Vector3D<u8> = rmp_serde::from_slice(&bytes).expect("deserialize");
+        assert_eq!((back.rows(), back.cols(), back.depth()), (2, 8, 3));
+        assert_eq!(back.as_slice(), v.as_slice());
+        assert_eq!(back.get_mask_bits(), v.get_mask_bits());
+    }
+
+    #[test]
+    #[should_panic(expected = "overflows usize")]
+    fn init_rejects_dimensions_whose_product_overflows() {
+        // Each dimension is legal on its own; the product is not. Without the
+        // check `Vec::with_capacity` receives the wrapped product and the
+        // container reports a shape its storage cannot hold.
+        let _: Vector3D<u8> = Vector3D::init(3, usize::MAX / 2, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn bucket_slice_rejects_a_column_past_the_row() {
+        let mut v: Vector3D<u16> = Vector3D::init(2, 4, 3);
+        v.fill(0);
+        // In bounds of `data`, so the slice index alone would return row 1's
+        // bucket instead of panicking.
+        let _ = v.bucket_slice(0, 5);
     }
 
     #[test]
