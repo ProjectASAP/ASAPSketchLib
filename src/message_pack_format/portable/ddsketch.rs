@@ -482,6 +482,46 @@ impl DdSketch {
             return None;
         }
         let target = (q * (count.saturating_sub(1)) as f64).floor() as u64;
+        self.value_at_rank(target)
+    }
+
+    /// Estimate the linearly interpolated quantile at `q * (n - 1)`.
+    ///
+    /// This interpolates the two adjacent order-statistic bucket estimates,
+    /// as required by PromQL quantile and continuous percentiles. The existing
+    /// `quantile` method retains its lower-order-statistic convention.
+    /// Returns `None` for invalid q/alpha, empty or overflowing counts, counts
+    /// above exact Float64 integer precision, or nonfinite bucket estimates.
+    pub fn quantile_interpolated(&self, q: f64) -> Option<f64> {
+        if !q.is_finite()
+            || !(0.0..=1.0).contains(&q)
+            || !self.alpha.is_finite()
+            || !(0.0..1.0).contains(&self.alpha)
+            || self.alpha == 0.0
+        {
+            return None;
+        }
+        let count = self
+            .store_counts
+            .iter()
+            .try_fold(0u64, |sum, count| sum.checked_add(*count))?;
+        if count == 0 || count > (1u64 << 53) {
+            return None;
+        }
+        let rank = q * (count - 1) as f64;
+        let lower_rank = rank.floor() as u64;
+        let upper_rank = rank.ceil() as u64;
+        let lower = self.value_at_rank(lower_rank)?;
+        let upper = self.value_at_rank(upper_rank)?;
+        if !lower.is_finite() || !upper.is_finite() {
+            return None;
+        }
+        let fraction = rank - lower_rank as f64;
+        let result = lower * (1.0 - fraction) + upper * fraction;
+        result.is_finite().then_some(result)
+    }
+
+    fn value_at_rank(&self, target: u64) -> Option<f64> {
         let mut cumulative: u64 = 0;
         let gamma = (1.0 + self.alpha) / (1.0 - self.alpha);
         let mut last_nonempty: Option<usize> = None;
@@ -1040,6 +1080,67 @@ mod tests {
             })
             .collect();
         bytes
+    }
+
+    #[test]
+    fn interpolated_quantile_preserves_adjacent_ranks_and_legacy_convention() {
+        let mut sketch = DdSketch::new(0.01);
+        sketch.update(20.0);
+        sketch.update(40.0);
+        let lower = sketch.quantile(0.0).unwrap();
+        let upper = sketch.quantile(1.0).unwrap();
+        assert_eq!(sketch.quantile(0.9), Some(lower));
+        for (q, expected) in [(0.0, 20.0), (0.5, 30.0), (0.9, 38.0), (1.0, 40.0)] {
+            let actual = sketch.quantile_interpolated(q).unwrap();
+            assert!((actual - expected).abs() <= expected * 0.01);
+            assert_eq!(actual, lower * (1.0 - q) + upper * q);
+        }
+        for q in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            assert!(sketch.quantile_interpolated(q).is_none());
+        }
+        assert!(DdSketch::new(0.01).quantile_interpolated(0.5).is_none());
+        let mut singleton = DdSketch::new(0.01);
+        singleton.update(20.0);
+        assert_eq!(
+            singleton.quantile_interpolated(0.9),
+            singleton.quantile(0.0)
+        );
+        for values in [vec![20.0, 20.0], vec![10.0, 10.0, 20.0, 40.0]] {
+            let mut repeated = DdSketch::new(0.01);
+            for &value in &values {
+                repeated.update(value);
+            }
+            for q in [0.0, 0.5, 0.9, 1.0] {
+                let rank = q * (values.len() - 1) as f64;
+                let fraction = rank - rank.floor();
+                let expected = values[rank.floor() as usize] * (1.0 - fraction)
+                    + values[rank.ceil() as usize] * fraction;
+                assert!(
+                    (repeated.quantile_interpolated(q).unwrap() - expected).abs()
+                        <= 0.01 * expected
+                );
+            }
+        }
+        for alpha in [0.0, -0.1, 1.0, f64::NAN] {
+            assert!(
+                DdSketch::from_raw(alpha, vec![1], 0)
+                    .quantile_interpolated(0.5)
+                    .is_none()
+            );
+        }
+        assert!(
+            DdSketch::from_raw(0.01, vec![(1u64 << 53) + 1], 0)
+                .quantile_interpolated(0.5)
+                .is_none()
+        );
+        // This portable format only represents positive inputs. An empty
+        // sketch after rejected nonpositive updates must not synthesize zero.
+        let mut unsupported = DdSketch::new(0.01);
+        unsupported.update(-20.0);
+        unsupported.update(0.0);
+        assert!(unsupported.quantile_interpolated(0.9).is_none());
+        let overflow = DdSketch::from_raw(0.01, vec![u64::MAX, 1], 0);
+        assert!(overflow.quantile_interpolated(0.5).is_none());
     }
 
     fn hex_nibble(c: u8) -> u8 {
