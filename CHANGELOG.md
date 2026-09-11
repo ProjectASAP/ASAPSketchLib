@@ -21,6 +21,16 @@ signals a backwards-compatible change.
   a HyperLogLog precision or a sub-window count needs and what a const generic
   cannot express. See
   [Common Structures](docs/api/api_common_structures.md#when-to-reach-for-vector3d-instead-of-vector2d).
+
+  It previously existed as a placeholder: a publicly exported type with a
+  single `init(layer, row, col)` that reserved capacity, no accessors, and so
+  no way to put an element in or read one out. Filling it in reshaped that
+  placeholder — the three dimensions are now `(rows, cols, depth)`, the
+  `serde` field names follow, and `init` rejects a zero or overflowing shape
+  rather than returning a container it cannot address. Code written against
+  the placeholder could only construct one and serialize an empty container,
+  so there is no behaviour to migrate, and the parameter arity is unchanged,
+  so such code still compiles.
 - **`CountMinHll`** (`experimental` feature). Grouped distinct counting: given
   a stream of `(key, distinct_value)` pairs, how many distinct values has this
   key seen? A Count-Min-shaped grid whose every cell is a small HyperLogLog,
@@ -37,16 +47,6 @@ signals a backwards-compatible change.
 
 ### Changed
 
-- **`Vector3D`'s dimensions changed meaning, and so did its `serde` shape.**
-  The stub took `init(layer, row, col)` and serialized `layer`/`row`/`col`;
-  it now takes `init(rows, cols, depth)` and serializes `rows`/`cols`/`depth`.
-  The arity is unchanged, so existing calls still compile while meaning
-  something different, and previously serialized bytes will not decode. The
-  stub had no callers in this crate and no sketch used it, but the type was
-  publicly exported, so this is a breaking change to a public API.
-- `Vector3D::init` now rejects a zero dimension instead of building a
-  container whose bucket accessors panic on first use, and deserialization
-  rejects a payload whose data length disagrees with `rows * cols * depth`.
 - `HyperLogLog`'s classic estimator body is now a shared function that
   `CountMinHll` also uses, so the two cannot drift. HyperLogLog's own numbers
   are unchanged.
