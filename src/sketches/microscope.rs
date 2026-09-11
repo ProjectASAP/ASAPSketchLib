@@ -119,6 +119,60 @@ impl SubWindowClock {
         }
     }
 
+    /// The constructors' validation as a `Result`.
+    ///
+    /// The variants are struct variants of a public enum, so their fields are
+    /// public and a struct literal reaches every consumer without passing
+    /// through [`Self::count_based`] or [`Self::time_based`]. A zero
+    /// sub-window length divides by zero in [`Self::n`].
+    pub fn checked(&self) -> Result<(), String> {
+        match *self {
+            Self::CountBased {
+                items_per_sub_window: 0,
+                ..
+            } => Err("items_per_sub_window must be non-zero".to_string()),
+            Self::TimeBased {
+                sub_window_len: 0, ..
+            } => Err("sub_window_len must be non-zero".to_string()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether two clocks number their sub-windows the same way: the same
+    /// kind, the same sub-window length, and, for a time-based clock, the
+    /// same epoch.
+    ///
+    /// Two clocks that agree here and report the same [`Self::n`] have rings
+    /// whose slot `i` stands for the same span of the stream, which is what
+    /// makes adding them pixel-wise meaningful.
+    pub fn same_frame(&self, other: &Self) -> bool {
+        match (*self, *other) {
+            (
+                Self::CountBased {
+                    items_per_sub_window: mine,
+                    ..
+                },
+                Self::CountBased {
+                    items_per_sub_window: theirs,
+                    ..
+                },
+            ) => mine == theirs,
+            (
+                Self::TimeBased {
+                    sub_window_len: mine,
+                    epoch: my_epoch,
+                    ..
+                },
+                Self::TimeBased {
+                    sub_window_len: theirs,
+                    epoch: their_epoch,
+                    ..
+                },
+            ) => mine == theirs && my_epoch == their_epoch,
+            _ => false,
+        }
+    }
+
     /// The current sub-window number.
     #[inline(always)]
     pub fn n(&self) -> u64 {
@@ -170,7 +224,11 @@ impl SubWindowClock {
                 seen,
             } => {
                 let before = *seen / *items_per_sub_window;
-                *seen += 1;
+                // Saturating, not wrapping: a `seen` near the top of the range
+                // is only reachable from a crafted payload, and wrapping it to
+                // zero would send `n` backwards and credit every cell's
+                // shutter to an arbitrary ring slot.
+                *seen = seen.saturating_add(1);
                 *seen / *items_per_sub_window != before
             }
             Self::TimeBased { .. } => {
@@ -270,22 +328,7 @@ impl<'de, H: SketchHasher> Deserialize<'de> for MicroCM<H> {
                  128-bit packed column hash; reduce rows or cols"
             )));
         }
-        match clock {
-            SubWindowClock::CountBased {
-                items_per_sub_window: 0,
-                ..
-            } => {
-                return Err(serde::de::Error::custom(
-                    "items_per_sub_window must be non-zero",
-                ));
-            }
-            SubWindowClock::TimeBased {
-                sub_window_len: 0, ..
-            } => {
-                return Err(serde::de::Error::custom("sub_window_len must be non-zero"));
-            }
-            _ => {}
-        }
+        clock.checked().map_err(serde::de::Error::custom)?;
         // Each record carries a zoom exponent and a shutter that the layout
         // cannot constrain; a crafted pair panics or wraps on first use.
         for (index, record) in cells.as_slice().chunks_exact(layout.depth()).enumerate() {
@@ -324,8 +367,9 @@ impl<H: SketchHasher> MicroCM<H> {
     /// `rounding_seed` seeds the probabilistic rounding a zoom-out uses;
     /// passing a fixed value makes a run reproducible.
     ///
-    /// Panics if a dimension is zero, if `cols` is not a power of two, or if
-    /// the per-row column bits do not fit the 128-bit packed hash.
+    /// Panics if a dimension is zero, if `cols` is not a power of two, if the
+    /// per-row column bits do not fit the 128-bit packed hash, or if `params`
+    /// or `clock` carry values their own constructors reject.
     pub fn with_dimensions(
         rows: usize,
         cols: usize,
@@ -340,6 +384,12 @@ impl<H: SketchHasher> MicroCM<H> {
              column would route every row to the same cell and collapse the \
              minimum across rows to one counter"
         );
+        // Both types are public with public fields, so a struct literal
+        // arrives here without having passed their constructors' checks.
+        // `deserialize` validates the same two; so must this path.
+        let params =
+            MicroParams::checked(params.t, params.c).unwrap_or_else(|detail| panic!("{detail}"));
+        clock.checked().unwrap_or_else(|detail| panic!("{detail}"));
         let layout = MicroLayout::new(params);
         let mut cells = Vector3D::init(rows, cols, layout.depth());
         cells.fill(0);
@@ -545,7 +595,15 @@ impl<H: SketchHasher> MicroCM<H> {
             total += match strategy {
                 DeltaStrategy::Over => oldest,
                 DeltaStrategy::Under => 0.0,
-                DeltaStrategy::Linear(fraction) => fraction.clamp(0.0, 1.0) * oldest,
+                DeltaStrategy::Linear(fraction) => {
+                    // Clamping here would rewrite `Linear(3.0)` into `Over` and
+                    // pass a NaN straight through into the estimate.
+                    assert!(
+                        (0.0..=1.0).contains(&fraction),
+                        "DeltaStrategy::Linear takes a fraction in 0.0..=1.0, got {fraction}"
+                    );
+                    fraction * oldest
+                }
             };
         }
         total
@@ -568,6 +626,13 @@ impl<H: SketchHasher> MicroCM<H> {
             return Err(format!(
                 "cannot merge sketches of different shape: \
                  (rows, cols, params) is {mine:?} against {theirs:?}"
+            ));
+        }
+        if !self.clock.same_frame(&other.clock) {
+            return Err(format!(
+                "cannot merge sketches whose clocks number sub-windows differently: \
+                 {:?} against {:?}",
+                self.clock, other.clock
             ));
         }
         if self.clock.n() != other.clock.n() {
@@ -628,6 +693,108 @@ mod tests {
     fn cell_depth_follows_the_parameters() {
         assert_eq!(sketch(2, 16, 12, 100).cell_bytes(), 20);
         assert_eq!(sketch(2, 16, 1, 100).cell_bytes(), 8);
+    }
+
+    /// `MicroParams` and `SubWindowClock` are public with public fields, so a
+    /// struct literal reaches `with_dimensions` without their constructors'
+    /// checks. `deserialize` rejects both; so must this path.
+    #[test]
+    #[should_panic(expected = "zoom base c must be in 2..=256")]
+    fn with_dimensions_rejects_a_params_literal_the_layout_cannot_represent() {
+        let _: MicroCM = MicroCM::with_dimensions(
+            2,
+            16,
+            MicroParams { t: 4, c: 0 },
+            SubWindowClock::count_based(10),
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "t (sub-windows per window) must be in 1..=4096")]
+    fn with_dimensions_rejects_a_sub_window_count_that_overflows_the_layout() {
+        let _: MicroCM = MicroCM::with_dimensions(
+            2,
+            16,
+            MicroParams {
+                t: usize::MAX,
+                c: 2,
+            },
+            SubWindowClock::count_based(10),
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "items_per_sub_window must be non-zero")]
+    fn with_dimensions_rejects_a_clock_literal_that_divides_by_zero() {
+        let _: MicroCM = MicroCM::with_dimensions(
+            2,
+            16,
+            MicroParams::default(),
+            SubWindowClock::CountBased {
+                items_per_sub_window: 0,
+                seen: 0,
+            },
+            0,
+        );
+    }
+
+    /// The pixel ring is indexed by sub-window number, so equal `n` is not
+    /// enough: the two clocks must also number their sub-windows the same way.
+    /// Otherwise `b`'s items, which its own clock would have expired long ago,
+    /// are held in `a`'s ring for the length of `a`'s window.
+    #[test]
+    fn merge_rejects_clocks_of_different_sub_window_length() {
+        let mut a = sketch(2, 16, 4, 1000);
+        for _ in 0..999 {
+            a.insert(&key(1));
+        }
+        let mut b = sketch(2, 16, 4, 10);
+        for _ in 0..9 {
+            b.insert(&key(1));
+        }
+        assert_eq!((a.sub_window(), b.sub_window()), (0, 0));
+        let err = a.merge(&b).expect_err("different sub-window lengths");
+        assert!(err.contains("number sub-windows differently"), "{err}");
+    }
+
+    #[test]
+    fn merge_rejects_clocks_of_different_kinds() {
+        let mut a = sketch(2, 16, 4, 10);
+        let b = MicroCM::with_dimensions(
+            2,
+            16,
+            MicroParams::new(4, 2),
+            SubWindowClock::time_based(999, 0),
+            0xABCD,
+        );
+        assert_eq!((a.sub_window(), b.sub_window()), (0, 0));
+        let err = a.merge(&b).expect_err("a count clock is not a time clock");
+        assert!(err.contains("number sub-windows differently"), "{err}");
+    }
+
+    /// Reachable only from a crafted payload, but wrapping `seen` would send
+    /// `n` backwards and credit every cell's shutter to an arbitrary ring slot.
+    #[test]
+    fn a_count_clock_at_the_top_of_its_range_saturates_rather_than_wrapping() {
+        let mut clock = SubWindowClock::CountBased {
+            items_per_sub_window: 10,
+            seen: u64::MAX,
+        };
+        let before = clock.n();
+        assert!(!clock.tick());
+        assert_eq!(clock.n(), before, "n must not go backwards");
+    }
+
+    #[test]
+    #[should_panic(expected = "takes a fraction in 0.0..=1.0")]
+    fn a_linear_weight_outside_the_unit_interval_is_refused() {
+        let mut sk = sketch(2, 16, 4, 10);
+        for _ in 0..100 {
+            sk.insert(&key(1));
+        }
+        let _ = sk.estimate_with(&key(1), DeltaStrategy::Linear(3.0));
     }
 
     #[test]

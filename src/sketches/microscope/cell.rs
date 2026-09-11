@@ -150,9 +150,11 @@ pub struct MicroLayout {
     /// The largest pixel a zoom-in may keep: `255 / c`, so a zoom-in is
     /// refused once any pixel would exceed a byte when multiplied by `c`.
     ///
-    /// Deliberately not `256 / c`, which is zero for `c > 256` and would
-    /// make the refusal vacuously true for every cell — including an empty
-    /// one — leaving a cell that zoomed out unable to ever zoom back in.
+    /// Deliberately not `256 / c`: a zoom-in multiplies every pixel by `c`
+    /// and the product must fit a byte, which is `p * c <= 255`, so the bound
+    /// is `255 / c`. The two differ at `c = 256`, where `256 / c` would admit
+    /// a pixel of 1 whose product is 256 and overflows, while `255 / c` is 0
+    /// and admits only an empty pixel — the one that does survive.
     zoom_in_ceiling: u32,
 }
 
@@ -355,11 +357,14 @@ pub fn unbiased_div_u64(value: u64, divisor: u64, rounding: &Rounding) -> u64 {
 /// that pixel has no room left.
 ///
 /// The zoom is not "divide, then increment". A pixel at `2^l - 1` conceptually
-/// takes the increment to `2^l` and *then* halves, which lands exactly on
-/// `2^l / c`; dividing first and adding one afterwards credits up to a whole
-/// extra unit every time a cell zooms, a systematic upward bias. So the
-/// crediting pixel is **set** to `2^l / c` and only the other pixels are
-/// divided.
+/// takes the increment to `2^l` and *then* divides, landing on `2^l / c`;
+/// dividing first and adding one afterwards credits up to a whole extra unit
+/// every time a cell zooms, a systematic upward bias. So the crediting pixel
+/// is **set** to `2^l / c` and only the other pixels are divided.
+///
+/// That quotient is rounded the same probabilistic way as the others: `c` need
+/// not divide `2^l`, and truncating it would drop `(2^l mod c) · c^Z` items on
+/// every zoom-out, in a fixed direction, compounding as `Z` grows.
 ///
 /// At the zoom cap the pixel saturates rather than wrapping, and the unit is
 /// left alone.
@@ -376,7 +381,7 @@ fn credit_pixel(cell: &mut [u8], layout: &MicroLayout, at: usize, rounding: &Rou
     let c = layout.params.c;
     for (index, slot) in cell.iter_mut().take(layout.pixels).enumerate() {
         *slot = if index == at {
-            ((PIXEL_MAX as u32 + 1) / c) as u8
+            unbiased_div(PIXEL_MAX as u32 + 1, c, rounding) as u8
         } else {
             unbiased_div(*slot as u32, c, rounding) as u8
         };
@@ -455,7 +460,7 @@ pub fn enter_sub_window(
         let unit = (layout.params.c as u64).pow(cell[layout.zoom_at] as u32);
         let pending = shutter(cell, layout) as u64;
         set_shutter(cell, layout, 0);
-        if pending > 0 && unit > 0 {
+        if pending > 0 {
             // `pending < unit`, so this is a coin at odds `pending : unit`.
             let carry = unbiased_div_u64(pending, unit, rounding);
             if carry > 0 {
@@ -551,7 +556,7 @@ pub fn merge_cells(dst: &mut [u8], src: &[u8], layout: &MicroLayout, n: u64, rou
     let combined = shutter(dst, layout) as u64 + shutter(src, layout) as u64;
     let unit = (c as u64).pow(target as u32);
     sums[layout.pixel_at(n)] += (combined / unit) as u32;
-    let mut remainder = combined % unit;
+    let remainder = combined % unit;
 
     let cap = layout.max_zoom();
     while sums.iter().any(|&v| v > PIXEL_MAX as u32) {
@@ -573,7 +578,7 @@ pub fn merge_cells(dst: &mut [u8], src: &[u8], layout: &MicroLayout, n: u64, rou
         *slot = value as u8;
     }
     dst[layout.zoom_at] = target;
-    remainder = remainder.min(u32::MAX as u64);
+    // `remainder < c^target <= MAX_SHUTTER`, so the cast cannot truncate.
     set_shutter(dst, layout, remainder as u32);
 }
 
@@ -693,16 +698,20 @@ mod tests {
                 let over = estimate(&cell, &layout, n, DeltaStrategy::Over);
                 let under = estimate(&cell, &layout, n, DeltaStrategy::Under);
                 let linear = estimate(&cell, &layout, n, DeltaStrategy::Linear(0.5));
-                assert!(
-                    under <= linear && linear <= over,
-                    "t={t} w={per_sub_window}: Under {under} <= Linear {linear} <= Over {over}"
-                );
                 // Over counts a superset of the window's sub-windows and
                 // Under a subset, so the true window count sits between them
-                // up to the rounding a zoom introduces.
+                // up to the rounding a zoom introduces. `Under <= Linear <=
+                // Over` is not asserted: the three scale one non-negative
+                // quantity by 0, 0.5 and 1, so it holds for any cell contents
+                // and would survive deleting every expiry path.
                 let truth = truth_over(items, t as u64, per_sub_window, n) as f64;
                 let unit = 2f64.powi(zoom(&cell, &layout) as i32);
                 let slack = unit * (t as f64 + 2.0);
+                assert!(
+                    under <= truth + slack,
+                    "t={t} w={per_sub_window}: Under {under} over-reported {truth} \
+                     by more than the {slack} a zoom can round away (Linear {linear})"
+                );
                 assert!(
                     over + slack >= truth,
                     "t={t} w={per_sub_window}: Over {over} under-reported {truth} \
@@ -758,7 +767,7 @@ mod tests {
                 insert(&mut cell, &layout, n, &rounding);
             }
             assert!(
-                estimate(&cell, &layout, n, DeltaStrategy::Under) > 0.0 || burst < (1 << 0),
+                estimate(&cell, &layout, n, DeltaStrategy::Under) > 0.0,
                 "burst={burst}: the cell should be holding something"
             );
             for _ in 0..=(layout.params().t + 1) {
@@ -824,14 +833,45 @@ mod tests {
         assert_eq!(zoom(&cell, &layout), 0);
     }
 
+    /// The quotient a zoom-out credits is rounded probabilistically, so its
+    /// mean is `256 / c` even when `c` does not divide 256.
+    ///
+    /// Truncating pins it at `floor(256 / c)`, dropping `(256 mod c) * c^Z`
+    /// items on every zoom-out in a fixed direction. Every other zoom test
+    /// runs at `c = 2`, where `256 / c` is exact and the two agree.
+    #[test]
+    fn a_zoom_out_rounds_the_crediting_pixel_probabilistically() {
+        let layout = MicroLayout::new(MicroParams::new(4, 3));
+        let rounding = Rounding::new(0x5EED);
+        let trials = 20_000;
+        let mut total = 0u64;
+        for _ in 0..trials {
+            let mut cell = vec![0u8; layout.depth()];
+            cell[0] = PIXEL_MAX;
+            credit_pixel(&mut cell, &layout, 0, &rounding);
+            assert_eq!(zoom(&cell, &layout), 1);
+            assert!(
+                matches!(cell[0], 85 | 86),
+                "the credit must be one of the two integers around 256/3, got {}",
+                cell[0]
+            );
+            total += cell[0] as u64;
+        }
+        let mean = total as f64 / trials as f64;
+        let expected = 256.0 / 3.0;
+        assert!(
+            (mean - expected).abs() < 0.05,
+            "the crediting pixel averaged {mean}, expected {expected}; \
+             truncation pins it at 85"
+        );
+    }
+
     /// The zoom-in ceiling admits exactly the pixels whose product fits a
     /// byte, and never degenerates to refusing everything.
     ///
-    /// At `256 / c` the ceiling is zero for any `c > 256`, which makes the
-    /// refusal vacuously true for every cell — an all-zero one included — so
-    /// a cell that zoomed out could never zoom back in and every later count
-    /// was reported at the coarse unit. That is a downward one-sided error,
-    /// the opposite of what the estimator promises.
+    /// `c = 256` is the case that separates `255 / c` from `256 / c`: the
+    /// latter admits a pixel of 1, whose product is 256 and does not fit the
+    /// byte it is written back into.
     #[test]
     fn the_zoom_in_ceiling_admits_exactly_what_fits_a_byte() {
         for c in [2u32, 3, 5, 16, 255, 256] {
